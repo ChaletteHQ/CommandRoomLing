@@ -1,0 +1,289 @@
+---
+name: check-deliverables
+surfaces: both
+description: "Pre-send sweep of what Command Room produced — flags anything that does not sound like the CEO or leaks internal language, BEFORE it gets forwarded. Fires on: 'check my deliverables', 'scan my deliverables', 'scan before I send' / 'scan before sending' / 'scan this before I send', 'check my output before I send', 'voice and privacy check', 'did this pass the quality check', 'scan my output for voice tells'. Read-only and flag-only — never edits, moves, or deletes; findings feed the voice-corrections corpus silently. Does NOT fire on 'automation scan' / 'where am I wasting time' (automation-scanner), 'weekly cleanup' (cleanup — runs this same sweep weekly as backstop), or 'value receipt' (value-receipt)."
+---
+
+# check-deliverables
+
+The on-demand quality sweep. The CEO fires it before forwarding something —
+"scan before I send" — and it reads what was actually produced and flags any
+voice tell or privacy/internal leak it finds, by filename, in plain English.
+
+## Skill Boundary (v2.1)
+
+- **Use check-deliverables for:** the on-demand voice + privacy sweep over what Command Room actually produced, before it gets forwarded. Read-only and flag-only.
+- **Use `cleanup` for:** "weekly cleanup" / "clean up my workspace" — cleanup runs this same sweep as its weekly backstop; this skill is the on-demand version the CEO fires themselves.
+- **Use `automation-scanner` for:** "automation scan" / "where am I wasting time" — opportunity scanning, not output checking.
+- **Use `dormant-customer-scan` for:** "dormant customer scan" — relationship detection, not output checking.
+- **Use `value-receipt` for:** "value receipt" — the forwardable ROI counts, not a quality check.
+
+## Why this exists (and why it's a skill, not automatic)
+
+The save-time voice + leak gates only run when a deliverable routes through the
+normal writer (`brief_writer.make_brief`). Live testing proved that route is not
+guaranteed: given a busy batch, the model routinely hand-rolls a Word doc (or
+drafts an email/memo as a markdown file, saves a premium-HTML brief/scorecard,
+or drafts as chat text) and the gates never fire. Automatic same-turn enforcement was attempted and was not reachable in the
+runtime of the time (plugin and user-scope hooks both proved dead). So enforcement
+moves to **detection the CEO invokes**: one command that reads the produced
+output and flags what didn't pass — which IS reliable, because the runtime
+honors skills. The scanner opens the file itself, so a hand-rolled doc is caught
+exactly like a normally-written one.
+
+Honest framing: this **detects and flags** voice/privacy issues in what was
+produced, before it leaves the CEO's hands. It does not claim bad output cannot
+be produced — a model with code access can always hand-roll a file; reading the
+produced file is what makes the issue catchable.
+
+## What it checks for
+
+- **Voice tells** — generic-assistant phrasing that breaks the illusion the CEO
+  wrote it (canned openers, fillers, sign-offs), plus structural tells.
+- **Privacy / internal leaks** — internal record ids, substrate file paths, and
+  process-narration words that should never appear in something forwarded out.
+
+Both come from the validated engine (`docx_leak_scanner` +
+`voice_tell_detector`) via `shared/scripts/deliverable_sweep.py`. The findings
+are the engine's — this skill is the trigger and the plain-English surface.
+
+## Hard rules
+
+- **Read-only, flag-only.** Never edit, move, rename, or delete a file. The only
+  writes are CR-owned telemetry (one audit event + a findings record under the
+  system dir), and they can never block or touch a user file. Safe on every live
+  client workspace.
+- **Plain English out.** Name each flagged file by its filename and describe the
+  problem the way a CEO would (the offending word, "a generic-assistant
+  phrase"). Never surface internal token names, event names, or `_hq/` paths
+  (CONTRACT Rule 4). The helper's `summarize_for_user` already does this — paste
+  it; do not re-describe findings in your own words.
+- **No false-positive noise.** Internal context/memory markdown (session notes,
+  the workspace brief, views, specs, voice corpus) is deliberately NOT scanned —
+  only deliverable-shaped output. A clean sweep says so in one line; it does not
+  invent concerns.
+
+## Behavior
+
+### Step 1 — Determine the scope
+
+| The CEO said | Scope |
+|---|---|
+| "scan before I send" / "check my deliverables" (no target) | Recent deliverables — everything produced in the **last ~24 hours** (default) |
+| "...this week" / "everything I made this week" | Last **7 days** |
+| points at a file or names a specific doc | **That file only** (point-at-target) |
+
+If the CEO drafted a deliverable as **chat text this session** (an email or memo
+written into the conversation, not saved to a file), include that text too — you
+have it in context; the scanner can read it directly (Step 3).
+
+### Step 2 — Run the sweep
+
+Resolve the workspace per `shared/CONTRACT.md` Rule 22, then call the helper.
+This is the only place findings come from:
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+cd "$PLUGIN_ROOT" && python3 -c "..."
+```
+
+**Default / time-window scan** (inside the `python3 -c` body, cwd is `$PLUGIN_ROOT`):
+
+```python
+import sys, json, time
+sys.path.insert(0, "shared/scripts")
+import deliverable_sweep as ds
+
+ws = "<abs workspace root>"          # from $WORKSPACE
+since = time.time() - 24 * 3600      # 24h default; use 7*86400 for "this week"
+res = ds.sweep_workspace(ws, since_ts=since, emit=True, source="on_demand_sweep")
+print(json.dumps({
+    "scanned": res["scanned"],
+    "violations": res["violation_count"],
+    "warns": res["warn_count"],
+    "errors": res["error_count"],
+    "summary": ds.summarize_for_user(res),
+}))
+```
+
+**Phase 6 Quick Win A (automatic, flag-only).** `sweep_workspace` / `sweep_targets` with `emit=True` also call `deliverable_sweep.feed_voice_corrections(ws, res)` internally: each FAIL-severity voice tell found in a produced deliverable is appended to the relevant `corrections-<skill>.jsonl` (attributed by filename) so the `learning` job's voice leg gets more training data for free. This is a CR-owned telemetry write under `_hq/voice/` — it NEVER edits, moves, or rewrites the user's deliverable, so the skill's read-only + flag-only contract is unchanged. Privacy/substrate leaks are NOT fed (they are not a voice pattern; they stay flag-only). Nothing to do here — it rides the existing sweep.
+
+**Point-at-target scan** (when the CEO named a specific file):
+
+```python
+import sys, json
+sys.path.insert(0, "shared/scripts")
+import deliverable_sweep as ds
+
+ws = "<abs workspace root>"
+res = ds.sweep_targets(["<abs path to the file>"], workspace_root=ws, emit=True)
+print(json.dumps({
+    "scanned": res["scanned"],
+    "violations": res["violation_count"],
+    "warns": res["warn_count"],
+    "errors": res["error_count"],
+    "summary": ds.summarize_for_user(res),
+}))
+```
+
+### Step 3 — Scan any chat-drafted deliverable text
+
+If a deliverable was written as chat prose this session (no file), scan that
+text directly — this is the path a file sweep can't see:
+
+```python
+import sys, json
+sys.path.insert(0, "shared/scripts")
+import deliverable_sweep as ds
+
+chat = ds.scan_chat_text("<the deliverable text you drafted>", context="brief")
+print(json.dumps({
+    "has_violation": chat["has_violation"],
+    "has_warn": chat["has_voice_warn"],
+    "leaks": sorted({x["match"] for x in chat["leaks"]}),
+    "voice_rules": sorted({x["rule"] for x in chat["voice"]["findings"]}),
+}))
+```
+
+If `has_violation` (or `has_warn`) is true, fold it into the surface as "the
+[email/memo] you drafted just now" with the offending word(s) named — same
+plain-English style as the file findings. Do not print rule names or token names
+to the CEO.
+
+### Step 4 — Surface the result
+
+**THE CLOSING LINE IS COMPOSED, NEVER TYPED (OFFERS1 — MANDATORY).** All four
+endings — something flagged, warnings only, clean, nothing to read — come back
+from one composer, because the two this skill used to type are never offered
+here again: *"Say the word and I'll rewrite the flagged lines in your voice"*
+and *"Want me to smooth them?"* (attended test v5.31.0). This skill does not edit files — see
+"What this skill does NOT do" — so an offer to rewrite promises a verb that
+cannot act here, and M's rule of 2026-09-03 says the product acts or states
+plainly that it did not; it never hands the work back in a question.
+
+```python
+import sys
+sys.path.insert(0, "shared/scripts")
+from offer_gate import deliverable_findings_line, SITE_CHECK_DELIVERABLES, compose
+
+# `res` is Step 2's return. `chat` is Step 3's and Step 3 is optional; when
+# no chat draft was scanned this session, `chat` is None and `chat_flags` is 0.
+chat = chat if "chat" in dir() else None
+chat_flags = 1 if (chat or {}).get("has_violation") else 0
+closing = deliverable_findings_line(
+    flagged=res["violation_count"] + res["error_count"] + chat_flags,
+    warned=res["warn_count"], scanned=res["scanned"])
+```
+
+- **Something flagged** (`violations > 0` or `errors > 0`, or chat text flagged):
+  lead with the count, then paste the helper's `summary` string **verbatim** — it
+  names each file by filename and the offending language in plain English. Add the
+  chat-draft finding (Step 3) if any. Then `closing`, as its own line.
+- **Only structural warnings** (`warns > 0`, no violations): `closing` alone.
+- **Clean** (all zero, nothing in chat): `closing` alone — it uses the real
+  `scanned` count and pluralizes from it ("1 recent document" / "3 recent
+  documents", never "document(s)"), and when `scanned` is 0 it says there was
+  nothing produced recently to check. Name the point-at-target form as a
+  phrase they can type; never as a question.
+
+Pass the WHOLE reply through the offer fence before it goes out — every
+sentence you intend to print, once, and print what it returns:
+
+```python
+print(compose(SITE_CHECK_DELIVERABLES, whole_reply))
+```
+
+It raises rather than returning; a paragraph that cannot pass is a paragraph
+that should not have been written. Print `closing` on its own instead.
+
+Never include a file path, an internal token, or an event name in any line the
+CEO sees.
+
+## What this skill does NOT do
+
+- Does not edit, move, or delete any file — it flags; the CEO (or a follow-up
+  rewrite) fixes.
+- Does not scan internal context/memory markdown (session notes, views, specs,
+  the workspace brief) — only deliverable-shaped output, to avoid noise.
+- Does not read any connector — it reads only files already in the workspace and
+  text already in the conversation. Zero external exposure.
+- Does not guarantee bad output can't be produced — it detects and flags what
+  was produced. The weekly `cleanup` sweep is the backstop; this is the version
+  the CEO fires on demand, before forwarding.
+- Does not invent findings on a clean document.
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> An on-demand sweep that reads what Command Room actually produced and flags anything that does not sound like the CEO or that leaks private/internal language, BEFORE it gets forwarded. Reads the produced files themselves (Word docs, markdown, and HTML) plus any deliverable drafted as chat text this session, so it catches a document however it was made — including one hand-rolled outside the normal writer. Read-only and flag-only: it never edits, moves, or deletes a file. Triggers: 'check my deliverables', 'scan my deliverables', 'scan before I send', 'scan before sending', 'scan this before I send', 'check my output before I send', 'voice and privacy check', 'did this pass the quality check', 'scan my output for voice tells'. DOES NOT fire on 'automation scan' / 'where am I wasting time' (automation-scanner), 'scan everything' (a retired audit phrase — cleanup catches and redirects it), 'dormant customer scan' (dormant-customer-scan), 'weekly cleanup' / 'clean up my workspace' (cleanup — which runs this same sweep as its weekly backstop; this skill is the on-demand version you fire yourself), or 'value receipt' (value-receipt).

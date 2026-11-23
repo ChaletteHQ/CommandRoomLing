@@ -1,0 +1,670 @@
+> **Long-form reference.** Start at `docs/ARCHITECTURE.md` in the staging repo (the current, dated map) and `docs/START_HERE.md` (the front door). This document keeps the earlier walk-through in full; sections that describe retired or superseded behaviour carry a **History** note in place (marked 2026-10-24).
+
+# How Command Room Works
+
+A single reference for understanding the plugin end-to-end — written for the owner who uses it in the Claude app AND the developer who maintains it in Code. Read in order, or skip to a section.
+
+---
+
+## Table of contents
+
+1. [What Command Room actually is](#what-command-room-actually-is)
+2. [The substrate (the moat)](#the-substrate-the-moat)
+3. [The scheduled chats](#the-scheduled-chats)
+4. [The on-demand surface — skills by intent](#the-on-demand-surface--skills-by-intent)
+5. [Lifecycle — onboarding, updates, release manifests](#lifecycle--onboarding-updates-release-manifests)
+6. [Development model — cr1 staging + per-client production](#development-model--cr1-staging--per-client-production)
+7. [File layout — where things live](#file-layout--where-things-live)
+8. [Recurring bug classes to watch](#recurring-bug-classes-to-watch)
+9. [Debugging + verifying](#debugging--verifying)
+10. [Quick reference — trigger phrases by intent](#quick-reference--trigger-phrases-by-intent)
+
+---
+
+## What Command Room actually is
+
+Command Room is a Claude plugin installed through the Claude app's plugin marketplace. The product promise from `plugin.json`: *"Claude as your chief of staff. Turns a folder of notes, transcripts, and emails into an executive workspace."* In practice, that means:
+
+- **The substrate**: every meeting, email, decision, commitment, and intel item flows into a structured event log (`events.jsonl`) + a relationship/project graph (`entities.json`). This is the moat. Everything else is read or write against it.
+- **The daily loop**: the Command Room Hub shows the inbox, the plate and the week, and Morning Brief and the silent Maintenance task are what stays on a schedule (cr1#618, #847). Most days the operator spends 5-15 minutes on what they surface.
+- **The on-demand surface**: <!-- skill-count -->60 skills accessible by trigger phrase (the number is rendered from `skills/` and pinned by guard G17 — never hand-edit it). Writing (email, memo, one-pager, decision-memo), prep (call-prep, intro-broker, contract-review), people (people-crm, team-intelligence), deals (pipeline-tracker), scheduling (calendar-writer), surfacing (dormant-customer-scan — people + threads lenses — and decision-log's revisit mode), lifecycle (onboarding, update-bridge), and meta (workspace-manager catch-all).
+- **Voice calibration**: every writing skill runs voice calibration on every fire so drafts sound like the operator. The voice corpus grows over time as the operator sends sent-mail samples.
+
+What it is NOT:
+- Not a full CRM. `pipeline-tracker` (SPEC PIPE1) covers deal tracking — stages, next steps, rot flags, won/lost with reasons, the pipeline view — built on the same substrate; but there is no quote generation, no contact-sync to external CRMs, no rep-level territory machinery.
+- Not a project manager. Doesn't replace Asana / Linear / Notion for task management — it tracks commitments + decisions, not story points.
+- Not a Slack outbound layer. People-crm reads Slack DMs; no skill drafts Slack messages the way `email-writer` drafts email. (Known gap as of v3.5.0; explicitly out of scope per the maintainer's v3.8.0 planning call.)
+- _Was_ not a calendar writer pre-v3.8.0 — `calendar-writer` (v3.8.0+) now schedules meetings, drafts substrate-aware agendas (open commitments with attendees), and creates Calendar events.
+
+The current sweet spot: operator-class CEO/founder who reads + reacts to a lot of inbound context across many threads and people, and wants substantive synthesis + drafted action without losing the personal voice.
+
+---
+
+## The substrate (the moat)
+
+Everything Command Room does reads from or writes to three workspace files:
+
+| File | What it holds | Owner |
+|---|---|---|
+| `_hq/data/events.jsonl` | Append-only timeline. Every meeting, interaction, decision, commitment, status change, plugin event. | Many writers; canonical schema in `shared/data-schemas/events.schema.json`. |
+| `_hq/data/entities.json` | People + orgs + projects. Canonical relationship + ownership graph. | `people-crm` (people), `workspace-manager` (projects), `people-crm` + `automation` (orgs). |
+| `_hq/data/aliases.json` | Name disambiguation map ("Sam" → person_023). | `people-crm`. |
+
+### events.jsonl — the event log
+
+The most important file in the workspace. Every consequential thing that happens lands here as one line of JSON. Read-heavy — almost every skill reads it. Write-heavy — daily loops add 10-30 events per active day.
+
+**Append-only is non-negotiable.** Per the schema doc, events are never rewritten or deleted. Resolution / closure happens via NEW events (`commitment_resolved` references the original `commitment` by id; `decision_superseded` does the same for decisions).
+
+**Why append-only?** History is what every surface is generated from. If we let events get rewritten, we can't reconstruct what the user actually saw in the morning brief on day N, can't reproduce a Pulse fire to debug, can't trust dormancy detection.
+
+**Five known event shape variants for `commitment` events**:
+
+| Shape | Field pattern | Source |
+|---|---|---|
+| Canonical | `data.owner_id`, `data.title`, `data.due`, `data.status` | post-v2.7.15 writers |
+| flat-new | top-level `owner_id`, `title`, `due` | Some legacy writers, untagged scan-for-commitments output |
+| legacy | top-level `owner` (no _id), `owner_display`, `requester_display` | pre-v2.7.15 events |
+| owner_person_id-variant | `data.owner_person_id`, `data.due_date`, `data.state` (not `status`) | cr-past-meetings actively produces this |
+| pending-review | `data.owner_name_proposed` + `data.pending_review: true` | Intentional separate path (the CRU-review queue) |
+
+This is why `shared/scripts/cru_match._commitment_field(ev, "<field>")` exists — it's the canonical reader that handles all 5 shapes via an alias chain. Every consumer that reads commitment events MUST go through this helper. v3.5.0+ also has `event_references_person(ev, person_id)` for cadence detection (same problem at a different layer).
+
+### entities.json — the relationship graph
+
+Contains workspace-level state: who's a person you track, what orgs they belong to, what projects you're working on. Schema is documented in `references/ORG_AND_THREAD_MODEL.md`. The canonical writer for people records is `people-crm`; for projects it's `workspace-manager`; for orgs it's various skills routed through `people_writer.py` helpers.
+
+Why does this matter? Every surface that mentions a person ("Sloan replied to your Apr 28 thread") goes through entities.json to resolve `person_023 → "Sloan"`. If entities.json drifts (two records for the same person, missing canonical name, wrong org affiliation), the surfaces show garbage like "person_023 replied" or attribute things to the wrong person.
+
+Two safeguards: (1) `people_writer.py` enforces dedup at write time; (2) the weekly `identity-reconcile` job and `entity_signal_detector` catch drift after the fact (before LIFECYCLE1 this was the retired Pulse chat's Phase 5).
+
+### aliases.json — name disambiguation
+
+Maps free-text names ("Sam", "Sam P", "DSample") to canonical `person_NNN` ids. Used by every skill that has to interpret natural-language references to people. Cheap to write; rich payoff in surface quality.
+
+### Deliverable theme (brand) — dormant by default
+
+Every `.docx` deliverable is themed by a single source, `shared/scripts/brand.py`. With no configuration it returns an upgraded, premium default (editorial Georgia headings over Calibri body, a refined navy + consistent teal accent, stat-tile bands and shaded tables) — so a fresh workspace already looks sharp with **zero setup**. For a client who wants their own look, add an optional `brand` object to `entities.json` — on the top-level `workspace` (themes all their documents) or on a single `org` (themes that org's documents only, via `make_brief(org_id=…)`). It is a partial override deep-merged over the default: set only `palette.accent` and a `logo_path`, and everything else stays the premium default. A logo renders as a right-aligned letterhead only if the file exists; a missing file silently falls back to the quiet no-logo header. **This is entirely dormant until switched on by hand:** nothing in onboarding asks about branding and no skill trigger sets it — the brand object is written during a paid customization engagement, and an absent brand object is byte-identical to having no brand layer at all. Schema: `shared/data-schemas/entities.schema.json` → `$defs/brand`.
+
+### The three-layer memory model (episodic → canonical → semantic)
+
+The three files above are the middle and top of a three-layer memory. Naming the layers explains where every piece of the substrate lives and, more importantly, how memory *heals itself over time* instead of depending on whether a skill happened to fire at the right moment.
+
+| Layer | What it is | Where it lives | Written by |
+|---|---|---|---|
+| **L1 — episodic** | The raw record of everything that was said: full session transcripts of every Command Room chat, plus meeting transcripts. Verbatim, complete, and **free** — the Claude app retains it whether or not we do anything, and (proven 2026-07-01) it is readable from inside a scheduled task. | The Claude app's session store + the connected meeting-transcript sources (Granola, etc.) | Nobody — it accrues automatically as the CEO works |
+| **L2 — canonical** | The extracted, deduped, queryable timeline: one structured event per consequential thing. This is what almost every skill reads and writes. | `_hq/data/events.jsonl` | Many skills, all through the `append_event()` gate |
+| **L3 — semantic** | The consolidated understanding: the relationship/project graph, plus the synthesized analytical views (TIMELINE / RELATIONSHIPS / COMMITMENT_AGING / DORMANT / THEMES). | `_hq/data/entities.json` + `_hq/views/` | `people-crm` / `workspace-manager` (graph); `insight-generator` (views) |
+
+**The layers promote upward on a schedule, so capture is eventually-complete rather than moment-dependent:**
+
+- **L1 → L2, nightly** — the `session-sweep` task (Phase 5) reads the last day's session transcripts and promotes the commitments / decisions / interactions / deliverables that *never became events* into `events.jsonl`, deduped through `.source_refs.idx`. Its one-time companion `session-backfill` does the same over the last 60 days to catch a workspace up. This is the layer that closes the biggest historical leak: anything the CEO did in an ad-hoc chat that didn't fire a writing skill used to be lost; now the episodic layer is always there and the nightly pass lifts it into the canonical log after the fact — including Bug #98-class skips (a task that rendered but didn't write; the transcript shows the render, the sweep writes the missing event).
+- **L2 → L3, weekly** — `insight-generator` reads the canonical timeline and recomputes the five analytical views, consolidating events into patterns (aging, dormancy, themes).
+
+**Why this matters:** before the L1→L2 promotion existed, memory depended on the *moment of capture* — a writing skill had to fire exactly when something happened, or it was gone. With the layers, memory stops depending on that moment. The episodic layer is always complete; the canonical layer catches up every night; the semantic layer consolidates every week. A missed capture is no longer a permanent hole — it is a leftover the next sweep collects.
+
+### The Living Brain — propose → confirm → narrate → undo (SPEC LB1)
+
+How the substrate grows ITSELF without either silently inventing facts or nagging the CEO to death. One contract, four verbs:
+
+- **Propose.** Every background detector writes uncertain observations through ONE entry point — `brain_proposals.propose()` (`shared/scripts/brain_proposals.py`) — as generic `brain_proposal` events. The 8 pre-LB1 proposal families (commitment reviews, person/org/project proposals, dormancy transitions, schedule adds) keep their own types and are adapter-read into the same queue; migrating them is a later wave. A proposal with no registered action verb is rejected at the source, a declined fingerprint stays away for 60 days (the shared `proposal_ledger`), a duplicate never re-enters.
+- **Confirm.** The queue reaches the CEO as the "Needs your eyes" card (≤5 items, money > identity > hygiene, max 2 per detector) riding the surfaces that already fire — morning brief, coach — and in full on the **Staff Meeting** (the opt-in Monday chat + the on-demand `staff meeting` trigger, owned by `system-health`; it also folds in the change feed and the relationship-moves top-3). Every resolution is a one-tap apply-choices dispatch (`src: "cr-brain"`) through the item's own single writer. An item shown on one daily surface today isn't re-shown on another the same day (the full-set Staff Meeting is exempt). Ignored proposals expire SILENTLY at their TTL (default 14 days) — cleanup's Monday note carries the open/expired counts so rot is visible without a nag.
+- **Auto-apply is a class table, not a confidence score.** Only change classes in `brain_proposals.AUTO_ALLOWED` — each with a registered, tested reverser in `brain_undo.REVERSERS` — may skip the confirm (today: HIGH-evidence sent-mail commitment closes, the shipped reconcile-sent precedent; plus structured-connector-fact contact creation, policy landed ahead of its detector). Identity- and money-shaped changes always confirm.
+- **Narrate + undo.** `change_feed.changes_since()` (`shared/scripts/change_feed.py`) is the user-facing READER over the audit substrate — "closed 3 commitments from your sent mail, recovered 2 items from your chats" — feeding the brief's CHANGED line, the coach's since-you-were-last-here beat, the Friday wrap's roll-up, and `what did you change`. Narration is never the enforcement artifact (enforcement binds to the audit events). Every narrated batch ends with the standard undo affordance; `brain_undo.undo_batch()` reverses additively — reopen events, mute clears, archive flips — never an edit or delete.
+
+First detector through the rails: the deal-signal detector (`shared/scripts/deal_signal_detector.py`, the `deal-signals` Sunday maintenance job) — observed stage/value/won language and deal-shaped activity on untracked orgs become confirm-tier proposals; nothing touches a deal until the CEO taps confirm.
+
+---
+
+## The scheduled chats
+
+> **History (marked 2026-10-24, amended for cr1#847).** The section below describes the chats as they were. What registers today is `schedule_config.FIRST_INSTALL_TASK_IDS`, Morning Brief and the silent Maintenance task; the five chats the Hub replaced are `schedule_config.SHELVED_TASK_IDS`. Registration and the scheduler seam are described in `docs/ARCHITECTURE.md` section 7.
+
+These fire on cron (defaults: weekdays 6:30 AM–5 PM for the daily loop, plus Friday 4 PM for the weekly Friday Wrap). Together they constitute most of the operator-facing value. They're configured via `enable-command-room-schedules` and registered through Cowork's scheduled-tasks API. Each is one persistent chat thread in Cowork's "Scheduled" section.
+
+### 1. morning-brief (cron 7:00 AM weekdays)
+
+Thin wrapper around the `morning-briefing` skill (the on-demand variant). Produces a markdown digest: today's calendar, overdue follow-ups, urgent inbox items, open commitment count split by direction. **The brief is prose end to end and renders NO widget on any fire (FB-20)** — it is a read-only surface by design. The brief-pack driver supplies two extra prose blocks: one sentence per open money-class deal signal (the one class that may never go silent, propose-only, adjudicated by chat phrase elsewhere) and a single queue-pointer line ("N things need your eyes — say `staff meeting`"). Adjudication belongs to the staff meeting, which is the sole surface that confirms items.
+
+**Why it exists separately from the other 5**: morning-brief is the most-frequently-fired surface. The other 5 are per-item action widgets end to end; morning-brief is a markdown digest and nothing else (FB-20) — the most-fired surface is the one that asks nothing of you.
+
+**Spec**: `skills/enable-command-room-schedules/references/orchestrator-morning-brief.md`.
+
+### 2. inbox (cron 7:30 AM weekdays)
+
+Triages overnight email into Reply Now / Decision Needed / FYI / Discard / Deep Read buckets. Drafts replies for 2-3 highest-priority items via `email-writer`. Renders a widget where each thread has its own action set (Send / Edit then send / Draft / Skip).
+
+**The financial-signal override** (v3.x): senders matching `^(billing|invoices?|estimates?|payments?|accounting)@` get +30 priority to override the automated-domain demote. It caught a QuickBooks estimate for an amount that was previously being filtered out.
+
+**Spec**: `skills/enable-command-room-schedules/references/orchestrator-inbox.md`.
+
+### 3. commitments (cron 8:30 AM weekdays)
+
+The most complex orchestrator (~700 lines of prompt). Splits open commitments into two directions × three age buckets:
+
+| Direction | Buckets |
+|---|---|
+| ↗ YOU OWE | overdue / due_near / aging_undated |
+| ↙ OWED TO YOU | overdue / due_near / aging_undated |
+
+For each item: per-recipient draft of either a status-update email (YOU OWE) or a chase email (OWED TO YOU). Cowork user reviews + clicks Send / Draft / Done / Snooze (3 days).
+
+**Sam-class bug history**: this orchestrator was the source of the dual-shape commitment bug (Sam 2026-05-17), the all-shape audit (v3.4.4), and the canonical filter using `_commitment_field` + `_commitment_confidence` helpers.
+
+**Spec**: `skills/enable-command-room-schedules/references/orchestrator-commitments.md`.
+
+### 4. end-of-day (cron 5:00 PM weekdays) — RENAMED from `past-meetings` (SPEC EOD2, M's Decision 4, 2026-08-16)
+
+**Two taskIds, one file, one pack.** EOD1 turned this 5 PM fire from a
+transcript-processing job into the day's CLOSE; EOD2 minted the `end-of-day`
+id for it and left the predecessor working. `past-meetings` is out of
+`DEFAULT_SCHEDULES` and listed in `schedule_config.RETIRED_TASKS` — but with
+`renamed_to: "end-of-day"`, which makes it a different class from the two
+eliminations below: **its orchestrator file is not a stub, it is the live
+End of Day orchestrator, shared with the successor row.** A workspace that
+still has `past-meetings` registered keeps a fully working evening chat, at
+the same hour, with no degradation, until the removal step of `set up
+command room schedules` or `rebuild my hub` removes it (cr1#970) (the cloud scheduler only; the older desktop scheduler has no
+delete) or the customer pauses it. `end-of-day` is itself shelved (cr1#618,
+#847), so `add end of day` gets `shelved_line`, registers nothing, and no
+successor ever appears beside the predecessor, and the watchdog answers "is End of Day registered / when did it
+last fire" over BOTH ids so a served row is never reported as missing. The
+fire's receipt keeps the `past-meetings` task_id on both ids
+(`end_of_day.TASK_ID`) so the day-close history is one continuous series.
+
+Its capture leg processes meeting transcripts from everything since its last successful run — floored at the nominal 24 hours, ceilinged at 30 days (`shared/scripts/catchup.py` `catchup_window`, SPEC CATCHUP1). A machine closed for three days does not lose those three days of meetings. For each transcript:
+1. Invokes `meeting-notes` silently to extract decisions, commitments, action items.
+2. Invokes `follow-up-ritual` silently to draft per-attendee follow-up emails.
+3. Runs the CRU pass (`cru_match`) to auto-resolve open commitments closed by completion language in the transcript.
+4. Runs the decision-CRU pass (v3.4.5+) to auto-close decisions executed or superseded by the transcript.
+5. Renders a widget per meeting: brief link + action items + draft follow-up emails.
+
+**The producer side of the evening fire**: this is where most commitment events get written (events still carry `source_skill='past-meetings'`, unchanged by the rename). It's also where the `owner_person_id-variant` shape was traced from (the v3.4.4 audit finding).
+
+**Spec**: `skills/enable-command-room-schedules/references/orchestrator-past-meetings.md`.
+
+### 5. upcoming-meetings — RETIRED (SPEC BRIEFMERGE, M's ruling 2026-08-08)
+
+The separate prep chat is **merged into the morning brief**. It is out of `DEFAULT_SCHEDULES`, listed in `schedule_config.RETIRED_TASKS`, never offered, and never registered again. A workspace that still has it registered gets ONE offer to switch it off (`set up command room schedules` or `rebuild my hub` → `pause upcoming meetings`), never a silent disable; its orchestrator file is a retirement stub so that fire explains itself instead of replaying the old chat.
+
+Where its work went — none of it was deleted:
+
+| It did | Now |
+|---|---|
+| Discovered today's meetings on its own cron | the morning-brief fire's **prep leg**, ordered FIRST (`orchestrator-morning-brief.md` Phase 2.95). One calendar pass per fire; the digest reads what the leg returned |
+| Generated a `.docx` prep per meeting | the same generator, invoked per meeting: `skills/call-prep/SKILL.md`. Same folder, same filenames, same refresh-in-place identity — the ONE-GENERATOR contract with one caller fewer |
+| Wrote its own fire receipt that nobody cross-read | ONE receipt for the merged fire carrying both legs (`prep_leg.log_combined_receipt`), so the watchdog can see "brief ran, prep didn't" — the sentence nothing could say while this was a task that could die in silence |
+| Posted a per-meeting widget | nothing. The brief is read-only (FB-20); prep outcomes are lines in its meeting section |
+| Covered later-booked meetings badly | `call-prep` on demand ("prep me for my 2pm"). There is deliberately no midday leg |
+
+Two fences make the merge safe, both proven by removal in `tests/run_briefmerge_test.py`: the prep leg can never kill the brief (per-meeting failure degrades to a line, whole-leg failure to one banner, the brief always renders), and the brief's meeting section refuses to render without the leg's result, so prep is always strictly before render.
+
+**Spec**: `skills/enable-command-room-schedules/references/orchestrator-morning-brief.md` (Phase 2.95); the retirement stub is `references/orchestrator-upcoming-meetings.md`.
+
+### 6. pulse — RETIRED (SPEC LIFECYCLE1, M's ruling 2026-08-02)
+
+The weekday pattern-detection chat is **eliminated**. It is out of `DEFAULT_SCHEDULES`, listed in `schedule_config.RETIRED_TASKS`, never offered, and never registered again. A workspace that still has it registered gets ONE offer to switch it off (`set up command room schedules` or `rebuild my hub` → `pause pulse`), never a silent disable; its orchestrator file is a retirement stub so that fire explains itself instead of erroring.
+
+Where each of its jobs went — none of them was deleted:
+
+| It did | Now |
+|---|---|
+| Person dormancy narrative | the morning brief + `relationship-moves`, which already ranked the same signal |
+| Project lifecycle: propose dormant, flip at 60d, ask about archiving at 180d, revive a dormant project on new activity | the weekly `lifecycle` job (`shared/scripts/lifecycle_pass.py`) inside `maintenance`: the same thresholds in code, with a receipt, and the owner's archive through `thread_archive.archive_thread` |
+| Asking whether a quiet project is dormant | `stalled projects`, the on-demand surface (`load_open_proposals(ws, "on-demand")`) |
+| Pending CRU reviews | `brain_proposals._adapt_commitment_reviews` → staff meeting + `needs your call` |
+| Org-layer drift, new-entity proposals | `entity_signal_detector` + the weekly `insight-generator` passes, both stricter about what may auto-apply |
+| Person-record synthesis | the `identity-reconcile` job (identity) + `entity_signal_detector` (role/org facts) |
+
+`event_references_person` — the canonical "did this event mention this person" helper this chat's Phase 3 was the original spec for — is untouched and still the answer for every consumer.
+
+**Spec**: `skills/enable-command-room-schedules/references/orchestrator-dont-forget.md` (filename retains the legacy "dont-forget" name for events.jsonl back-compat).
+
+### Scheduling timezone rule (R8 — settled empirically 2026-07-01)
+
+**R8 AS SETTLED IN 2026-07 IS A LEGACY-SEAT RULE, AND IT STILL HOLDS THERE (amended by TZ1, 2026-09-20).** On a desktop Cowork seat, cron and `fireAt` evaluate in MACHINE-local time — the computer's clock, not the workspace timezone. Confirmed live: a machine in Mountain time with a Pacific workspace fired on Mountain wall-clock, and a scheduled session stamped its output in workspace time while firing on machine time.
+
+**On a merged/cloud seat there is no machine.** A scheduled fire is a container (whose clock read PDT on 2026-09-19) talking to a sandbox VM (UTC) about a cron the platform evaluates in UTC, for a customer who may be in none of those zones. So on those seats the customer's own workspace zone is the user-local clock, and ONE module decides which of the two answers applies: `shared/scripts/clock_policy.py`. It reads the environment and the workspace's own `triggers` map; a seat it cannot place positively as cloud keeps the machine clock, because an absence of evidence is not evidence of the cloud.
+
+The split is real and permanent:
+
+- **Scheduling math runs on ONE clock, and `clock_policy` says which.** Cron expressions in `DEFAULT_SCHEDULES` / `schedule_config` are the customer's own wall clock; lateness computation (`late_fire.py`) and fired-recency math (`task_watchdog.py`) read `clock_policy.user_local_now()` — the machine clock on a legacy seat, the workspace zone on a cloud one. Never "correct" an already-converted fire time a second time; that is the LATETZ defect and it is a different thing from choosing the clock once.
+- **Workspace TZ is presentation-only** (`shared/scripts/tz.py` `to_local()`): timestamps the CEO reads are rendered in `workspace.user_timezone`; nothing about when tasks fire changes with it.
+- **Conversion happens once, at registration/change time.** When the user asks for a time ("set inbox to 8am"), they mean THEIR timezone. On a legacy seat change-schedule converts via `schedule_config.workspace_time_to_machine()` before building the cron, and says so in the confirm diff when the two clocks differ. On a cloud seat that helper returns the time unchanged and `schedule_backend.plan_create` / `plan_update` do the single projection onto UTC instead — converting in both places would move the customer's 8 AM twice. A fixed cron can't track DST transitions on either seat: a legacy pair whose zones shift on different dates drifts by the DST hour until the schedule is touched again, and a cloud seat's stored `utc_offset_minutes` is re-projected by the quiet `schedule-realign` job (`schedule_backend.plan_realign`) when the workspace offset changes.
+- Most installs run machine == workspace timezone and none of this is visible; the rule exists for the ones that don't (travel, remote-desktop machines, VMs).
+
+**A wrong clock is not a timezone problem (CLOCK1, 2026-08-04).** The rule above was written for the zone split; it never contemplated a clock that is simply WRONG. A scheduled fire on a sandbox machine whose clock had not synced at boot read two days behind, and computed an entire surface — and its permanent `ts` stamps — from it. `shared/scripts/trusted_now.py` cross-checks the machine clock against the newest timestamp already recorded in the workspace, and against the session date where a surface can supply one. It corrects **which instant it is**; it never corrects **which zone that instant is expressed in**. Every rule above is unchanged: the seat's own clock is still the clock cron evaluates in, lateness math is still naive on that clock, the workspace timezone is still presentation-only for connector timestamps, conversion still happens once at registration. TZ1 (2026-09-20) changed only WHICH clock a cloud seat calls its own, and it changed it in `clock_policy`, not here. A builder who reaches for `to_local` while working on clock trust has confused the two problems.
+
+### 7. friday-wrap (cron 1 PM Fridays — Phase 3/R4 default for new installs; earlier installs registered at 4 PM keep their time) — NEW v3.11.0
+
+First weekly-rhythm scheduled task. Wraps the existing `weekly-recap` skill — pulls 7 days of context across every connector (Mail, Calendar, Slack/Teams, Drive, every transcript source), runs `scan-for-commitments` on freshly-captured meeting events as a side effect, then synthesizes a recap surfaced both inline (markdown chat) and as a saved `.docx` at `_hq/meetings/Weekly_Recap_<YYYY-MM-DD>.docx`.
+
+Unlike the 6 daily tasks, this is a **markdown-post orchestrator**, not a widget orchestrator — no `show_widget` call, no apply-choices action surface. Pure recap, link to the `.docx` in a Briefs section, STOP. Same delegation pattern as `morning-brief` wrapping `morning-briefing`.
+
+**Spec**: `skills/enable-command-room-schedules/references/orchestrator-friday-wrap.md`.
+
+### How widgets work (applies to 2-6 — the 6 daily widget orchestrators)
+
+> **History (marked 2026-10-24).** Step 3 describes the raw relay of the early releases. Since v3.13.8 the one path is `widget_transport.render_and_persist` and the bytes it validates go unchanged to the widget tool, which on the merged app must be loaded before it is judged (`shared/CHAT_ACTION_WIDGET.md`, section "Finding the widget tool first"; v5.33.1). See `docs/ARCHITECTURE.md` section 6.
+
+Each widget orchestrator follows the same architecture:
+1. **Renderer pipeline**: `shared/scripts/build_*_input.py` projects entities + events into a structured input JSON. Then `shared/scripts/chat_output_renderer.py::render_chat_output_widget(data_view)` produces HTML bytes.
+2. **Validators**: `validate_rendered_widget(html)` checks structural invariants (every input-bearing button has its matching wrapper). `validate_chat_output` runs leak-scanner regexes. Both raise on violation.
+3. **`mcp__visualize__show_widget(html)`**: posts the widget to the chat.
+4. **Apply-choices**: user clicks per-item buttons, widget batches selections, fires one consolidated `apply choices: [...]` submission. The `apply-choices` skill parses + dispatches each action.
+5. **STOP CONTRACT** (v3.5.0+: `shared/STOP_CONTRACT.md`): the widget IS the chat turn. No narration after. No file-write fallback. No markdown-list substitute.
+
+This architecture is the product's hardest-won discipline. Pre-v2.14.x the agent would freelance — write the widget to disk "for reopening later," narrate what was in the widget after posting, swap to markdown when output felt too big. Each was a recurring bug. The validators + STOP CONTRACT close those bypass paths structurally.
+
+---
+
+## The on-demand surface — skills by intent
+
+<!-- skill-count -->60 skills total in `skills/` (rendered from the tree; G17 pins it). Organized here by user intent so you can find the right one quickly.
+
+### "Brief me on something"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `morning-briefing` | `morning briefing`, `brief me`, `what do I need to know today` | The on-demand variant of the daily morning brief. |
+| `call-prep` | `prep me for [meeting]`, `prep the call with [name]` | Per-meeting brief — calendar + email + Slack + Granola + open commitments + decision context. |
+| `weekly-recap` | `weekly recap`, `summarize last week`, `what happened last week` | 7-day synthesis across all connectors + decision/commitment surface + .docx output. |
+| `cleanup` | `clean up my workspace`, `tidy up`, `maintenance`, `deep clean` | Weekly self-maintenance (Sundays). Auto-fixes safe issues, heals substrate corruption, surfaces only what needs eyes. No scores, no dashboard. |
+| `operator-report` | `operator report`, `what did you save me`, `monthly recap` | CEO-facing "Operating Lift" report — what would have slipped, what got captured, conservative time-saved estimate. |
+| `transcript-search` | `what did anyone say about [topic]`, `meetings about [topic]` | Cross-meeting topic search returning meeting hits with snippets. |
+| `decision-log` (Mode: revisit — formerly `decision-revisit`, folded in SKILLMERGE1) | `what decisions should I revisit`, `decision audit`, `decisions to revisit` | Surfaces decisions worth re-examining based on time elapsed + contradictory signal + named-condition shifts. Companion to decision-log; pure substrate skill. |
+| `dormant-customer-scan` (Mode: threads — formerly `thread-resurrection`, folded in SKILLMERGE1) | `what conversations went silent`, `warm threads to revive`, `thread resurrection` | Mirror of dormant-customer-scan but for THREADS not PEOPLE. Cross-graph awareness — surfaces commitment chase as an alternative when relevant. |
+
+### "Tell me about a person/relationship"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `people-crm` | `who is [name]`, `tell me about [name]`, `prep me for dinner with [name]` | Person profile — last contact + recent threads + open commitments + relationship history. |
+| `team-intelligence` | `my team`, `team status`, `prep for 1:1` | Direct-report focused — 1:1 briefs, weekly team rollup, commitment tracking by team member. |
+| `dormant-customer-scan` | `who went dark`, `dormant customer scan`, `who haven't I heard from` | Surfaces customers gone quiet vs their own historical cadence. |
+| `intro-broker` (v3.8.0+) | `intro [A] to [B]`, `connect [A] and [B]`, `introduce [A] to [B]` | Drafts two-sided intros voice-calibrated from your past intro_made events. Logs to the relationship graph; schedules a 30-day follow-up check. |
+
+### "Track a deal / the pipeline" (SPEC PIPE1)
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `pipeline-tracker` | `show my pipeline`, `pipeline review`, `new deal [name] with [org]`, `move [deal] to [stage]`, `mark [deal] won`, `mark [deal] lost`, `[Name] signed`, `we lost the [deal]`, `what deals are closing this month` | Deal lifecycle on the workspace substrate — a deal is a thread with stage / value / next-step tracking; rot derives from observed activity; won/lost close through one path with a reason. An explicit win on a prospect org converts them to a client in the same turn. Feeds the board pack's pipeline appendix and lost-deal concerns. |
+
+### "Process meeting / capture something"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `meeting-notes` | `process meeting`, `meeting notes from [meeting]` | Extracts decisions + commitments + action items from a transcript. |
+| `follow-up-ritual` | `follow up on the call`, `draft follow-ups` | Per-attendee follow-up emails after a meeting. |
+| `decision-log` | `log decision`, `record decision` | Captures a decision to the events.jsonl + DECISION_LOG view. |
+| `intel-intake` | Pastes a URL, says `intel`, `break this down` | Turns external content (article, video) into structured intel cross-referenced to workspace entities. |
+| `scan-for-commitments` | `scan for commitments` | One-shot historical scan of meeting transcripts to backfill commitment events. |
+| `calendar-writer` (v3.8.0+) | `set up a 30-min with [name]`, `schedule lunch with [name]`, `book time with [name]`, `put [name] on my calendar` | Schedules meetings. Finds mutual availability, drafts substrate-aware agenda (open commitments with attendee), creates the calendar event. Optionally auto-fires call-prep 24h before. Closes the v3.5.0-flagged calendar-write gap. |
+| `contract-review` (v3.8.0+) | `review this contract`, `redline this NDA`, `check this MSA` | Parses contract PDF/docx, compares against your standard terms, flags deviations green/yellow/red with redlines. History-aware — surfaces "this counterparty pushed for this carve-out before" patterns. |
+
+### "Write something in my voice"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `email-writer` | `draft an email to [recipient]`, `email [name] about [topic]` | Voice-calibrated email draft. |
+| `memo-writer` | `write a memo on [topic]`, `decision doc`, `board update` | Voice-calibrated internal memo / decision doc / monthly investor update. |
+| `one-pager-composer` | `one-pager on [topic]` | Voice-calibrated structured one-pager. (v3.7.1+: writes `one_pager_drafted` events; reads decision-log + intel for substrate-aware drafting.) |
+| `decision-memo-composer` (v3.8.0+) | `decision memo on [topic]`, `tradeoff analysis`, `choosing between [A] and [B]` | Structured tradeoff analysis — framing, options, weighted criteria, comparison matrix, recommendation. Optional stress-test integration. Auto-fires decision-log on "Log decision" click. |
+| `stress-test` | `stress test this`, `pre-mortem`, `red team` | Munger-style inversion — failure-mode mapping + safeguards. |
+
+### "Manage workspace lifecycle"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `workspace-manager` | `let's work`, `what's going on`, `new project`, `archive`, named-entity references with no specialist match | Catch-all router + project/session manager. |
+| `command-room-onboarding` | First install (auto), `set up command room`, `restart onboarding` | 6-phase M1 onboarding (~40 min) distributed across 13 chats. |
+| `command-room-update-bridge` | `update command room`, `what's new`, `install latest` | Applies workspace migrations + plays release manifests (v3.4.5+); says the one dashboards sentence (nothing is installed — Night M3). Touches no scheduled chat (cr1#970): at most one line naming `set up command room schedules`. |
+| `enable-command-room-schedules` | `set up command room schedules`, `change schedule` | Registers / re-registers the first-install set: Morning Brief and the silent Maintenance task. |
+
+### "Pull in / file existing context"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `ingest-context` (v3.5.0+) | `ingest context from [path]`, `pull context from [path]`, `import chatgpt` | Extract people/projects/decisions from a source; no file copies. |
+| `file-documents` (v3.5.0+) | `file documents from [path]`, `sort my downloads into projects` | Same as above PLUS copy source files into project folders. |
+| `workspace-ingest` | `ingest folder [path]`, `scan my desktop` (covers both intents) | Underlying pipeline; alias skills route to subsets. |
+
+### "Bug triage / diagnostics"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `report-bug` | `report bug`, `this isn't working`, `something broke` | OUTBOUND — diagnoses + drafts a Gmail to matthew@chaletteholdings.com. |
+| `usage-report` | `usage report`, `where does the spend go` | pack_run telemetry aggregation. |
+| `automation-scanner` | `automation scan`, `what can be automated` | Surfaces repetitive patterns in events + session notes worth automating. (v3.7.1+: writes per-opportunity `automation_opportunity_surfaced` events.) |
+| `scaffold-automation` (v3.8.0+) | `scaffold #N`, `build the automation for [X]`, `scaffold the [opportunity] one` | Pairs with automation-scanner — picks an opportunity by seq and generates real working artifacts (Zapier config / Python skeleton / n8n flow + setup recipe + rollback doc). Closes the scan→build loop. |
+
+### "Quick utility"
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `list-active` | `list projects`, `active projects`, `roster` | Zero-interaction tree render of all projects. |
+| `apply-choices` | (auto on Apply all clicks) | Receives consolidated widget submission, dispatches each action. |
+
+---
+
+## Lifecycle — onboarding, updates, release manifests
+
+### First install (onboarding)
+
+`command-room-onboarding` fires automatically on first install when `CLAUDE.md` doesn't exist in the workspace. M1 (2026-05-23+; scheduled-task generation stripped 2026-06) ships a 6-phase ~30-min flow distributed across several chats. **Onboarding registers no scheduled tasks** — the daily/weekly scheduled chats are an opt-in the customer sets up after the call by running `set up command room schedules` in a fresh chat (registration only works reliably from its own chat, which is why onboarding no longer attempts it):
+
+0. **Setup widget** — workspace shape, email exclusions, timezone, AI name (progressive-reveal widget; AI name defaults to "Penelope").
+1. **Scan + workspace build + Workspace Map** — Chat 1 runs the 60-day metadata scan + builds the workspace; Chat 3 (customer-opened) shows the Workspace Map in chat (`list active projects`). No backfill task, no schedules chat.
+2. **Mirror + Voice contrast + Insights in Chat 4** — Mirror v1 + Voice contrast immediately on Opus; Insights fire user-triggered when the customer types `show me what's next`, computed from the 60-day scan (no deep-read wait). The deeper last-7-days read is pointed to via on-demand `weekly-recap`.
+3. **Compounding loop** — Chat 4 frames how the substrate compounds (every meeting / decision / follow-up / `weekly-recap` builds on the 60-day baseline).
+4. **(removed)** — the old Run Now ritual for 5 scheduled chats is gone; onboarding registers nothing to authorize.
+5. **Training prompts** — customer fires 3 hands-on commands in 3 new chats (`prep me for [meeting]`, `tell me about [person]`, `draft a check-in to [person]`).
+6. **Coach handoff** — accomplishment summary (which points the customer to `set up command room schedules` and `weekly-recap`); Chat 4 becomes the customer's permanent home with their AI via the `command-room-coach` skill.
+
+Day-1 customers register **no** scheduled tasks during onboarding. When ready, they opt in via `set up command room schedules`, which registers the first-install set defined by `schedule_config.FIRST_INSTALL_TASK_IDS` — as of EOD2 that is the four chats `morning-brief`, `end-of-day`, `inbox` (surfaced as *Inbox Triage*) and `friday-wrap` (surfaced as *Weekly Recap*), plus the silent background `maintenance` task the customer never sees as a chat. **The frozenset is the authority, not this sentence:** the copy that used to sit here named `upcoming-meetings` and `pulse` long after both were retired, and omitted `maintenance` entirely. Everything else in `DEFAULT_SCHEDULES` is a later-add — `schedule_config.later_add_task_ids()` — offered in operator-driven follow-up sessions once accumulated workspace signal makes it fire well, never auto-registered on day 1.
+
+### Plugin updates
+
+Updates happen in the Claude app's plugin settings (Check for updates, then Update). Plugin code refreshes on disk; fully quit and reopen the Claude app to pick up new code.
+
+After restart, the customer can run `update command room` to fire `command-room-update-bridge`, which:
+1. Says the one dashboards sentence — dashboards live in chat now; nothing is installed (Night M3).
+2. Detects pending workspace-file migrations (CLAUDE.md preference additions, BUSINESS_CONTEXT additions) and applies them after user confirm.
+3. **v3.4.5+**: plays per-version release manifests at `shared/releases/v*.json`. Each manifest's items have detectors that check workspace state; only items whose detectors return truthy get surfaced. Example: the v3.4.4 manifest's `count_dropped_open_commitments` detector counts non-canonical commitments in your workspace; if you have any, you see a re-fire prompt with the actual count.
+
+### Release manifests (v3.4.5+)
+
+Every release ships a manifest at `shared/releases/v<X.Y.Z>.json`. Mandatory — `ship-cr-plugin` (in the chalette plugin, v0.4.1+) blocks the ship if it's missing.
+
+Manifest schema in `references/RELEASE_MANIFEST.md`. Two action types currently supported:
+- `announce_only` — informational, no user action required (uses `release_detectors.always` detector).
+- `instruct_user` — tells the user what to type/click in the Claude app (e.g., "set up my hub"). Has a real detector that gates whether to surface.
+
+Future action types (`apply_workspace_migration`, `programmatic_refire`) will be added as needed.
+
+---
+
+## Development model — cr1 staging + per-client production
+
+> **History (marked 2026-10-24).** The staging and production split below still holds. The way work moves (GitHub issues, one branch and one pull request per issue, the `cr1-build` skill, the owner merges) is in the staging repo's `CONTRIBUTING.md` and `ISSUES.md`; the SPEC, BUILD and REVIEW record lifecycle this section predates is retired.
+
+Current model established 2026-06-22 (the "cr1 model"). Documented in the staging repo's `DEVELOPMENT.md` and the operator workspace's CLAUDE.md + `_hq/INFRASTRUCTURE.md`.
+
+### The canonical edit surface
+
+**A dedicated working clone is the edit surface.** Path: `~/repos/cr1-canonical/command-room/` — a git clone of **`chaletteholdings/cr1`**, the private staging repo. Edits land there directly and push to `cr1`.
+
+**Do not edit any Command Room clone under `~/.claude/plugins/marketplaces/`.** Those are the Claude app's locally-installed copies — read-only install caches, coupled to the app's install location and stale the moment staging moves ahead. The legacy staging marketplace clone's remote was renamed to `oldtest` and retired on 2026-06-22.
+
+### Staging vs production
+
+| | Repo(s) | Visibility | Role |
+|---|---|---|---|
+| Staging | `chaletteholdings/cr1` | Private | The canonical edit surface clones this; the operator dogfoods from it |
+| Production | Per-client repos under `ChaletteHQ`: `CommandRoomInternal` plus one `CommandRoom<Client>` repo per client | Private (one repo per client) | What each client installs from |
+| Chalette admin | `chaletteholdings/chalette` | Private (operator only) | Internal operator tooling |
+
+A promote fans the core out from staging to every per-client repo via `scripts/promote_core_to_clients.py`, honoring each client's `_chalette/overrides.json` so client-custom skills are never clobbered.
+
+### Ship flow
+
+`ship-cr-plugin` skill in the chalette plugin handles the full release ritual:
+
+1. Pull staging fresh
+2. Status check (no unexpected dirty state)
+3. Release-readiness inspect
+4. Get version bump from the operator
+5. Get release notes summary
+6. Write plugin.json; `RELEASE_NOTES.md` is re-rendered from the release manifests after step 7 (the engineering changelog stays in the staging repo)
+7. **(v0.4.1+) MANDATORY release manifest at `shared/releases/v<X.Y.Z>.json`** — Step 5.5. Step 6 has a pre-commit gate that aborts if missing.
+8. Commit + push to staging
+9. Tell the owner to update in the Claude app (history: the Cowork-era ritual also mirrored to Cowork local-uploads to bypass its VHD cache)
+
+Production promote is a separate command (`promote v3.X.Y`). It fans staging out to every per-client repo (see above), commits + tags + pushes each.
+
+### Marketplace.json contract (non-negotiable)
+
+- **NO `version` field on the plugin entry.** Field present → the Claude app treats the plugin as "already at this version" and grays out Update button. Field absent → the app falls back to commit-SHA detection. Documented as Claude Code GitHub issues #52218, #26744, #31462.
+- Plugin internal name lowercase only. `CR` was rejected at sync; `cr` works. The Claude app title-cases it for display.
+
+---
+
+## File layout — where things live
+
+> **History (marked 2026-10-24).** The tree below is the v3-era layout. The release manifests now run to the current version under `shared/releases/`, `shared/scripts/` holds several hundred modules, and `tests/` is run through `tests/run_all.py`. A current module index is issue #373.
+
+```
+command-room/
+├── .claude-plugin/
+│   └── plugin.json                    # Plugin metadata + version
+├── RELEASE_NOTES.md                   # All releases, newest first (rendered from shared/releases/)
+├── README.md                          # Marketplace-facing description
+│
+├── skills/                            # <!-- skill-count -->60 skills, one directory each
+│   ├── morning-briefing/SKILL.md
+│   ├── inbox-triage/SKILL.md
+│   ├── workspace-manager/SKILL.md
+│   ├── command-room-onboarding/SKILL.md
+│   ├── command-room-update-bridge/SKILL.md
+│   ├── enable-command-room-schedules/
+│   │   ├── SKILL.md                   # The registration skill
+│   │   └── references/                # The 7 orchestrator prompts (6 daily widgets + 1 weekly markdown)
+│   │       ├── orchestrator-morning-brief.md
+│   │       ├── orchestrator-commitments.md
+│   │       ├── orchestrator-inbox.md
+│   │       ├── orchestrator-past-meetings.md   # End of Day — serves BOTH `end-of-day` and `past-meetings`
+│   │       ├── orchestrator-upcoming-meetings.md
+│   │       ├── orchestrator-dont-forget.md       # Pulse
+│   │       └── orchestrator-friday-wrap.md       # NEW v3.11.0 — weekly recap
+│   └── (40+ more skills)
+│
+├── shared/                            # Cross-skill helpers + contracts
+│   ├── CONTRACT.md                    # Rule 1-24 (path resolution, validators, etc.)
+│   ├── STOP_CONTRACT.md               # (v3.5.0+) Post-widget output rules
+│   ├── COMMITMENT_SCHEMA.md           # Canonical commitment event shape + variants
+│   ├── ORG_AND_THREAD_MODEL.md        # Entity graph schema
+│   ├── CHAT_ACTION_WIDGET.md          # Widget submission contract
+│   ├── EMAIL_DRAFT_PROTOCOL.md        # Send dispatch order (Zapier / native / standalone)
+│   ├── VOICE_CALIBRATION.md           # Voice-calibration protocol
+│   ├── WORKSPACE_API.md               # Atomic writes + classification rules
+│   ├── PASSIVE_CAPTURE.md             # Auto-event-capture spec
+│   ├── data-schemas/
+│   │   └── events.schema.json         # Canonical event-type enum + payload shapes
+│   ├── releases/                      # (v3.4.5+) Per-version release manifests
+│   │   ├── v3.4.2.json
+│   │   ├── v3.4.3.json
+│   │   ├── v3.4.4.json
+│   │   ├── v3.4.5.json
+│   │   └── v3.5.0.json
+│   └── scripts/                       # Python helpers (importable from skills via bash)
+│       ├── cru_match.py               # Commitment match scoring + load_open_commitments
+│       ├── decision_match.py          # Decision auto-resolve / supersede
+│       ├── confidence.py              # (v3.5.0+) Shared threshold constants
+│       ├── chat_output_renderer.py    # The renderer pipeline + validators
+│       ├── brief_writer.py            # .docx brief generator (deterministic format)
+│       ├── people_writer.py           # Canonical entities.json writer for people
+│       ├── atomic_write.py            # Atomic append/write helpers
+│       ├── telemetry.py               # pack_run telemetry builder
+│       ├── tz.py                      # Timezone helpers
+│       ├── tool_discovery.py          # MCP tool discovery (Gmail, Calendar, etc.)
+│       ├── zapier_send.py             # Zapier reply-thread helpers (latest message id)
+│       └── release_detectors/         # (v3.4.5+) Per-release manifest detectors
+│           └── always.py
+│
+├── references/                        # Higher-level architecture docs
+│   ├── HOW_COMMAND_ROOM_WORKS.md      # THIS DOC
+│   ├── VIEW_GENERATION.md             # How TIMELINE / DECISION_LOG / etc. regen
+│   ├── RELEASE_MANIFEST.md            # (v3.4.5+) Manifest schema + writing contract
+│   └── (more)
+│
+└── tests/                             # Python unit tests (pytest-style, run with `python tests/run_*.py`)
+    ├── run_cru_match_test.py          # 63 tests as of v3.5.0
+    ├── run_decision_match_test.py     # 16 tests
+    ├── run_release_detectors_test.py  # 10 tests
+    ├── run_chat_output_test.py
+    └── (more)
+```
+
+### What lives in your workspace (the operator's machine)
+
+```
+<workspace-root>/                       # the folder the user opened in the Claude app — whatever they named it, wherever it lives on their machine
+├── CLAUDE.md                           # Personal-instructions file Claude reads on every session
+├── _hq/
+│   ├── data/
+│   │   ├── events.jsonl                # The event log
+│   │   ├── entities.json               # People + orgs + projects
+│   │   ├── aliases.json                # Name disambiguation
+│   │   └── known-billing-domains.txt   # Optional override list for cr-inbox
+│   ├── meetings/                       # Per-meeting prep briefs + transcripts
+│   ├── briefings/                      # Per-day morning briefings
+│   ├── intel/                          # Captured intel
+│   ├── insights/                       # Weekly synthesis output
+│   ├── operator-reports/               # Monthly operating-lift reports
+│   ├── bugs/                           # (optional) Per-bug docs from inbound triage (the maintainer-side; chalette plugin owns the triage skill)
+│   ├── views/                          # Auto-regen markdown views
+│   │   ├── TIMELINE.md
+│   │   ├── DECISION_LOG.md
+│   │   ├── MASTER_TRACKER.md
+│   │   ├── PEOPLE.md
+│   │   └── RELATIONSHIPS.md
+│   └── PICKUP_RITUAL_command_room.md   # Session-pickup guide for next chat
+└── <per-project folders>/              # Auto-created when projects pass the threshold
+    ├── SESSION_NOTES_<folder name>.md
+    ├── deliverables/
+    └── (more)
+```
+
+---
+
+## Recurring bug classes to watch
+
+> **History (marked 2026-10-24).** The four classes still recur; the fifth, the prose-only mandate that a green battery cannot see, is the reason for the access layer and the instruction-layer guards (G67 to G76).
+
+Four classes have hit the plugin repeatedly in May 2026. Knowing them lets you triage future bugs in the right shape.
+
+### 1. Writer/consumer split
+
+A new feature ships that WRITES events to events.jsonl, but no view or skill is updated to READ those events. The feature appears to work (events land), but the user-facing surface never reflects them.
+
+Examples: Sam 2026-05-17 dual-shape commitments (consumer side only handled 2 of 5 shapes); v3.4.5 decision closure shipped without DECISION_LOG view filter update (Theme 3 catch); `intel_logged` writer was missing despite TIMELINE expecting the events (v3.5.0 fix).
+
+**Mitigation**: per `feedback_verify_consumers_before_ship.md` memory, the gate is "did I just ship a feature that writes events nobody reads?" Before every release, audit every consumer of any new event type + every field-name variant.
+
+### 2. Canonical-path improvisation
+
+The agent freelances around a canonical path when the canonical UX feels suboptimal. Examples: writing widget HTML to disk "for reopening later," narrating widget contents after `show_widget`, swapping to markdown when the widget feels too big, hand-rolling a substitute when a canonical install fails.
+
+**Mitigation**: validators + leak-scanner + ZERO-MANIPULATION CONTRACT (v3.5.0+ extracted to `shared/STOP_CONTRACT.md`). Each release closes one bypass; agent finds the next one. Pattern, not point fixes.
+
+### 3. Shape variance / data-field-name drift
+
+The same logical field appears under multiple names in events written by different writers. `owner_id` vs `owner_person_id` vs `owner`. `due` vs `due_date`. `status` vs `state`. `confidence` as float vs `"HIGH"`/`"high"` string.
+
+**Mitigation**: shared field-aware helpers (`cru_match._commitment_field` + alias chain). Consumers MUST use the helper. v3.5.0+ extends this to `event_references_person` for the Pulse cadence-detection class.
+
+### 4. Confidence threshold inconsistency
+
+The same word ("confidence threshold") used in multiple places with different scales. Commitments filter 0.7, past-meetings auto-commit 0.8, Pulse auto-apply 0.85, decision-CRU 0.65. Match scores from cru_match: 0.55/0.30.
+
+**Mitigation**: v3.5.0+ `shared/scripts/confidence.py` consolidates into `CONFIDENCE_*` (extraction confidence) and `MATCH_SCORE_*` (CRU match scoring) named constants. Two semantic categories, one canonical source.
+
+---
+
+## Debugging + verifying
+
+### Cowork-as-runtime-debugger
+
+When something misfires in Cowork, the fastest diagnostic is: have Cowork dump the raw state it's working with. The Cowork sandbox has tools the customer wouldn't normally invoke. Pattern:
+
+```
+Dump the current state of <X>. Output as fenced JSON / markdown. Don't summarize, don't explain — just print the raw state so the maintainer can debug.
+```
+
+Caught the v2.14.34 widget-wrapper-dropping bug after two days of misdiagnosis chasing CSS issues.
+
+### Running tests locally
+
+> **History (marked 2026-10-24).** Run the battery through `tests/run_all.py` (`--quick` for the quick check, `--changed` while building, no flag for the full battery), always with `PYTHONUTF8=1`, one battery per machine. Single suites still run by name as shown.
+
+```bash
+cd ~/repos/cr1-canonical/command-room/
+python tests/run_cru_match_test.py
+python tests/run_decision_match_test.py
+python tests/run_release_detectors_test.py
+python tests/run_chat_output_test.py
+```
+
+All should output `OK N tests passed`.
+
+### Verifying a manifest detector against your own events.jsonl
+
+```bash
+cd ~/repos/cr1-canonical/command-room/
+python shared/scripts/release_detectors/<detector_module>.py "<absolute path to your events.jsonl>"
+```
+
+Prints the `{applies, context}` JSON. Useful for previewing what the user would see before pushing a manifest item.
+
+### Reporting a bug
+
+Customers fire the `report-bug` skill (in this plugin). It diagnoses against the codebase, pattern-matches against known-issue patterns (about half of reports get a same-session fix without ever leaving the customer), and for the rest drafts a Gmail to `matthew@chaletteholdings.com` with the full diagnosis pre-filled.
+
+### Triaging inbound bug reports (the maintainer-only)
+
+The inbound triage skill (`process-bug-report`) was moved to the chalette internal plugin (`chaletteholdings/chalette` v0.5.0+) in v3.9.0. Customers never need it — they fire `report-bug` to send the bug; the maintainer fires `process bug report` in the chalette plugin to receive and triage it.
+
+---
+
+## Quick reference — trigger phrases by intent
+
+| If you want to... | Type |
+|---|---|
+| See today's brief | `morning briefing` / `brief me` |
+| Triage email | `triage my inbox` / `process my inbox` |
+| Process a meeting | `process meeting` / `meeting notes` |
+| Send follow-ups from a meeting | `follow up on the call` / `close the loop` |
+| Prep for a specific meeting | `prep me for [meeting]` / `prep the call with [name]` |
+| Get this week's recap | `weekly recap` / `summarize last week` |
+| Keep the workspace tidy | `clean up my workspace` / `tidy up` |
+| Look someone up | `who is [name]` / `tell me about [name]` |
+| Prep a 1:1 | `prep for 1:1 with [name]` |
+| Find dormant customers | `who went dark` / `dormant customer scan` |
+| See your deal pipeline | `show my pipeline` / `pipeline review` |
+| Open a new deal | `new deal [name] with [org]` |
+| Move / close a deal | `move [deal] to [stage]` / `mark [deal] won` / `mark [deal] lost` |
+| Draft an email | `draft an email to [recipient]` |
+| Draft a memo | `write a memo on [topic]` |
+| Draft a one-pager | `one-pager on [topic]` |
+| Draft a decision memo (multi-option tradeoff) | `decision memo on [topic]` / `tradeoff analysis` |
+| Build a board pack | `build the board pack for [date]` / `prep for the [date] board meeting` |
+| Stress-test a plan | `stress test this plan` / `pre-mortem` |
+| Schedule a meeting | `set up a 30-min with [name]` / `book time with [name]` |
+| Review a contract | `review this contract` / `redline this NDA` |
+| Make an introduction | `intro [A] to [B]` / `connect [A] and [B]` |
+| Surface stale decisions | `what decisions should I revisit` |
+| Surface stale conversations | `what conversations went silent` / `warm threads to revive` |
+| Scaffold an automation (after scan) | `scaffold #N` / `scaffold the [opportunity] one` |
+| Capture intel | Paste URL + say `intel` / `break this down` |
+| Run a project | `new project` / `go [project name]` / `archive [project]` |
+| List projects | `list projects` / `roster` |
+| See what you snoozed | `show muted` |
+| Update the plugin | (Claude app plugin settings → Update → fully quit and reopen the app) then `update command room` |
+| See your Workspace Map | `list active projects` (dashboards live in chat) |
+| Set up scheduled chats | `set up command room schedules` |
+| Change scheduled-chat timing | `change my schedule` / `move morning brief to 8 AM` |
+| Report a bug to the maintainer | `report bug` / `something's wrong` |
+| Pull in old context | `ingest context from [path]` / `import chatgpt` |
+| File documents into projects | `file documents from [path]` / `sort my downloads` |
+| See cost telemetry | `usage report` |
+| See operating-lift report | `operator report` |
+| Find automation opportunities | `automation scan` |
+| Search transcripts for a topic | `what did anyone say about [topic]` |
+
+---
+
+## When this doc gets stale
+
+Every release that adds a new skill, retires a skill, changes the daily-loop architecture, or adds a new shape variant should update the relevant section here. Treat it like CHANGELOG: append-style edits, version-tagged.
+
+If you're touching the substrate (events.jsonl schema), the daily loop (any of the 6 orchestrators), or the release-manifest system — bump the section here in the same release. The doc's purpose is to be the one place the operator (you, future-the maintainer, or a teammate) can read to ground themselves quickly. Stale = useless.

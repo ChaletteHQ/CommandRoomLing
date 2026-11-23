@@ -1,0 +1,1218 @@
+#!/usr/bin/env python3
+"""
+Late-fire detection + graceful degradation (Phase 3 Reliability, R4 — 2026-07;
+lateness ledger + run-mode gate v4.5.2 R2).
+
+The legacy Cowork scheduler fires a missed scheduled task at next app launch, hours or days
+after its cron slot — a "Friday wrap + Monday preview" delivered Sunday is
+stale, and pre-R4 nothing in the orchestrator knew it was late. Every chat
+orchestrator calls `check_lateness()` at the top of its run (the shared
+helper the spec prefers over per-orchestrator math) and branches on the
+tier it returns.
+
+WHO MAY BE LATE (v4.5.2 R2 — FINDINGS F-47 P1a / F-51). The v4.5.1 dogfood
+produced THREE fabricated late_fire receipts in one afternoon because the
+lateness check ran on ANY task activation and consulted no served-slot
+ledger: a manual re-run scored 356 min against a slot the 8:48 AM scheduled
+fire had already served; a manual fire scored 1306 min against YESTERDAY'S
+slot, served by the overnight catch-up; a cron change scored 317 min against
+a slot the change itself created. The contract now:
+
+  - Lateness is evaluated ONLY on scheduled-context fires (`fired_via` in
+    {scheduled, catchup}). A `manual` fire (typed trigger, Run Now, re-run)
+    is interactive and never late — tier `manual`, no event, no banner.
+  - THE FALLBACK DIRECTION IS `manual`, NOT `scheduled` (DOGFIX1, 2026-07-27
+    — the F-47 class recurring live at v5.2.1). `fired_via` reaches this
+    helper as a STRING an executing model substituted into a prose
+    placeholder, so the value can be anything: an unsubstituted
+    `'<scheduled|manual>'`, a freeform `'Run Now'` (the aliases cover
+    `run-now`/`run_now`, not the spaced spelling), `''`, `'typed trigger'`.
+    Pre-DOGFIX1 every one of those was truthy-and-not-`manual`, so it fell
+    through to the scheduled branch and fabricated lateness — the exact
+    direction RECEIPT_CONTRACT.md forbids ("**When uncertain, it is
+    manual**"). Now only the two literal scheduled-context values run the
+    math; EVERYTHING else is tier `manual`, `suppressed:
+    "unrecognized_run_mode"`, with the raw string returned as
+    `fired_via_raw` so the fallback is visible rather than swallowed.
+    Asymmetry, restated: a mis-labeled manual costs one missing lateness
+    note; a mis-labeled scheduled REFUSES A SURFACE A HUMAN ASKED FOR.
+  - The slot being served must be UNSERVED: the task's newest substrate
+    receipt (via the R1 receipt reader — all legacy shapes) is the
+    served-slot marker. A slot with a receipt after it is SERVED; there is
+    never a second late_fire for it — and, since SCHED1 (2026-08-17), never
+    a second DELIVERY of it either. A scheduled-context fire for a served
+    slot returns `directive: "skip_render"` and an ack line, and writes an
+    honest `skipped` receipt instead of re-rendering the surface. Detecting
+    the duplicate and then rendering it anyway is what this module did for
+    three full deliveries in one day.
+    RUNNOW1 (2026-08-23) bounds that skip to SERVED_RECEIPT_MAX_AGE after the
+    serving receipt, and stops a `skipped` receipt from counting as a serve.
+    Unbounded, the skip refused a human: a Run Now the model labelled
+    `scheduled` 1,945 minutes after Friday's slot got the "already ran"
+    ack instead of the surface, and asking again reproduced it. Self-fed, it
+    also re-armed from its own skip receipts, so two Run Now presses in a row
+    could both be declined. Past the bound the fire renders, tier `rerun`, and
+    the re-run's own receipt (`rerun_of`) is excluded from the served-slot
+    marker too, so a person may press as often as they like.
+  - A slot older than the task's most recent `schedule_config_changed`
+    event was minted retroactively by the change (the F-51 phantom) — never
+    scored. Schedule changes do not create missed slots.
+  - Scheduler `lastRunAt` stamps are NEVER consulted — the 2026-07-08
+    cleanup autopsy proved they land without execution (F-39: 9 tasks
+    stamped, one receipt). Receipts are the only served/not-served truth.
+
+TIER CONTRACT (thresholds tunable in LATENESS_TIERS — one shared constant):
+
+  manual   — fired_via=manual, OR any value that does not normalize into
+             SCHEDULED_CONTEXT: interactive fire, lateness not applicable.
+             No banner, no degradation, no event.
+  exempt   — silent task classes (SILENT_TASKS registry membership, never a
+             hardcoded name list): late is fine, they always run in full.
+             No banner, no degradation, no event.
+  none     — < 3h late, or the slot was already served / minted by a
+             schedule change (`suppressed` says which). Run normally,
+             no mention — EXCEPT on the served-slot skip, where `directive`
+             is `skip_render` and the tier is not the thing to read (SCHED1).
+  rerun    — the slot was served, this fire calls itself `scheduled`, and it
+             arrived more than SERVED_RECEIPT_MAX_AGE after the receipt that
+             served it (RUNNOW1). Render the surface IN FULL with the returned
+             `ack` as the first line: past that bound the fire is a person
+             pressing Run Now, and a person who asks gets the surface. No
+             banner, no degrade notice, no `late_fire` event — the slot was
+             delivered, so it was never a missed fire. An explicit `catchup`
+             never reaches this tier: it is the one run mode that can prove it
+             is not a person, so it keeps SCHED1's skip in full.
+  note     — 3h–24h late. Run normally; the output OPENS with the one
+             plain-English `banner` line.
+  degrade  — > 24h late. Do NOT render the full stale surface. The run
+             still performs every substrate write the task owes (events,
+             view updates) SILENTLY — invisible-write-loses-to-visible-
+             deliverable is the Bug #98 class, so orchestrators keep those
+             writes explicit — then posts only the one-line
+             `degrade_notice`. The next morning brief reads events.jsonl,
+             so no extra carry logic is needed beyond the writes landing.
+
+The returned `receipt_fired_via` is what the fire's closing `log_receipt`
+call passes as `fired_via`: `manual` on manual fires, `catchup` when a
+scheduled-context fire is serving a missed slot (note/degrade), else
+`scheduled` — standardizing the pattern F-51's receipt improvised.
+
+NARRATIVE RULE (F-47/F-50): the banner states the facts — what was
+scheduled, that this run is late. It never asserts a CAUSE ("the computer
+was likely asleep"): the helper cannot know why, and the dogfood logged
+four fabricated sleep narratives in one day on fires that weren't late at
+all. Orchestrators must not add a cause either.
+
+TIME RULES: all lateness math runs on ONE clock, end to end, AND SO DOES
+EVERY RENDERED TIME (LATETZ, 2026-07-28). `expected_fires` returns naive
+slots on that clock, `_now_local` is naive on that clock,
+`served_slot_markers` normalizes to it via `_to_local_naive`, and
+`_human_time` renders the value as-is.
+
+WHICH clock it is depends on the seat, and `clock_policy` decides it in one
+place (TZ1, 2026-09-20; gap analysis §0.18):
+
+  * LEGACY desktop seat — the MACHINE clock, because that is what cron
+    evaluates in there (confirmed live 2026-07-01, machine=Mountain vs
+    workspace=Pacific). Byte for byte what this module has always done.
+  * MERGED / CLOUD seat — the WORKSPACE zone. There is no machine to be
+    local to: the fire is a container that read PDT, the helpers run in a
+    sandbox VM on UTC, and the platform evaluates the cron in UTC. Reading
+    any of those three as "the customer's clock" is how a 7 AM brief gets
+    scored as seven hours late while looking green on the one seat whose
+    container happened to agree.
+
+The banner used to be converted into the workspace TZ at render time on the
+theory that "workspace TZ is presentation-only" meant "present in workspace
+TZ". It does not. The governing rule (references/HOW_COMMAND_ROOM_WORKS.md)
+is that CONVERSION HAPPENS ONCE, AT REGISTRATION/CHANGE TIME: change-schedule
+turns the user's requested wall time into machine-local via
+`workspace_time_to_machine()` and stores that in the cron. Converting again
+at render re-expressed the slot in a clock it was never authored in — a no-op
+only where machine tz == workspace tz. That masked it on M's PC and made CI
+red for 8 consecutive pushes ("8:45 AM" rendering as "1:45 AM" on a UTC
+runner; an Asia/Tokyo workspace named the wrong DAY entirely).
+
+Corollary worth knowing before touching this: `tz.to_local()` is for upstream
+CONNECTOR timestamps (Granola / Calendar / Gmail) and assumes a naive input is
+UTC. A cron slot is neither a connector timestamp nor UTC. Never route one
+through it.
+
+TELEMETRY: a `late_fire` event (registered in the Phase 1 vocabulary)
+is appended through the append_event() gate on note/degrade tiers, so
+cleanup / insight-generator can detect chronic patterns
+(`detect_chronic_lateness`) and propose a better default time — the
+proposal surfaces in the Monday note; the actual move goes through
+change-schedule. Telemetry never blocks the run (append failures are
+swallowed and reported in the return dict).
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import sys
+from pathlib import Path
+from typing import Optional
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from event_time import event_dt  # noqa: E402
+from receipts import (  # noqa: E402
+    TASK_PREDECESSORS,
+    _iter_events,  # the one defensive event reader — shared, not re-rolled
+    normalize_fired_via,
+    normalize_task_id,
+    receipt_task_id,
+)
+from schedule_config import (  # noqa: E402
+    SUPERSEDED_BY,
+    CronParseError,
+    is_silent_task,
+    load_schedule_config,
+    schedule_task_id,
+    serving_display_name,
+    task_display_name,
+)
+
+# MAINT1: the five pre-MAINT1 silent taskIds keep the silent-class exemption
+# forever — a not-yet-migrated install still fires them, and their work is
+# still silent write-side maintenance (late is fine, they run in full).
+_SUPERSEDED_SILENT_IDS = frozenset(
+    t for ids in SUPERSEDED_BY.values() for t in ids
+)
+from task_watchdog import expected_fires  # noqa: E402
+
+# The R4 behavior tiers — ONE shared constant, tunable here and nowhere else.
+LATENESS_TIERS = {
+    "note": _dt.timedelta(hours=3),
+    "degrade": _dt.timedelta(hours=24),
+}
+
+# RUNNOW1 (2026-08-23) — HOW LONG THE SERVED-SLOT SKIP STAYS IN FORCE, measured
+# from the receipt that served the slot. Inside this window a scheduled-context
+# fire for a served slot still skips, which is the one job the skip was built
+# for: a catch-up and a scheduled fire landing the SAME edition minutes apart
+# (module header, SCHED1). Outside it the fire renders, labelled as a re-run.
+#
+# WHY THERE HAS TO BE A BOUND. Run mode is self-reported and always will be
+# (`slot_provenance` below documents the search for a real discriminator and
+# its answer: there is none). So the skip's input signal cannot distinguish a
+# duplicate scheduler fire from a person pressing Run Now — and unbounded, it
+# refused a person: a Saturday Run Now scored 1,945 minutes against Friday's
+# 7 AM slot, found it served at 8:45 AM Friday, and posted "already ran … so
+# I'm not sending it twice" instead of the surface M asked for. M's ruling:
+# "I want to be able to shoot these off whenever I want."
+#
+# Two hours because that is generous for the duplicate the skip exists to catch
+# (minutes apart, at worst an app-launch catch-up chasing its own cron slot)
+# and nowhere near a day-later, days-later or 1,945-minute gap, which is
+# obviously a human. Tunable here and nowhere else, like LATENESS_TIERS.
+SERVED_RECEIPT_MAX_AGE = _dt.timedelta(hours=2)
+
+# Chronic-lateness proposal threshold: >24h-late fires in >=3 of the last 4
+# weeks triggers the better-default-time proposal (cleanup Monday note).
+CHRONIC_WINDOW_WEEKS = 4
+CHRONIC_MIN_LATE_WEEKS = 3
+
+# The ONLY two run modes lateness math may run on — the docstring's
+# "scheduled-context fires" set, now enforced in code rather than asserted in
+# prose (DOGFIX1). Anything outside it is manual by fail-safe, including the
+# unsubstituted prose placeholder. Deliberately NOT derived from
+# receipts.FIRED_VIA: that set contains `manual`, and this one is the
+# complement of it.
+SCHEDULED_CONTEXT = frozenset({"scheduled", "catchup"})
+
+
+def _now_local(workspace_root=None, env_date=None) -> _dt.datetime:
+    """Naive USER-local now — the clock this seat's schedules evaluate in.
+
+    `clock_policy` picks it once per seat: the machine clock on a legacy
+    desktop (R8, unchanged in every byte), the WORKSPACE zone on a merged/
+    cloud seat where "the machine" is a container that read PDT beside a
+    sandbox VM on UTC (TZ1, gap analysis §0.18). CLOCK1 is untouched by
+    that choice — the INSTANT is still corroborated against the workspace
+    ledger before it is returned; only the zone it is expressed in is
+    decided, and it is decided in one place rather than here. R8's real
+    rule — never correct an ALREADY-CONVERTED fire time a second time —
+    is what `_to_local_naive` and `_human_time` below still enforce.
+
+    Falls back to the raw machine clock if the helpers are unavailable.
+    """
+    try:
+        from clock_policy import user_local_now
+
+        return user_local_now(workspace_root, env_date=env_date)
+    except Exception:
+        try:
+            from trusted_now import trusted_now_local_naive
+
+            return trusted_now_local_naive(workspace_root, env_date=env_date)
+        except Exception:
+            return _dt.datetime.now()
+
+
+# CLOCK1 — one `clock_untrusted` telemetry event per PROCESS, not per fire.
+# The consumer is chronic-skew detection (cleanup / insight-generator), which
+# needs to know a machine has a bad clock, not how many times one fire noticed.
+_CLOCK_TELEMETRY_EMITTED: list = [False]
+
+
+def _clock_field(workspace_root, env_date) -> dict:
+    """CLOCK1's verdict, in the compact shape that travels to orchestrators.
+
+    Best-effort in every direction: an unresolvable workspace, an unreadable
+    ledger or a missing helper all produce the trusted-machine answer with no
+    notice, which is byte-identical to pre-CLOCK1 behaviour. Never raises.
+    """
+    fallback = {
+        "untrusted": False, "direction": None, "notice": None, "today": None,
+        "machine_now": None, "corroborated_now": None, "source": "machine",
+        "skew_seconds": 0.0, "anomaly": None,
+    }
+    try:
+        import trusted_now
+
+        trusted_now.register_workspace(workspace_root)
+        report = trusted_now.clock_report(workspace_root, env_date=env_date)
+    except Exception:
+        return fallback
+    if report.get("untrusted") and not _CLOCK_TELEMETRY_EMITTED[0]:
+        _CLOCK_TELEMETRY_EMITTED[0] = True
+        try:
+            from event_gate import append_event
+
+            append_event(
+                Path(workspace_root) / "_hq" / "data" / "events.jsonl",
+                {
+                    "type": "clock_untrusted",
+                    "source_skill": "late_fire",
+                    "data": {
+                        "direction": report.get("direction"),
+                        "source": report.get("source"),
+                        "skew_seconds": report.get("skew_seconds"),
+                        "machine_now": report.get("machine_now"),
+                        "corroborated_now": report.get("corroborated_now"),
+                    },
+                },
+                holder="trusted_now",
+            )
+        except Exception:
+            # Telemetry never blocks a fire (RELIABILITY.md core principle).
+            pass
+    return report
+
+
+def _human_time(dt_naive_local: _dt.datetime) -> str:
+    """Presentation-only rendering of a MACHINE-local naive datetime — the
+    clock cron evaluates in, and the clock every datetime in this module is
+    already expressed in (`_to_local_naive`). Rendered AS-IS. Never raises.
+
+    NO WORKSPACE-TZ CONVERSION HAPPENS HERE, DELIBERATELY (LATETZ, 2026-07-28).
+    This function used to do `dt.astimezone()` (attach the machine zone) and
+    then `tz.to_local(...)` (re-express in the workspace zone). That is a
+    second conversion of a value that was already converted once, and it
+    violates the governing rule in `references/HOW_COMMAND_ROOM_WORKS.md`:
+    **conversion happens ONCE, at registration/change time.** `change-schedule`
+    converts the user's requested wall time into machine-local via
+    `schedule_config.workspace_time_to_machine()` and stores THAT in the cron;
+    by the time a slot reaches this renderer the conversion is already done.
+    Doing it again re-expresses the slot in a clock it was never authored in.
+
+    It was a no-op only where machine tz == workspace tz — which is M's PC and
+    nowhere else. On the UTC CI runner with a `America/Los_Angeles` workspace
+    the 8:45 AM slot rendered as "1:45 AM", and main ran red for 8 consecutive
+    pushes on exactly that assertion. It is not only the hour that moves: a
+    workspace in Asia/Tokyo rendered the same Friday slot as "12:45 AM
+    Saturday", naming the wrong DAY in a customer-visible line.
+
+    `tz.to_local()` is the right helper for what it was built for — upstream
+    CONNECTOR timestamps (Granola / Calendar / Gmail), which arrive in UTC or
+    with a foreign offset and must be pulled into the user's zone. Its own
+    contract assumes a naive input is UTC. A cron slot is not a connector
+    timestamp, and it is not UTC. Do not route one through it.
+    """
+    # Defensive: the module's contract is naive user-local, but an aware
+    # value from a caller is normalized rather than rendered in a foreign zone.
+    if dt_naive_local.tzinfo is not None:
+        dt_naive_local = _to_local_naive(dt_naive_local)
+    day = dt_naive_local.strftime("%A")
+    hour = dt_naive_local.strftime("%I:%M %p").lstrip("0")
+    if dt_naive_local.minute == 0:
+        hour = dt_naive_local.strftime("%I %p").lstrip("0")
+    return f"{hour} {day}"
+
+
+def _to_local_naive(dt: Optional[_dt.datetime],
+                    workspace_root=None) -> Optional[_dt.datetime]:
+    """Aware -> naive in this seat's user-local clock (see `_now_local`)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    try:
+        from clock_policy import to_user_local_naive
+
+        return to_user_local_naive(dt, workspace_root)
+    except Exception:
+        return dt.astimezone().replace(tzinfo=None)
+
+
+# WALKFIX1 Item F — the suppression reason and the skip receipt's own reason
+# string, spelled once so the ledger and the tests read the same words.
+SUPPRESSED_PRE_REGISTRATION = "slot_predates_registration"
+PRE_REGISTRATION_SKIP_REASON = "slot predates registration"
+
+# SCHED1 — the served-slot suppression, its skip receipt's reason string, and
+# THE DIRECTIVE. The suppression string is unchanged from pre-SCHED1 (it is
+# already in the live ledger under this spelling); what is new is that the
+# return says what to DO about it.
+SUPPRESSED_SLOT_SERVED = "slot_already_served"
+SERVED_SLOT_SKIP_REASON = "slot already served"
+DIRECTIVE_SKIP_RENDER = "skip_render"
+
+# RUNNOW1 — the OTHER half of a served slot. Past SERVED_RECEIPT_MAX_AGE the
+# fire renders, and it renders LABELLED: the tier says re-run, `rerun_of` names
+# the delivery it is repeating, and the ack goes ABOVE the surface instead of
+# in place of it. The suppression stays `slot_already_served` on both halves on
+# purpose — the reason lateness is zeroed is the same fact in both cases, and a
+# second suppression string would fork every ledger reader that already knows
+# the first. The TIER is the discriminator, and `directive` is the render
+# decision exactly as SCHED1 left it: `skip_render` on the bounded half, `None`
+# here.
+TIER_RERUN = "rerun"
+RERUN_OF_FIELD = "rerun_of"
+
+# WALKFIX1 Item H — the two fields that make an off-slot fire self-explaining.
+SLOT_DELTA_FIELD = "slot_delta_minutes"
+OFFSLOT_FIELD = "fired_offslot"
+
+
+def slot_provenance(workspace_root, task_id, *, now=None,
+                    fired_via: str = "scheduled") -> dict:
+    """Where this fire landed relative to its own slot. `{}` when unresolvable.
+
+    THE FINDING (2026-08-10). M pressed Run Now on the past-meetings task at
+    12:38 for a 17:00 slot. The receipt read `fired_via: "scheduled"`, no
+    lateness, no vocabulary — a later auditor sees a 17:00 task firing at 12:38
+    with nothing on the record explaining the five-hour gap. The field HAS
+    richer vocabulary elsewhere (`catchup` on the same hour's commitment-triage
+    fire, `manual` for chat-verb re-fires), so Run Now is a third provenance
+    with no word for itself.
+
+    THE PROBE FOR A REAL DISCRIMINATOR, and its answer: there is none. The legacy scheduler
+    registers ONE prompt body per task and replays it byte-identically for the
+    cron fire and for a Run Now press — the bootloader's own Step 2.5 says so
+    in as many words ("this prompt is not evidence of the run mode"). The
+    scheduled-tasks runtime surfaces `taskId`, `cronExpression`, `fireAt`,
+    `enabled`, `nextRunAt`, `lastRunAt` and the prompt path; none of them says
+    how a given run started, and no environment variable carries it either.
+    Registration accepts no trigger-context parameter to bake one in. So the
+    run mode remains a judgement the fire makes about itself, and a fire that
+    genuinely cannot tell is required to say `manual`.
+
+    What CAN be stated as fact is where the fire landed, so that is what the
+    receipt carries: `slot_delta_minutes`, signed, from the slot the cron says
+    was most recently due (positive = after it), and `fired_offslot` when that
+    distance is outside the window the lateness math itself treats as on-slot.
+    The Run Now case then reads as a scheduled-context fire sitting a long way
+    off its slot with no lateness claimed — which is exactly what happened, and
+    is now legible without anyone reconstructing it from wall clocks.
+
+    `fired_offslot` is present ONLY when true, so an on-slot fire's receipt is
+    shape-identical to before. It is set on genuine catchups too, where it is
+    redundant with the tier already on the receipt; its load-bearing case is
+    the SUPPRESSED fire, where nothing else on the record explains the gap.
+
+    Best-effort and silent: no schedule entry, an unparseable cron or a
+    non-scheduled run mode all return `{}`.
+    """
+    if normalize_fired_via(fired_via) not in SCHEDULED_CONTEXT:
+        return {}
+    try:
+        now = now or _now_local(workspace_root)
+        entities = Path(workspace_root) / "_hq" / "data" / "entities.json"
+        # EOD2: resolve a RENAMED predecessor to the successor that carries
+        # the cron. A still-registered `past-meetings` fires on the
+        # `end-of-day` row's cadence — they are one chat — and without this
+        # the row is simply absent and the provenance goes quiet.
+        spec = load_schedule_config(entities).get(
+            schedule_task_id(normalize_task_id(task_id)))
+        if not spec or not spec.get("cron"):
+            return {}
+        fires = expected_fires(spec["cron"], now=now, count=1)
+    except Exception:  # noqa: BLE001 — provenance never blocks a receipt
+        return {}
+    if not fires:
+        return {}
+    delta = int((now - fires[0]).total_seconds() // 60)
+    out = {SLOT_DELTA_FIELD: delta, "scheduled_for": fires[0].isoformat()}
+    if abs(delta) >= LATENESS_TIERS["note"].total_seconds() // 60:
+        out[OFFSLOT_FIELD] = True
+    return out
+
+
+def _log_pre_registration_skip(workspace_root, task_id, *, scheduled,
+                               registered_at) -> bool:
+    """Write the honest SKIPPED receipt for a slot older than the task.
+
+    Best-effort — a receipt write must never block a fire (RELIABILITY.md).
+    Routed through the canonical `receipts.log_receipt` rather than a
+    hand-rolled event: a hand-rolled receipt is how the `fired_via` /
+    `lateness_tier` vocabulary drifted in the first place (F-49/F-50 P2c).
+    """
+    try:
+        from receipts import log_receipt
+
+        log_receipt(
+            workspace_root,
+            task_id,
+            status="skipped",
+            fired_via="scheduled",
+            surfaced=0,
+            extra_data={
+                "skipped_reason": PRE_REGISTRATION_SKIP_REASON,
+                "scheduled_for": scheduled.isoformat(),
+                "registered_at": registered_at.isoformat(),
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _log_served_slot_skip(workspace_root, task_id, *, scheduled,
+                          served_at) -> bool:
+    """Write the honest SKIPPED receipt for a slot a receipt already served.
+
+    Deliberately the SAME shape as the registration-floor skip above (SCHED1
+    §4-2): one skip vocabulary, so `usage-report`, the watchdog and
+    `served_slot_markers` itself read both suppressions with the reader they
+    already have, and no new event type ships with this fix.
+
+    Best-effort — a receipt write must never block a fire (RELIABILITY.md), and
+    routed through the canonical `receipts.log_receipt` rather than a
+    hand-rolled event (the F-49/F-50 vocabulary-drift class).
+
+    ⚠ IT CARRIES `window_incomplete_before`, AND THAT IS NOT DECORATION. This
+    build's own harness caught the regression: `catchup.last_successful_point`
+    read the NEWEST receipt of any status as "how far processing has actually
+    reached" until cr1#740 (it now reads past a skip), so a skip receipt — which
+    processes nothing — advanced the catch-up basis to the moment of the
+    duplicate. The marker stays: it records the reach on the receipt itself, for
+    any reader of the raw row. Reproduced on a
+    fixture: an evening slot served Friday 17:05, a scheduled duplicate on
+    Monday midday, and the REAL Monday evening fire then computed its window
+    from Monday midday and dropped the entire Friday-to-Sunday span. Before
+    this fix the duplicate at least DID the work while it re-rendered; the
+    honest skip does not, so it has to say where processing really reached.
+    `catchup` already owns the mechanism for exactly this (the marker wins over
+    the receipt's own timestamp) — the skip just has to fill it in with the
+    reach measured BEFORE the skip lands.
+
+    ⚠⚠ AND THE MARKER IS SEEDED BEFORE ANY COMPUTATION THAT CAN FAIL (fix
+    round, REVIEW_SCHED1 N-1). The first cut computed the marker inside
+    `try: … except Exception: pass` and wrote the receipt either way, so a
+    failed computation shipped an UNMARKED skip — and an unmarked skip is
+    precisely the regression above, back through the fallback path with a
+    healthy-looking receipt in front of it. It is reachable:
+    `last_successful_point` lets a substrate read failure propagate by
+    contract (a locked or half-written ledger, a multi-machine sync
+    collision), which is the flakiness class everything around it already
+    defends against. So `served_at` — already in hand, and the answer
+    `last_successful_point` returns whenever the served receipt carries no
+    inherited marker — goes in FIRST as the floor, and the computation only
+    ever REFINES it downward to an inherited marker. There is no path from
+    here that writes a skip receipt claiming reach it does not have.
+
+    Imported lazily on purpose: `catchup` imports this module at module level.
+    """
+    extra = {
+        "skipped_reason": SERVED_SLOT_SKIP_REASON,
+        "scheduled_for": scheduled.isoformat(),
+        "served_at": served_at.isoformat(),
+    }
+    try:
+        from catchup import WINDOW_INCOMPLETE_FIELD, last_successful_point
+    except Exception:  # noqa: BLE001 — no catchup module, nothing to name
+        WINDOW_INCOMPLETE_FIELD = None
+        last_successful_point = None
+    if WINDOW_INCOMPLETE_FIELD:
+        # THE FLOOR. Never later than the fire that actually did the work.
+        extra[WINDOW_INCOMPLETE_FIELD] = served_at.isoformat()
+        try:
+            reach = last_successful_point(workspace_root, task_id).get("dt")
+            if reach is not None:
+                extra[WINDOW_INCOMPLETE_FIELD] = reach.isoformat()
+        except Exception:  # noqa: BLE001 — a failed refinement keeps the
+            pass          # floor; it never costs the marker itself
+
+    try:
+        from receipts import log_receipt
+
+        log_receipt(
+            workspace_root,
+            task_id,
+            status="skipped",
+            fired_via="scheduled",
+            surfaced=0,
+            extra_data=extra,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def served_slot_markers(workspace_root, task_id) -> dict:
+    """One pass over the substrate for the two facts the lateness ledger
+    needs — naive datetimes on this seat's user-local clock (None = never):
+
+      last_receipt         — newest receipt for this task, ANY legacy shape
+                             (the R1 reader's matcher), EXCLUDING skips. This
+                             is the served-slot marker: receipts are the only
+                             served/not-served truth (F-39 — scheduler
+                             lastRunAt stamps land without execution).
+      last_skip            — newest `status: "skipped"` receipt for this task.
+                             Visible, and deliberately NOT the served marker.
+      last_rerun           — newest receipt carrying `rerun_of`: a delivery a
+                             PERSON asked for. Visible, counted as a delivery
+                             for the ack, and deliberately NOT the served
+                             marker either.
+      last_failed          : newest `surface_failed` receipt (by status or by
+                             type): a fire that could not render (W2 SCORE2
+                             MUST 3). Visible, and never the served marker.
+      last_schedule_change — newest `schedule_config_changed` event naming
+                             this task (change-schedule writes
+                             `data.changes: [{task_id, cron, enabled}]`).
+                             A slot older than this was minted retroactively
+                             by the change (F-51) — never a missed fire.
+      registered_at        — OLDEST `schedule_created` event naming this task
+                             (WALKFIX1 Item F). The registration floor: a task
+                             cannot have missed a slot that predates its own
+                             existence.
+
+    WHY `registered_at` IS A THIRD MARKER AND NOT PART OF THE SECOND ONE.
+    `last_schedule_change` reads `schedule_config_changed` only, which
+    change-schedule writes when an EXISTING task is re-timed. A first
+    registration writes `schedule_created` and nothing else, so the F-51
+    suppression never applied to it — which is why "add staff meeting" on a
+    Sunday immediately catch-up-fired Friday's 9 AM slot, 2.5 days before the
+    task existed, and greeted the customer with "Skipped the full Staff
+    Meeting" as the first thing the feature ever said to them.
+
+    OLDEST, not newest: re-running the setup ritual re-registers every task
+    idempotently, and keying on the newest `schedule_created` would move the
+    floor forward on every re-run and quietly suppress real missed slots.
+
+    WHY A SKIP IS NOT A SERVE (RUNNOW1 §DD-1, 2026-08-23). Until this build the
+    matcher had no status filter, so the honest `skipped` receipt SCHED1 writes
+    when it declines a delivery came straight back as `last_receipt` — the
+    served-slot marker — for the NEXT fire. The skip therefore re-armed itself
+    from its own output: the first refusal made the second refusal correct, the
+    second made the third, and nothing in the ledger ever recorded a delivery.
+    Two consecutive Run Now presses could both be declined, the second one
+    citing the first one's refusal as the delivery it was not sending twice.
+    A skip processes nothing and delivers nothing; it is a record that a fire
+    declined, not evidence a slot was served. It stays fully visible as
+    `last_skip` — the receipt/watchdog side still needs to see that a fire
+    declined — it simply stops standing in for a delivery.
+
+    Both suppressions write `status: "skipped"` (the registration floor and the
+    served-slot skip share one shape by design, SCHED1 §4-2), so both are
+    filtered here, and correctly: neither one delivered anything either.
+
+    AND A RE-RUN IS NOT A SERVE EITHER (RUNNOW1 §DD-5, coordinator-authorized
+    2026-08-23 under M's R-2). A receipt carrying `rerun_of` records a delivery
+    a PERSON asked for, not the scheduled delivery of a slot. Left in the
+    served-slot marker it re-armed the skip against the very person it had just
+    served: press Run Now, get the surface, press again fifteen minutes later
+    and be told "already ran at 3:25 PM, so I'm not sending it twice" — the
+    refusal M ruled against, arriving by a different door. The same principle
+    as the skip filter, applied to the other kind of receipt this branch
+    produces: only a receipt that SERVED THE SLOT is a served-slot marker.
+
+    A re-run receipt IS still a delivery, and `last_rerun` keeps it visible so
+    the re-run ack can name the last time the surface actually ran. What it is
+    not is evidence the SLOT was served — that fact belongs to `last_receipt`
+    alone, and the two-hour bound is measured against it and nothing else, so
+    a genuine scheduled duplicate is still stopped exactly as before.
+    """
+    canonical = normalize_task_id(task_id)
+    # CTS1 — a split successor's ledger also reads its RETIRED predecessor's
+    # receipts and schedule changes (receipts.TASK_PREDECESSORS): the morning
+    # after the commitments split, the 8:30 slot was served by a receipt
+    # written under the old id — without this the first post-split fire
+    # fabricates lateness for a slot that ran.
+    accepted = {canonical} | set(TASK_PREDECESSORS.get(canonical, ()))
+    last_receipt: Optional[_dt.datetime] = None
+    last_skip: Optional[_dt.datetime] = None
+    last_rerun: Optional[_dt.datetime] = None
+    last_failed: Optional[_dt.datetime] = None
+    last_change: Optional[_dt.datetime] = None
+    registered: Optional[_dt.datetime] = None
+    for ev in _iter_events(workspace_root):
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "schedule_created":
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            named = normalize_task_id(data.get("taskId")
+                                      or data.get("task_id") or "")
+            if named in accepted:
+                dt = event_dt(ev)
+                if dt is not None and (registered is None or dt < registered):
+                    registered = dt
+            continue
+        if ev.get("type") == "schedule_config_changed":
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            changes = data.get("changes")
+            named = []
+            if isinstance(changes, list):
+                named = [normalize_task_id(c.get("task_id") or c.get("taskId"))
+                         for c in changes if isinstance(c, dict)]
+            else:  # defensive: flat single-task shapes
+                named = [normalize_task_id(data.get("task_id") or data.get("taskId"))]
+            if accepted & set(named):
+                dt = event_dt(ev)
+                if dt is not None and (last_change is None or dt > last_change):
+                    last_change = dt
+            continue
+        if receipt_task_id(ev) in accepted:
+            dt = event_dt(ev)
+            if dt is None:
+                continue
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            # `status` on today's receipts, `outcome` on the pre-R1 legacy
+            # shape — the same pair `receipts.iter_receipts` reads, so a
+            # legacy skip cannot slip past this filter under its old key.
+            status = data.get("status") or data.get("outcome")
+            if status == "skipped":
+                if last_skip is None or dt > last_skip:
+                    last_skip = dt
+                continue
+            if status == "surface_failed" or ev.get("type") == "surface_failed":
+                # CB-T2B-4. A fire that could not render served nothing, so
+                # its receipt is never the served-slot marker: a catch-up for
+                # the same slot tries again instead of acking a delivery that
+                # did not happen. W2 SCORE2 MUST 3 (CB-T2B-4 F-1): it is kept
+                # as `last_failed`, so the retry's `late_fire` row can say it
+                # followed a failure and never feeds the chronic proposal.
+                if last_failed is None or dt > last_failed:
+                    last_failed = dt
+                continue
+            if data.get(RERUN_OF_FIELD):
+                # A delivery a person asked for. Still a delivery (it is what
+                # the next re-run's ack names), never a served-slot marker.
+                if last_rerun is None or dt > last_rerun:
+                    last_rerun = dt
+                continue
+            if last_receipt is None or dt > last_receipt:
+                last_receipt = dt
+    return {
+        "last_receipt": _to_local_naive(last_receipt, workspace_root),
+        "last_skip": _to_local_naive(last_skip, workspace_root),
+        "last_rerun": _to_local_naive(last_rerun, workspace_root),
+        "last_failed": _to_local_naive(last_failed, workspace_root),
+        "last_schedule_change": _to_local_naive(last_change, workspace_root),
+        "registered_at": _to_local_naive(registered, workspace_root),
+    }
+
+
+def check_lateness(
+    workspace_root,
+    task_id: str,
+    *,
+    fired_via: str = "manual",
+    now: Optional[_dt.datetime] = None,
+    env_date: Optional[str] = None,
+    emit: bool = True,
+) -> dict:
+    """Compute this fire's lateness tier. Call at the top of every chat
+    orchestrator run, BEFORE any surface is rendered.
+
+    Args:
+      fired_via: the run mode the orchestrator detected
+        (`shared/RECEIPT_CONTRACT.md` § Run-mode detection): `scheduled`
+        for scheduler-initiated fires (including app-launch catch-up
+        deliveries of a missed slot), `manual` for anything a human caused
+        (typed trigger, Run Now, re-run). Manual fires are never late —
+        no tier math, no event, no banner (F-47 P1a).
+
+        ONLY the two SCHEDULED_CONTEXT values run the math. Every other
+        input — including an omitted argument, which is why the default is
+        `manual` and not `scheduled` — is treated as manual (DOGFIX1). A
+        caller that means `scheduled` must say so in that exact word; there
+        is no spelling of "I don't know" that degrades a surface.
+
+      env_date: the session's own date ("Today's date is YYYY-MM-DD"), which
+        the orchestrator substitutes from its context. CLOCK1's second
+        corroboration source, and the only one that can catch a clock running
+        FAST. Like `fired_via` it is a model-substituted string, so it can
+        arrive as anything — an unsubstituted placeholder, an empty string, a
+        sentence. Anything unparseable is treated as absent, silently: a
+        garbage session date never moves the clock and never blocks a run.
+
+    Returns:
+      {task, tier: manual|exempt|none|note|degrade|rerun|unknown,
+       fired_via (normalized, fail-safed input), fired_via_raw (what the
+       caller actually passed — evidence when the fallback fired),
+       receipt_fired_via (what the fire's closing log_receipt call passes:
+       manual|scheduled|catchup), suppressed (None | "manual_fire" |
+       "unrecognized_run_mode" | "slot_already_served" |
+       "slot_created_by_schedule_change"), lateness_minutes,
+       scheduled_for (ISO, machine-local), banner (note tier),
+       degrade_notice (degrade tier), directive (SCHED1: None | "skip_render"),
+       served_at (both served-slot halves),
+       ack + skip_receipt_logged (skip_render), rerun_of + ack (rerun tier),
+       event_logged (bool),
+       clock (CLOCK1: {untrusted, direction, notice, today, machine_now,
+       corroborated_now, source, skew_seconds, anomaly})}
+
+    `directive` IS THE RENDER DECISION (SCHED1, 2026-08-17), and it is present
+    on every tier so there is one unconditional thing to read. `skip_render`
+    means: the slot this fire is serving was ALREADY delivered (a receipt
+    exists after it), so post `ack` — one line, no surface, no widget, no
+    other output — and stop. The honest `skipped` receipt is already written by
+    the time you see it; do not write a second receipt for the same fire. That
+    promise is kept in code, not asserted: the directive is emitted ONLY when
+    the skip receipt actually landed (fix round, N-5), so a fire that renders
+    nothing has always recorded something.
+    That last sentence is the fix: pre-SCHED1 this path returned tier `none`
+    ("run normally"), the fire re-rendered the full surface, and the ledger
+    ended a day with three duplicate deliveries whose duplication it had
+    detected each time. A `manual` fire never reaches this branch — a human who
+    asks for a surface gets the surface.
+
+    `skip_render` IS BOUNDED (RUNNOW1, 2026-08-23) — on `fired_via="scheduled"`
+    only. It is emitted for a scheduled fire only within
+    `SERVED_RECEIPT_MAX_AGE` of the receipt that served the slot, and for an
+    explicit `catchup` always (a catchup is the one run mode that can prove it
+    is not a person; a Run Now labels itself `scheduled`). A scheduled fire
+    arriving LATER for a served slot returns tier
+    `rerun`, `directive: None`, `rerun_of` (the last actual delivery) and an `ack`
+    the orchestrator posts ABOVE the surface rather than in place of it: past
+    two hours the fire is a person pressing Run Now, and the run mode it
+    reports about itself cannot tell you otherwise. `suppressed` is
+    `slot_already_served` on BOTH halves — the fact that zeroes lateness is the
+    same one — so the TIER, not the suppression, says which happened.
+
+    REPEATED PRESSES EACH RENDER (§DD-5). A re-run's own receipt carries
+    `rerun_of` and is therefore excluded from the served-slot marker, exactly
+    as a `skipped` receipt is: it records a delivery a PERSON asked for, not
+    the scheduled delivery of a slot. Without that exclusion the second press
+    fell inside the bound of the FIRST press's receipt and was refused — the
+    same refusal by a different door. The bound is measured against
+    `served_at` (the slot's serving receipt) and nothing else, so a genuine
+    scheduled duplicate is stopped exactly as before; `rerun_of` in the return
+    names the last time the surface actually ran, which on a second press is
+    the previous re-run.
+
+    ⚠ `rerun_of` IS LOAD-BEARING ON THE RECEIPT, not audit decoration. The
+    orchestrator carries it into `log_receipt`'s `extra_data`; a re-run receipt
+    written WITHOUT it reads as an ordinary scheduled delivery and re-arms the
+    skip against the next press for two hours.
+
+    `clock` is present on EVERY tier including `manual` — a clock that cannot
+    be trusted is a fact about the run, not about the lateness verdict, and a
+    manual fire renders "today" from it exactly as a scheduled one does. When
+    `clock["notice"]` is set the orchestrator renders it as the FIRST line of
+    output, the same mechanism as the lateness banner.
+
+    `unknown` (unparseable cron / no schedule entry) behaves like `none` —
+    the fire runs normally; lateness detection is best-effort and must
+    never block the primary output.
+    """
+    # CLOCK1 — corroborate the clock BEFORE any date-relative math runs on it,
+    # and register the root so every writer that stamps its own `ts` later in
+    # this fire reads the corrected instant too.
+    clock = _clock_field(workspace_root, env_date)
+    now = now or _now_local(workspace_root, env_date)
+    normalized = normalize_fired_via(fired_via)
+    # Fail-safe by asymmetry, in code (DOGFIX1). `normalize_fired_via` returns
+    # unknown strings UNCHANGED (only absent/blank comes back None), so a
+    # `via != "manual"` test read every garbage value as scheduled. Test the
+    # positive set instead: recognized-scheduled, or manual.
+    recognized = normalized in SCHEDULED_CONTEXT
+    via = normalized if recognized else "manual"
+    out = {
+        "task": task_id,
+        "tier": "none",
+        "fired_via": via,
+        "fired_via_raw": fired_via,
+        "receipt_fired_via": "manual" if via == "manual" else "scheduled",
+        "suppressed": None,
+        "lateness_minutes": 0,
+        "scheduled_for": None,
+        "banner": None,
+        "degrade_notice": None,
+        # SCHED1 — present on EVERY tier, None on all but the served-slot skip.
+        # Always-present rather than added-when-set so orchestrator prose has
+        # one unconditional thing to read, and so a test can pin its ABSENCE
+        # on the paths that must keep rendering.
+        "directive": None,
+        "clock": clock,
+        "event_logged": False,
+    }
+    if via == "manual":
+        # Interactive fire — lateness is not a concept that applies (F-47
+        # P1a: a manual Run-now self-classified as a 356-min-late scheduled
+        # fire). No slot math, no event, no narrative.
+        out["tier"] = "manual"
+        # Distinguish a caller that SAID manual from one whose value did not
+        # resolve. Same tier and same behaviour — every orchestrator's
+        # existing `manual` branch handles both with no prose change — but a
+        # reviewer, a test, and the receipt can all see which happened.
+        out["suppressed"] = (
+            "manual_fire" if normalized == "manual" else "unrecognized_run_mode"
+        )
+        return out
+    if is_silent_task(task_id) or task_id in _SUPERSEDED_SILENT_IDS:
+        out["tier"] = "exempt"
+        return out
+
+    try:
+        entities = Path(workspace_root) / "_hq" / "data" / "entities.json"
+        config = load_schedule_config(entities)
+        # EOD2 — same resolution as `slot_provenance` above, and this is the
+        # one that matters most: a `past-meetings` fire on an un-renamed
+        # machine must still be scored against the 5 PM slot it serves.
+        # Returning `unknown` here would switch lateness detection off for
+        # the entire un-renamed fleet on the day the rename shipped, with no
+        # symptom anywhere.
+        spec = config.get(schedule_task_id(task_id))
+        if not spec:
+            out["tier"] = "unknown"
+            return out
+        fires = expected_fires(spec["cron"], now=now, count=1)
+    except Exception:  # CronParseError, unreadable entities, anything — best-effort
+        out["tier"] = "unknown"
+        return out
+    if not fires:
+        out["tier"] = "unknown"
+        return out
+
+    scheduled = fires[0]
+    lateness = now - scheduled
+    out["scheduled_for"] = scheduled.isoformat()
+    out["lateness_minutes"] = int(lateness.total_seconds() // 60)
+
+    # CUT-PLATE (2026-09-06) — the fire introduces ITSELF by the surface
+    # it serves: a `past-meetings` registration fires the End of Day pack and
+    # its banner / ack / degrade notice say "End of Day", never the
+    # predecessor's sidebar name (the v5.28.0 attended test saw "your Past
+    # Meetings last ran 5:10 PM Friday" on the day-close). Every other id
+    # resolves to the same name as before.
+    display = serving_display_name(task_id)
+    if lateness < LATENESS_TIERS["note"]:
+        return out  # tier "none" — run normally, no mention
+
+    # This fire LOOKS late — consult the lateness ledger before believing
+    # it (v4.5.2 R2). Best-effort like everything here: if the substrate is
+    # unreadable the markers come back None and the tier math proceeds.
+    try:
+        markers = served_slot_markers(workspace_root, task_id)
+    except Exception:
+        markers = {"last_receipt": None, "last_skip": None, "last_rerun": None,
+                   "last_schedule_change": None, "registered_at": None}
+    last_receipt = markers["last_receipt"]
+    last_rerun = markers.get("last_rerun")
+    last_change = markers["last_schedule_change"]
+    registered_at = markers.get("registered_at")
+    if registered_at is not None and scheduled < registered_at:
+        # WALKFIX1 Item F — the REGISTRATION FLOOR. A task cannot be late for a
+        # slot that predates its own existence, and the customer cannot have
+        # missed an appointment they never made. Live twice on 2026-08-09/10:
+        # "add staff meeting" on a Sunday catch-up-fired Friday 9 AM (3,499
+        # minutes "late") and the first thing the feature ever said to its new
+        # owner was that it had skipped something.
+        #
+        # Three costs, all removed here: the first-touch apology for a failure
+        # nobody committed; a `late_fire` datapoint feeding the better-default-
+        # times loop about a slot that could not have fired on time; and a full
+        # catchup fire for a period the customer never owned.
+        #
+        # An honest SKIP receipt is written instead of a degraded catchup fire,
+        # so the slot is accounted for rather than silently dropped — the same
+        # posture every other suppression on this path takes.
+        out["suppressed"] = SUPPRESSED_PRE_REGISTRATION
+        out["lateness_minutes"] = 0
+        out["registered_at"] = registered_at.isoformat()
+        if emit:
+            out["skip_receipt_logged"] = _log_pre_registration_skip(
+                workspace_root, task_id, scheduled=scheduled,
+                registered_at=registered_at)
+        return out
+    if last_receipt is not None and last_receipt >= scheduled:
+        # The slot was served — a receipt exists after it. This fire is a
+        # re-run / second delivery, not a late first serve (F-47 triggers
+        # 1 and 2).
+        #
+        # SCHED1 (2026-08-17) — WHAT CHANGED, AND WHY IT HAD TO. Pre-SCHED1
+        # this branch set the suppression, returned tier `none`, and tier
+        # `none` means "run normally, no mention" — so the guard detected the
+        # duplicate and the fire re-rendered the whole surface anyway. Three
+        # full duplicate deliveries in one day rode exactly this path (plus a
+        # friday-wrap pair on 07-24), and one of them became the anchor a
+        # later surface counted its wins from. The evidence was in hand every
+        # time; nothing acted on it.
+        #
+        # WHY A DIRECTIVE AND NOT JUST A RECEIPT. WALKFIX1's registration
+        # floor is the precedent and the warning: it writes an honest skip
+        # receipt and then lets the fire run, observed live as skip-then-
+        # full-run. A receipt is a record, not an instruction. So the return
+        # carries `directive` — the one field orchestrator prose branches on —
+        # plus the ack line to post in place of the surface.
+        #
+        # THE RESIDUAL, STATED HONESTLY (spec §0-2). Run mode is
+        # self-reported: the legacy scheduler replays one byte-identical prompt for a cron
+        # fire and a Run Now press, so this module cannot attest that a fire
+        # calling itself `scheduled` really was. A manual fire that
+        # mislabels itself degrades to a skip plus an ack — cheap, honest, and
+        # recoverable by asking again, which classifies manual. The reverse
+        # (a scheduled duplicate that calls itself manual) renders, which is
+        # the same direction of failure the whole run-mode contract chose.
+        #
+        # THE DIRECTIVE FOLLOWS THE RECEIPT, NOT THE OTHER WAY AROUND (fix
+        # round, REVIEW_SCHED1 N-5). The clause the orchestrators carry states
+        # as FACT that the honest `skipped` receipt is already written and
+        # forbids the fire from writing a second one. If the write failed and
+        # the directive went out anyway, the fire would render nothing AND
+        # record nothing — a false zero, the worse of the two failures. So a
+        # failed write degrades to the pre-SCHED1 shape: no directive, no ack,
+        # the fire renders, and the day is at least on the record. Not
+        # reachable on today's fleet (`pack_run` is valid for every task in
+        # `orchestrator-map.json`), which is exactly when a fence is cheap.
+        #
+        # RUNNOW1 (2026-08-23) — THE SKIP IS BOUNDED. Everything above is
+        # unchanged INSIDE `SERVED_RECEIPT_MAX_AGE` of the receipt that served
+        # the slot, which is the duplicate this branch was built for. Past it
+        # the fire renders, labelled `TIER_RERUN`, because past it the fire is
+        # a person: the residual stated two paragraphs up ("a manual fire that
+        # mislabels itself degrades to a skip plus an ack — cheap, honest, and
+        # recoverable by asking again") turned out to be neither cheap nor
+        # recoverable in the field. A Saturday Run Now on Morning Brief scored
+        # 1,945 minutes against Friday's 7 AM slot, found it served at 8:45 AM
+        # Friday, and answered the person with "already ran … so I'm not
+        # sending it twice" — and asking again produces the same self-labelled
+        # `scheduled` and the same refusal, because the label is the model's
+        # own judgement about a byte-identical prompt, not a signal. M's
+        # ruling: "I want to be able to shoot these off whenever I want."
+        #
+        # THE BOUND IS THE ONLY DISCRIMINATOR AVAILABLE, and it is a good one:
+        # the duplicate the skip exists for lands minutes after the delivery,
+        # a person lands hours or days after it. Nothing here pretends to know
+        # the run mode — D1 of the spec is explicit that no such signal exists
+        # and that inventing one is the thing not to do.
+        #
+        # AND IT IS SCOPED TO `scheduled` (review F-4, 2026-08-23). `catchup`
+        # is the one run mode where a REAL discriminator does exist: it is
+        # asserted by the app-launch recovery path, and a person pressing Run
+        # Now never arrives labelled `catchup` — the whole finding is that a
+        # Run Now labels itself `scheduled`. So an explicit `catchup` past the
+        # bound is a second recovery fire for a slot already delivered, which
+        # is precisely the duplicate SCHED1 exists to stop, and letting the
+        # bound render it would re-open that delivery in exchange for nothing.
+        # SCHED1 is preserved in full on the one context that can prove it is
+        # not a human. Pinned in run_runnow1_test [8e].
+        out["suppressed"] = SUPPRESSED_SLOT_SERVED
+        out["lateness_minutes"] = 0
+        out["served_at"] = last_receipt.isoformat()
+        if via == "scheduled" and (now - last_receipt) > SERVED_RECEIPT_MAX_AGE:
+            # BEYOND THE BOUND — render, and say so. Deliberately an early
+            # return rather than a fall-through to the catch-up branch below,
+            # which spec DD-2 phrased as "drops through": that branch writes a
+            # `late_fire` telemetry row and a "running late" banner (or, past
+            # 24h, `degrade_notice`: "Skipped the full …"). Both are false
+            # about a slot that WAS delivered — the surface is not late, it is
+            # repeated — and the better-default-times loop must not learn a
+            # missed slot from a delivered one (SCHED1 pins that telemetry
+            # off on this path). So the served branch keeps its early return
+            # and spec DD-3's `tier: "rerun"` is what it returns.
+            #
+            # Note what this restores: pre-SCHED1 this exact fire rendered the
+            # full surface silently (tier `none` = "run normally, no mention").
+            # The re-run tier renders the same surface WITH a line saying it is
+            # a repeat, which is strictly more honest than either the silent
+            # render or the refusal.
+            #
+            # WHICH DELIVERY THE LINE NAMES (§DD-5). `served_at` above is the
+            # SLOT's serving receipt — the fact this branch turns on, and the
+            # only thing the two-hour bound is measured against. The line the
+            # reader sees names the last time the surface actually RAN, which
+            # on a second press is the previous RE-RUN, not the scheduled
+            # delivery hours or days earlier. Two different facts, kept apart:
+            # a re-run receipt is a delivery but never a served-slot marker,
+            # so repeated presses each render and each say something true.
+            last_delivery = last_receipt
+            if last_rerun is not None and last_rerun > last_delivery:
+                last_delivery = last_rerun
+            out["tier"] = TIER_RERUN
+            out[RERUN_OF_FIELD] = last_delivery.isoformat()
+            out["ack"] = (
+                f"This is a re-run — your {display} last ran "
+                f"{_human_time(last_delivery)}."
+            )
+            return out
+        logged = True
+        if emit:
+            logged = _log_served_slot_skip(
+                workspace_root, task_id, scheduled=scheduled,
+                served_at=last_receipt)
+            out["skip_receipt_logged"] = logged
+        if logged:
+            out["directive"] = DIRECTIVE_SKIP_RENDER
+            out["ack"] = (
+                f"Your {display} already ran at {_human_time(last_receipt)}, "
+                f"so I'm not sending it twice."
+            )
+        return out
+    if last_change is not None and last_change > scheduled:
+        # The slot predates the task's latest schedule change — it only
+        # exists because the change re-anchored the cron (F-51's phantom
+        # 9:30 slot, minted at 2:46 PM). Never a missed fire.
+        out["suppressed"] = "slot_created_by_schedule_change"
+        out["lateness_minutes"] = 0
+        return out
+
+    # Serving a genuinely missed slot — the receipt says catchup.
+    out["receipt_fired_via"] = "catchup"
+    when = _human_time(scheduled)
+    if lateness < LATENESS_TIERS["degrade"]:
+        out["tier"] = "note"
+        # Facts only — never assert a cause (F-47/F-50: four fabricated
+        # "computer was likely asleep" narratives in one dogfood day).
+        out["banner"] = (
+            f"This is your {display}, running late — it was scheduled for "
+            f"{when}."
+        )
+    else:
+        now_day = _human_time(now).split(" ", 2)[-1]
+        out["tier"] = "degrade"
+        out["degrade_notice"] = (
+            f"Skipped the full {display} — it was scheduled for {when} and "
+            f"it's now {now_day}. I've quietly saved everything it captures; "
+            f"the next Morning Brief will fold in what mattered."
+        )
+
+    # W2 SCORE2 MUST 3 (CB-T2B-4 F-1): a fire that arrived and FAILED for this
+    # slot is not a computer that was off. When the newest `surface_failed`
+    # receipt is at or after the slot being scored, this row says so, and
+    # `detect_chronic_lateness` does not count it. On the verdict too, so a
+    # composer that builds the row from it (emit False) can carry it.
+    last_failed = markers.get("last_failed")
+    after_failed = last_failed is not None and last_failed >= scheduled
+    if after_failed:
+        out["after_failed"] = True
+    if emit:
+        try:
+            from event_gate import append_event
+
+            row_data = {
+                "taskId": task_id,
+                "tier": out["tier"],
+                "lateness_minutes": out["lateness_minutes"],
+                "scheduled_for": out["scheduled_for"],
+                "fired_via": out["receipt_fired_via"],
+            }
+            if after_failed:
+                row_data["after_failed"] = True
+            append_event(
+                Path(workspace_root) / "_hq" / "data" / "events.jsonl",
+                {
+                    "type": "late_fire",
+                    "source_skill": task_id,
+                    "data": row_data,
+                },
+                holder="late_fire",
+            )
+            out["event_logged"] = True
+        except Exception:
+            # Telemetry never blocks the fire (RELIABILITY.md core principle).
+            out["event_logged"] = False
+    return out
+
+
+def detect_chronic_lateness(
+    workspace_root,
+    *,
+    now: Optional[_dt.datetime] = None,
+    window_weeks: int = CHRONIC_WINDOW_WEEKS,
+    min_late_weeks: int = CHRONIC_MIN_LATE_WEEKS,
+) -> list[dict]:
+    """The late_fire consumer (cleanup Monday note / insight-generator).
+
+    A task with >24h-late fires in >= min_late_weeks of the last
+    window_weeks gets a better-default-time proposal. Proposal only —
+    the actual move goes through change-schedule; existing users'
+    customized crons are never touched from here.
+    """
+    now = now or _now_local(workspace_root)
+    cutoff = now - _dt.timedelta(weeks=window_weeks)
+    weeks_late: dict[str, set] = {}
+    try:
+        import events_io
+
+        events = events_io.iter_events(workspace_root)
+    except Exception:
+        events = []
+    for ev in events:
+        if ev.get("type") != "late_fire":
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        if data.get("tier") != "degrade":
+            continue
+        if data.get("after_failed") is True:
+            # W2 SCORE2 MUST 3: a retry after a failed fire. The fire arrived
+            # on time and failed; "the computer is off" would be false.
+            continue
+        dt = event_dt(ev)
+        if dt is None:
+            continue
+        dt = _to_local_naive(dt, workspace_root)
+        if dt < cutoff:
+            continue
+        tid = data.get("taskId") or ev.get("source_skill")
+        if not tid:
+            continue
+        weeks_late.setdefault(tid, set()).add(dt.isocalendar()[:2])
+
+    proposals = []
+    for tid, weeks in sorted(weeks_late.items()):
+        if len(weeks) >= min_late_weeks:
+            # RETIMENAME1 (cr1#146): this line is rendered in cleanup's Monday
+            # note (and the insight generator), not in the chat it is about.
+            # cr1#146 ruled that a renamed chat is named there by its CURRENT
+            # name (a `past-meetings` registration serves End of Day, and that
+            # is the chat the customer reads), so it takes the serving name.
+            # The watchdog's own rows in the same note keep the Scheduled
+            # sidebar's title (SPEC EOD2, task_watchdog._spoken_name); the two
+            # rules meet in one note and the owner knows it.
+            display = serving_display_name(tid)
+            proposals.append({
+                "task": tid,
+                "late_weeks": len(weeks),
+                "window_weeks": window_weeks,
+                "line": (
+                    f"Your {display} has run more than a day late "
+                    f"{len(weeks)} of the last {window_weeks} weeks — usually the "
+                    f"computer is off at its scheduled time. Want it earlier? "
+                    f"Say 'change my schedule' and pick a time you're at the desk."
+                ),
+            })
+    return proposals
+
+
+__all__ = [
+    "LATENESS_TIERS",
+    "SERVED_RECEIPT_MAX_AGE",
+    "SCHEDULED_CONTEXT",
+    "CHRONIC_WINDOW_WEEKS",
+    "CHRONIC_MIN_LATE_WEEKS",
+    "DIRECTIVE_SKIP_RENDER",
+    "SUPPRESSED_SLOT_SERVED",
+    "SERVED_SLOT_SKIP_REASON",
+    "TIER_RERUN",
+    "RERUN_OF_FIELD",
+    "check_lateness",
+    "detect_chronic_lateness",
+    "served_slot_markers",
+]

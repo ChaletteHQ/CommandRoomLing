@@ -1,0 +1,3419 @@
+#!/usr/bin/env python3
+"""Living Brain proposals — the ONE writer API + ONE projector (SPEC LB1, D1).
+
+WHY THIS EXISTS
+Eight bespoke proposal/confirm flows already exist and none share rails —
+every new detector today adds a ninth selector, render, and resolution
+semantics. This module is the shared rails: background detectors write
+uncertain observations through `propose()`; surfaces read ONE normalized
+queue through `load_open_proposals()` / `select_confirm_card()`; resolutions
+land through `resolve_proposal()` (tombstone + shared cooldown ledger).
+
+DOCTRINE (D1–D3, D10 + M rulings R1/R2)
+  - **Events + projectors, not a new store.** Proposals are `brain_proposal`
+    events through `event_gate.append_event`; the projector folds
+    resolution/expiry tombstones. No proposals.json.
+  - **Adapters are permanent fossil readers.** LB2 (2026-07) migrated the
+    org / project / dormancy / schedule_add WRITERS onto `propose()`; the
+    person and commitment_review families still write their legacy types
+    (deferred to LB3 — person machinery is PID1-fresh, commitment_review is
+    wired into the commitment_state single-closer). The adapters are never
+    deleted: historical events are append-only and live on every client
+    substrate forever, so pre-migration rows keep rendering here until they
+    resolve or expire naturally. No backfill, no event rewriting, ever.
+  - **AUTO LIFECYCLE CONTRACT (LB2, the FB-20 mandate):** a detector that
+    calls `propose(tier="auto")` MUST, in the same run, apply the change
+    through its class's single writer and `resolve_proposal(..., "applied")`
+    — an auto proposal never rests open. Auto items are applied-then-
+    narrated (the change feed's job), never adjudicated: the projector
+    excludes them by default (`include_auto=False`) so no adjudication
+    surface can render or count one. `resting_auto_proposals()` is the
+    violation detector; a non-empty return is a detector bug, not user
+    input.
+  - **Policy tiers are code (D2).** `tier="auto"` is legal ONLY for change
+    classes in `AUTO_ALLOWED` with a reverser registered in
+    `brain_undo.REVERSERS`; `propose()` raises otherwise. Identity- and
+    money-shaped changes are always `confirm` (Bug #92 / PIPE1 D9) — except
+    the one R1 class: person/org creation from a STRUCTURED CONNECTOR FACT
+    (full name + address from mail/calendar attendee, zero same-name/email
+    collision via `people_writer.list_same_name_people` /
+    `org_writer.find_existing_org`, past the noise gate) is `auto`,
+    additive-only, archive-reversible, narrated. Prose-inferred identities
+    stay `confirm`; merges stay `confirm` permanently. (The R1 detector
+    SHIPPED in PID1 — `identity_reconcile.py` is it; auto clusters apply via
+    `people_writer.auto_add_person`, never through this queue.)
+  - **Anti-fatigue is contract (D10):** `DAILY_CONFIRM_CAP = 5`; max
+    `MAX_SLOTS_PER_DETECTOR = 2` per render; TTL default 14d, silent expiry;
+    declined ⇒ 60d fingerprint cooldown via the SHARED `proposal_ledger`
+    (`pass` = detector name); a proposal whose action_tuples map to no
+    registered verb is rejected at source.
+  - **Cross-surface dedup (R2):** a proposal rendered on one daily surface
+    today is not re-shown on another daily surface the same day. Shown
+    markers live here (`_hq/.system/brain_card_shown.json` — render state,
+    not substrate). The Staff Meeting full-set surface and explicit asks
+    (system-health) are DELIBERATELY EXEMPT.
+
+All writes go through event_gate / atomic_write. stdlib only.
+"""
+from __future__ import annotations
+try:
+    from text_clip import PROPOSAL_EVIDENCE_MAX_CHARS, clip  # noqa: E402
+except ImportError:  # pragma: no cover — direct-path fallback
+    import sys as _sys_tc
+    from pathlib import Path as _Path_tc
+    _sys_tc.path.insert(0, str(_Path_tc(__file__).resolve().parent))
+    from text_clip import PROPOSAL_EVIDENCE_MAX_CHARS, clip  # noqa: E402
+
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import List, Optional
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from entities_io import entities_collection  # noqa: E402
+
+# TZDATE3 — canonical date localizer (tz.py, hoisted TZDATE2). Guarded: a
+# stripped install missing tz.py keeps the pre-TZDATE3 UTC-slice behavior
+# exactly (matches the render_*.py precedent).
+try:
+    from tz import localize_date as _localize_date  # noqa: E402
+except ImportError:
+    def _localize_date(ts: str | None, workspace_path: str | None = None) -> str:
+        return ts[:10] if isinstance(ts, str) and ts else ""
+
+# The daily card renders at most this many items (D3). The weekly insights
+# widget keeps its own GLOBAL_PROPOSAL_CAP = 7 (unchanged — learning-loop
+# proposals ride the weekly widget, never this card).
+DAILY_CONFIRM_CAP = 5
+# cr1#773: new questions a connector read may bring up on one day, people and
+# projects together. Every one is kept; `identity_reconcile.next_surface_day`
+# stamps the rest for later days and `confirm_flow.may_surface` holds them back
+# from what renders.
+DAILY_CONNECTOR_QUESTION_CAP = 7
+DEFAULT_TTL_DAYS = 14
+ORG_PROJECT_STALE_DAYS = 30  # review F2 — org/project adapter window
+# FS-17 — TTL on LOW-CONTEXT person proposals (name-only single mentions: no
+# inferred role AND no inferred org). Mirrors ORG_PROJECT_STALE_DAYS: an aged
+# name-only mention must not pollute the queue forever (68 of the 78 live
+# staff-meeting rows were exactly this backlog). Rich-context proposals keep
+# the F-46 never-expire posture — a real identity decision never dies with
+# the chat that captured it.
+PERSON_LOW_CONTEXT_STALE_DAYS = 30
+MAX_SLOTS_PER_DETECTOR = 2
+
+# LB2 §3a — families whose WRITERS migrated onto propose(). Their proposals
+# carry the family's ADAPTER fingerprint convention (the natural key), so
+# cross-rail dedup is a fingerprint match against the full projection:
+#   org          org:<normalized name>        (was org_proposal events)
+#   project      project:<normalized name>    (was project_proposal events)
+#   dormancy     dont_forget:<target id>      (was dont_forget_dormant_proposal)
+#   schedule_add schedule:<task id>           (schedule_proposals.log_proposal)
+# An open PRE-migration row of the same family is adapter-read, not bp — so
+# propose() for these kinds also checks the adapter-read side of the
+# projection before emitting (the cross-rail dedup trap: without it a
+# migrated writer re-proposes something already open as a legacy row and the
+# queue shows both). person / commitment_review are NOT here (LB3).
+MIGRATED_KINDS: dict[str, str] = {
+    "org": "org:",
+    "project": "project:",
+    "dormancy": "dont_forget:",
+    "schedule_add": "schedule:",
+    # config_drift is bp-native (no legacy rail) but listed for the
+    # fingerprint-convention check: config_drift:<skill>:<knob>.
+    "config_drift": "config_drift:",
+    # objective_link is bp-native too (OBJ2 — no legacy rail); listed for
+    # the fingerprint-convention check:
+    # objective_link:<objective_id>:<target_id>.
+    "objective_link": "objective_link:",
+}
+
+# Change classes legal on the auto tier (D2 — a class table, not a
+# confidence score; each also requires brain_undo.has_reverser()).
+AUTO_ALLOWED: dict[str, str] = {
+    # SPEC_LEARN1 A14 — the three learning classes, and only these three. Each
+    # is bounded (at most three phrases per writing skill, three sections per
+    # meeting type, three document kinds per run), each is on a 60-day
+    # cooldown plus a permanent applied-fingerprint exclusion, each is
+    # narrated once in the morning brief and reverses on one word. The classes
+    # the amendments moved OUT of this tier stay out: a never-track rule
+    # (`noise_rule`) is read by prose with no code reader to test a reverser
+    # against, and loosening what auto-closes (`confidence_threshold`) or
+    # muting a sender (`surface_suppression`) spends a grant nobody gave.
+    "voice_block_update": "a phrase or length the customer has corrected "
+        "the apply number of times, four by default and never under three, "
+        "stops being written — archived prior block, one-word undo, at most "
+        "three phrases per skill per run",
+    "prep_section_weight": "a prep section empty in most of the last six "
+        "graded meetings of a type renders shorter for that type — the prior "
+        "weight is on the event, one-word undo",
+    "exemplar_promotion": "three same-direction structural edits on one "
+        "document kind promote the corrected document to that kind's "
+        "exemplar — prior text archived, one-word undo, and any residual "
+        "name refuses the promotion outright",
+    "commitment_close": "HIGH sent-mail evidence — the shipped reconcile-sent "
+                        "precedent",
+    # R1 (M ruling 2026-07-14): structured-connector-fact identity creation
+    # only — additive, archive-reversible, narrated. Detector shipped in
+    # PID1 (identity_reconcile.py; applies via auto_add_person).
+    "person_org_creation_structured_fact": "identity from a structured "
+        "connector fact (full name + address from mail/calendar), zero "
+        "same-name/email collision, past the noise gate — additive only",
+    # HIST1 Part 2 (D3/S1/S2): one atomic NON-identity fact from a STRUCTURED
+    # connector source — an additive *_fact_observed event, reversed by
+    # appending entity_fact_retracted (facts are append-only; nothing to
+    # flip). Category limited to AUTO_FACT_CATEGORIES; role/company_news
+    # stay confirm even from a structured source. Applied via
+    # entity_signal_detector.apply_structured_facts (the PID1
+    # applied-then-narrated posture — never an open auto proposal, so the
+    # FB-20 auto-tier parity gap stays dormant until LB2's gate lands).
+    "entity_fact_structured": "one atomic non-identity fact (preference/"
+        "contact/personal) from a structured connector source — additive "
+        "event, retraction-reversible",
+    # UXR1 D3 (M ruling 2026-07-21): the OBVIOUS person_link — a name-mention
+    # that exactly matches ONE on-file record with no conflicting signal —
+    # auto-applies instead of asking (the system already knows the answer).
+    # Legal ONLY under identity_reconcile's (a′)-(d) gate: exact normalized
+    # multi-token full-name match OR an address belonging to exactly ONE
+    # on-file record, and that record is the match (AUTOAPPLY §4a — an
+    # id-level identifier is stronger evidence than a name, so demanding the
+    # name too was asking a question the system had already answered);
+    # exactly one on-file candidate (two same-name records → NEVER auto, the
+    # IDM1 class); no conflicting org/email signal (a role/shared-inbox
+    # address is never corroboration); the pair is not in
+    # scan_existing_duplicates' suspect set. Linking is
+    # reversible (the registered brain_undo reverser reopens the mention AND
+    # re-opens a confirm-tier row); merging is not — `person_proposal` (add
+    # a NEW person) and `person_merge` stay confirm-tier forever. That
+    # asymmetry is the whole reason this is safe.
+    #
+    # STAFFCUT §3.4 (M ruling 2026-08-02) WIDENED gate (a′) with a third
+    # clause: a spelling that does NOT match exactly may still auto-link when
+    # the mention is CONTEXTUALLY CORROBORATED — a shared non-free-mail email
+    # domain, the same org, or co-occurrence in the same meeting's events. The
+    # ruling's own words are the invariant: "it has to match somehow on
+    # context." NAME SIMILARITY ALONE NEVER AUTO-LINKS, and bars (b), (c) and
+    # (d) are untouched — a widened (a′) still has to clear a single on-file
+    # candidate, no conflicting signal (a role/shared-inbox address is never
+    # corroboration, and a free-mail domain identifies nobody), and no
+    # duplicate suspicion. The fail-safe posture stands: an unverifiable bar
+    # is False, and False means the row asks.
+    "person_link": "name-mention link to an existing record — exact-unique-"
+        "clean, or an id-level address, or a spelling match CORROBORATED BY "
+        "CONTEXT (shared non-free-mail domain / same org / meeting "
+        "co-occurrence), all under the UXR1 D3 gate a'-d — alias-free, "
+        "tombstone-reversible",
+    # AUTOAPPLY §4c (M ruling: act when corroborated and reversible): two
+    # captures of ONE real-world commitment, agreeing at id level on owner
+    # AND counterparty, near-verbatim in title after name-stripping, from
+    # DIFFERENT writers — the cross-writer capture IS the corroboration.
+    # C4's flag tier detects duplicates by ADDING a confirm row; this tier
+    # sits above it so a duplicate the system is certain about costs zero
+    # rows. Legal only under commitment_dedup.auto_merge_eligible, and only
+    # because the commitment_merge reverser (registered in the same commit)
+    # splits it back out additively.
+    "commitment_merge": "two cross-writer captures of one commitment, "
+        "id-level agreement on owner and counterparty + near-verbatim "
+        "title — supersede-reversible, nothing observable outside",
+    # DEALNAG1 (M ruling 4, 2026-09-03): a prospect carrying a PAID OR
+    # SIGNED fact — a won deal thread, a payment / signed-agreement /
+    # invoice event — becomes a client without asking. "A question here was
+    # the defect": the workspace already knew, and the morning brief spent
+    # a month asking about a fact on its own record. Legal only through
+    # org_promotion.promote_org (paid-or-signed predicate + a primary-focus
+    # org for the engagement edge + no prior undo), and only because the
+    # registered org_promotion reverser puts the relationship_type and the
+    # engagement edge back. A sizing or engagement record alone is not a
+    # signal and produces neither a promotion nor a proposal.
+    "org_promotion": "a prospect with a paid or signed fact (won deal, "
+        "payment, signed agreement) — relationship flip + engagement edge, "
+        "both reversible",
+}
+
+# The ONLY categories legal on the entity_fact_structured auto class
+# (SPEC HIST1 S2) — mirrors people_writer/org_writer.AUTO_FACT_CATEGORIES
+# (writer-level enforcement is code-deep there; this copy guards any future
+# propose-path caller). The auto-tier test pins the three copies equal.
+AUTO_FACT_CATEGORIES = frozenset({"preference", "contact", "personal"})
+
+# Ranking shapes (D3): money > identity > hygiene, then age.
+# org_money (HIST1 Part 2 step 12 — an observed account/contract value on a
+# client org; confirm-only forever per D4/Bug #92) ranks money with the
+# deal kinds: a value signal that goes silent has the same price tag.
+_MONEY_KINDS = frozenset({"deal_update", "deal_creation", "org_money"})
+_IDENTITY_KINDS = frozenset({
+    "person", "person_update", "org", "project",
+    "person_org_creation_structured_fact",
+    # PID1 D4 — the reconciler's merge-propose rows: person_link (an open
+    # proposal that is already on file — link it?) and person_merge (two
+    # EXISTING records that look like one person). UXR1 D3 (M ruling
+    # 2026-07-21) moved person_link onto the auto tier for the exact-unique-
+    # clean case ONLY (identity_reconcile gate a-d; everything else still
+    # asks). person_merge is NEVER in AUTO_ALLOWED (merge_person_into has no
+    # reverser — a record merge cannot be undone).
+    "person_link", "person_merge",
+    # cr1#195 - the rename question: two people share one address and the
+    # record on file carries the other one's name. Confirm-tier only; the
+    # owner's answer calls people_writer.rename_person.
+    "person_rename",
+    # DEALNAG1 — the auto org promotion. It is applied-then-resolved in the
+    # same run, so it never renders anywhere; the shape is declared for the
+    # ranking table's completeness and for any diagnostic read.
+    "org_promotion",
+})
+# OBJ2 — objective-adjudication proposals (Decision #2 on the Staff Meeting
+# card): a proposed link between a standing objective and a target item.
+_OBJECTIVE_KINDS = frozenset({"objective_link"})
+# HIST1 Part 2 N3: `entity_fact_structured` and the confirm-tier
+# `entity_fact` kind deliberately rank HYGIENE via kind_shape's fall-through
+# (below money/identity) — a fact observation is additive context, never a
+# record mutation. `person_update` (role/company-move proposals) is already
+# in _IDENTITY_KINDS above. Pinned by the auto-tier test.
+_SHAPE_RANK = {"money": 0, "identity": 1, "hygiene": 2,
+               # OBJ2: objective-link proposals group LAST — an objective
+               # adjudication is never more urgent than the queue above it.
+               "objective": 3}
+
+# Daily surfaces the R2 cross-surface dedup applies to. staff-meeting and
+# system-health (explicit ask) are exempt by omission; weekly-recap consumes
+# roll-up counts, not the card.
+DAILY_DEDUP_SURFACES = frozenset({"morning-brief", "coach"})
+
+# STAFFCUT §3.7 — the ON-DEMAND surface hint. A row carrying it is skipped by
+# every NAMED surface (including staff-meeting, which is otherwise exempt from
+# every filter) and rendered in full for a caller that asks for this surface by
+# name. An UN-NAMED call (`surface=None`, the diagnostic/dedup read) still sees
+# everything — see the filter in `load_open_proposals` for why that one matters.
+# This is a DEMOTION mechanism, not a suppression: the projector still holds
+# the row and its resolution path is unchanged.
+#
+# It is deliberately NARROWER than the LB2 `surface_hint` routing that
+# `select_confirm_card` applies. That filter lives on the daily card only, and
+# the staff meeting's whole contract is that it sees the full set, hint
+# included (config_drift depends on exactly that). So the rule here keys on
+# this ONE sentinel value: nothing else's routing changes, and no count on any
+# other surface moves.
+ON_DEMAND_SURFACE_HINT = "on-demand"
+
+# STAFFCUT §3.7 — the demotion is a CLASS ruling, so it keys on KIND as well as
+# on the hint. Hint-only was the first implementation, and it was incomplete in
+# a way that would have shipped: LB2 migrated the dormancy WRITER onto
+# `propose()`, so a NEW dormancy row is a `bp_` proposal carrying whatever its
+# writer passed — and that writer passes no surface_hint. Demoting the fossil
+# adapter rows alone would have demoted the OLD rows and left every new one on
+# the staff meeting, which is the opposite of the ruling. Keying on kind covers
+# both rails and every row already open on a live workspace, with no event
+# rewriting and no backfill (the append-only discipline).
+# BIND1 (REVIEW_BIND1 RE-VERIFY 1 N2) — `thread_binding` joins it for
+# exactly the reason above. The binding QUESTION is on-demand by M's
+# ruling and its writer stamps the hint, but a hint stamped at MINT
+# cannot reach a row already open on a live workspace: those carry an
+# empty `surface_hint` and went on competing for a daily card slot the
+# moment they out-ranked four others. Keying on the kind covers them.
+ON_DEMAND_KINDS = frozenset({"dormancy", "thread_binding"})
+
+# LIFECYCLE1 §7a — kinds RETIRED at the projector: no NAMED surface renders one
+# any more (staff meeting, morning brief, system-health, the needs-review queue
+# — all of them read through this function).
+#
+# WHY THIS EXISTS AND STAFFCUT §3.6 WAS NOT ENOUGH. STAFFCUT retired
+# `_adapt_schedule_add`, the LEGACY adapter — which the measurement in that
+# function's docstring shows was already returning [] for the staff meeting.
+# What it did not touch was the OTHER rail: LB2 had migrated the schedule_add
+# WRITER onto `propose()`, so `schedule_proposals.log_proposal` kept minting
+# `bp_` rows that arrived through `_open_brain_proposals` and rendered with
+# confirm/dismiss verbs. That is the row M saw on the 2026-08-03 staff meeting
+# ("<a task name> — readiness thresholds met"), one day after the kind was
+# documented as retired. Retiring the adapter and leaving the writer is the
+# same half-fix from the opposite side; the writer stops in
+# `schedule_proposals.log_proposal` and the KIND stops here, so a row already
+# open on a live workspace stops rendering too.
+#
+# NOTHING IS TOMBSTONED AND NOTHING STRANDS. `expire_stale` reads
+# `_open_brain_proposals` directly, not this projector, so every row already
+# open still ages out on its own TTL and lands its `brain_proposal_expired`
+# marker. The kind stays parseable forever; the event vocabulary loses nothing.
+RETIRED_KINDS = frozenset({"schedule_add"})
+
+# CUTB / M ruling R-B (2026-09-06) — the mid-confidence DEAL QUESTION is
+# WITHHELD from every named surface. The deal-signals detector's two kinds
+# rendered as a three-way Money row ("likely deal · Confirm / Not relevant
+# (60 days) / Snooze (7 days)") on the Staff Meeting card and as the brief's
+# "Command Room thinks [Org] is a live deal" sentence; the v5.28.0 attended
+# test (B1.4) saw three of them, two about orgs that had been won and
+# converted weeks earlier. M's words: "we want to show less options to
+# clients — they are overwhelmed." The signal is still RECORDED (`propose()`
+# writes the row; `deal_signal_detector.propose_candidates` is unchanged), it
+# still dedups, retires and expires on its own rails, and an org promotes
+# itself only on a paid / signed / won fact (`org_promotion`). What changes
+# is that nobody renders or COUNTS the question: withheld here, at the
+# projector chokepoint, so the brief pointer, the Staff Meeting header, the
+# shape tiles and every downstream total drop with it in one move.
+#
+# `deal_update` goes with `deal_creation`: it is the same detector's same
+# three-verb prompt about the same band of evidence ("looks moved to
+# negotiating", "sounds won", "has a number attached" — language, not a
+# paid or signed fact), and the ruled design rule is fewer verbs per row.
+# `org_money` STAYS: it is a different detector (an account value near a
+# client org), not a deal question, and its confirm is the ONLY door the
+# money field has (HIST1 D4: never estimated, confirm-only) — withholding it
+# would silently retire a feature with no replacement. `surface is None`
+# (the diagnostic / cross-rail dedup read) keeps seeing withheld rows for
+# the same reason it sees demoted and retired ones: a withheld-but-open row
+# must still suppress a duplicate write and still be visible to an audit.
+WITHHELD_KINDS = frozenset({"deal_creation", "deal_update"})
+
+# The overflow line teaches the full-queue phrase (R3.4). Rendered verbatim
+# by surfaces when overflow_count > 0.
+OVERFLOW_LINE = "{n} more queued — say `staff meeting` to review everything."
+
+
+class BrainProposalError(ValueError):
+    """Illegal propose() call — wrong tier, missing reverser, unregistered
+    verb, malformed tuples. Loud by design: a detector bug, not user input."""
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    from event_time import parse_ts
+
+    return parse_ts(value)
+
+
+def _events_path(workspace_root) -> Path:
+    return Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+
+
+def _load_events(workspace_root) -> list[dict]:
+    # SPEC PGUARD1 D1 — the staff-meeting load seam reads ORG-SCOPED: the
+    # account mask (filter_masked_events) + personal-lane drop apply by
+    # design, so a masked account's history can never drive a proposal card.
+    # Shard-transparent + defensive like the prior event_refs-based read.
+    # Every consumer in this module (projector, resolve, expiry, health
+    # counts) flows through this one seam — keep edits here minimal and
+    # localized (PID1 builds against this file in parallel).
+    try:
+        from events_io import load_events_org_scoped
+    except ImportError:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+        from events_io import load_events_org_scoped
+
+    path = _events_path(workspace_root)
+    if not path.exists():
+        return []
+    events, _skipped = load_events_org_scoped(workspace_root)
+    return events
+
+
+def kind_shape(kind: str) -> str:
+    if kind in _MONEY_KINDS:
+        return "money"
+    if kind in _IDENTITY_KINDS:
+        return "identity"
+    if kind in _OBJECTIVE_KINDS:
+        return "objective"
+    return "hygiene"
+
+
+# ---------------------------------------------------------------------------
+# propose() — the single entry point for every NEW detector
+# ---------------------------------------------------------------------------
+
+def _validate_action_tuples(action_tuples: list) -> None:
+    """D10 — no-consumer proposals rejected at source: every tuple's action
+    must be a registered verb_taxonomy action id (the same set the renderer
+    validates against)."""
+    from verb_taxonomy import CANONICAL_ACTION_IDS
+
+    if not isinstance(action_tuples, list) or not action_tuples:
+        raise BrainProposalError(
+            "action_tuples must be a non-empty list — a proposal with no "
+            "consumer action never enters the card (D10)")
+    for t in action_tuples:
+        if not isinstance(t, dict) or not t.get("action"):
+            raise BrainProposalError(f"malformed action tuple: {t!r}")
+        if t["action"] not in CANONICAL_ACTION_IDS:
+            raise BrainProposalError(
+                f"action {t['action']!r} is not a registered verb_taxonomy "
+                "action id — register the verb before proposing through it "
+                "(D10 no-consumer rejection)")
+
+
+def _open_brain_proposals(events: list[dict], *, now: Optional[datetime] = None) -> list[dict]:
+    """brain_proposal events minus resolution/expiry tombstones minus
+    computed-TTL expiry. Returns normalized dicts (see load_open_proposals).
+
+    TTL1 — `brain_proposal_reopened` is the additive mirror the
+    `brain_proposal_expiry` reverser appends, and it is folded HERE in
+    APPEND ORDER, last writer wins (the `person_proposal_reopened`
+    precedent). Without this fold the reverser would write a marker no
+    reader honours, and `undo` after a question expiry would report a
+    reversal that changed nothing on screen.
+
+    TTL1 FIX ROUND 1 (reviewer F-1) — the normalized row now carries
+    `last_activity_at`: the reopen when there was one, the row's own
+    opening otherwise. `opened_at` is a BIRTHDAY and never moves, so any
+    reader that ages a row from it re-expires whatever the customer just
+    put back on the very next daily run — an `undo` that lasts a day. The
+    neighbouring rail already measures from last activity
+    (`commitment_backlog_sweep.last_activity_map`, whose own prose is "a
+    row the user put back stays put back"); this is that baseline for the
+    brain family, which has no commitment id and so cannot use it.
+
+    TTL1 FIX ROUND 1 (reviewer F-6) — `due` and the money fields are
+    carried through when the SOURCE EVENT has them. The importance rule
+    reads the row it is handed, so a date or an amount the writer put on
+    the proposal was being dropped by this normalization and two of the
+    rule's four legs could never fire on the only two classes whose
+    default is a drop. Additive and drop-empty: a proposal with none of
+    them normalizes byte-identically to before."""
+    from confirm_flow import _asked_ts, _surface_day
+
+    tombstoned: set[str] = set()
+    reopened_at: dict[str, str] = {}
+    for ev in events:
+        etype = ev.get("type")
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        pid = data.get("proposal_id")
+        if etype in ("brain_proposal_resolved", "brain_proposal_expired"):
+            if pid:
+                tombstoned.add(pid)
+        elif etype == "brain_proposal_reopened":
+            if pid:
+                tombstoned.discard(pid)
+                reopened_at[pid] = ev.get("ts") or ""
+    out: list[dict] = []
+    for ev in events:
+        if ev.get("type") != "brain_proposal":
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        pid = data.get("proposal_id")
+        if not pid or pid in tombstoned:
+            continue
+        # cr1#773: a row held for a later day starts its clock that day, in
+        # UTC here (this read has no workspace), so the wait never spends its
+        # lifetime. A row with no stamp is its own `ts`, as it always was.
+        surface_on = _surface_day(data.get("surface_on"))
+        asked = _asked_ts(ev.get("ts") or "", surface_on, timezone.utc)
+        opened = _parse_ts(asked)
+        ttl = data.get("ttl_days")
+        ttl = int(ttl) if isinstance(ttl, (int, float)) else DEFAULT_TTL_DAYS
+        # TTL1 — a proposal a person put back with `undo` starts its clock
+        # again from the REOPEN. Without this the computed-TTL screen below
+        # would drop it on the very next read and the undo would be a
+        # sentence about nothing.
+        anchor = _parse_ts(reopened_at.get(pid) or "") or opened
+        expires = (anchor + timedelta(days=ttl)) if anchor else None
+        if now is not None and expires is not None and expires < now:
+            continue  # stale — excluded from render even before the sweep
+        kind = data.get("kind") or "unknown"
+        out.append({
+            "id": pid,
+            "source_family": "brain",
+            "kind": kind,
+            "shape": kind_shape(kind),
+            "tier": data.get("tier") or "confirm",
+            "fingerprint": data.get("fingerprint") or "",
+            "evidence": data.get("evidence") or "",
+            "action_tuples": data.get("action_tuples") or [],
+            "render_line": data.get("render_line") or "",
+            "opened_at": asked,
+            # TTL1 F-1 — the clock a LIFETIME is measured from. Never
+            # `opened_at`: a row put back by `undo` has moved, and a
+            # lifetime measured from its birthday lets it go again the
+            # next morning.
+            "last_activity_at": (reopened_at.get(pid) or asked),
+            "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ") if expires else "",
+            "detector": data.get("detector") or "unknown",
+            "seq": ev.get("seq"),
+            "thread_id": data.get("thread_id"),
+            "org_id": data.get("org_id"),
+            "person_id": data.get("person_id"),
+            # FS-10 — the row TITLE (deal/org/person display name) so the
+            # Staff Meeting builds "Name — badge · evidence · consequence".
+            "title": data.get("title") or data.get("org_name") or "",
+            "proposal_kind": data.get("proposal_kind") or "",
+            # LB2 — optional surface routing: a row whose writer named a
+            # surface renders ONLY there (config_drift → staff meeting; a
+            # config nudge is never urgent). Empty = every surface.
+            "surface_hint": data.get("surface_hint") or "",
+            # PID1 — merge-propose row payloads (D4): the target ids the
+            # apply-choices handlers dispatch on, embedded VERBATIM (F2).
+            # REVIEW THREADANN1 F1 — `parent_thread_id` + `clusters` join the
+            # same verbatim embed: the apply-choices `thread_split` handler
+            # dispatches `execute_split(<parent_thread_id>, <clusters>)` off
+            # THIS row, and a payload the projector drops is a confirm tap
+            # with no inputs (the exact THREADBIND1-F2 "no confirm-side
+            # consumer" gap, one layer down).
+            **{k: data[k] for k in ("cluster_seqs", "cluster_fingerprints",
+                                    "keep_id", "duplicate_id", "alias_name",
+                                    "matched_name", "parent_thread_id",
+                                    "clusters",
+                                    # cr1#195 - the person_rename row's
+                                    # confirm inputs, verbatim.
+                                    "new_name", "current_name",
+                                    "shell_id",
+                                    # cr1#845 - which dormancy question this
+                                    # row is: `active` differs by it.
+                                    "ask") if data.get(k)},
+            # TTL1 F-1/F-6 — the fields the importance rule reads, carried
+            # through drop-empty when the source event has them. A queue
+            # row is the only thing `question_ttl.importance_hold` is
+            # handed, so a date or an amount dropped here is a leg of the
+            # safety rail that can never fire.
+            **{k: data[k] for k in ("due", "due_date", "amount",
+                                    "deal_value", "value", "invoice_amount",
+                                    "note") if data.get(k)},
+            **({"surface_on": surface_on} if surface_on else {}),
+        })
+    return out
+
+
+def open_brain_proposals(workspace_root, *, now_iso: Optional[str] = None,
+                         include_lapsed: bool = False) -> list[dict]:
+    """DEALNAG1 — the open brain-family rows (tombstone- and TTL-filtered),
+    read through the org-scoped seam, with NO surface filter and NO snooze
+    filter: the retirement path (`deal_signal_retire`) must reach a snoozed
+    row too, because a snooze is "ask me later" and a win means there is
+    nothing left to ask. Diagnostic / system consumers only — adjudication
+    surfaces keep reading `load_open_proposals`.
+
+    `include_lapsed=True` (CUTB item 1(c)) keeps rows past their TTL that
+    carry NO tombstone yet — `expire_stale` runs only inside `cleanup`, so a
+    row can be computationally lapsed for weeks while nothing on the ledger
+    says so. The retirement sweep asks for these so a lapsed row about a
+    settled org gets its tombstone too, instead of being neither open nor
+    answered."""
+    now_iso = now_iso or _now_iso()
+    return _open_brain_proposals(_load_events(workspace_root),
+                                 now=None if include_lapsed
+                                 else _parse_ts(now_iso))
+
+
+def propose(
+    workspace_root,
+    *,
+    kind: str,
+    fingerprint: str,
+    evidence: str,
+    action_tuples: list,
+    tier: str,
+    ttl_days: int = DEFAULT_TTL_DAYS,
+    detector: str,
+    change_class: Optional[str] = None,
+    render_line: str = "",
+    thread_id: Optional[str] = None,
+    org_id: Optional[str] = None,
+    person_id: Optional[str] = None,
+    extra: Optional[dict] = None,
+) -> dict:
+    """Emit ONE brain_proposal through the gate — the single entry point for
+    every new detector. Returns {status, proposal_id?, event?}:
+      - "proposed"             — emitted.
+      - "suppressed_cooldown"  — declined within 60d (shared ledger); nothing
+                                 written.
+      - "duplicate_open"       — an open proposal already carries this
+                                 fingerprint; nothing written.
+    Raises BrainProposalError on illegal calls (auto tier without an
+    AUTO_ALLOWED class + registered reverser; unregistered verbs)."""
+    _check_propose_call(tier=tier, kind=kind, fingerprint=fingerprint,
+                        detector=detector, change_class=change_class,
+                        extra=extra, action_tuples=action_tuples)
+
+    from proposal_ledger import active_cooldowns
+
+    now_iso = _now_iso()
+    if fingerprint in active_cooldowns(workspace_root, detector, now_iso=now_iso):
+        return {"status": "suppressed_cooldown", "fingerprint": fingerprint}
+
+    events = _load_events(workspace_root)
+    now = _parse_ts(now_iso)
+    open_fps = {p["fingerprint"] for p in _open_brain_proposals(events, now=now)}
+    if fingerprint in open_fps:
+        return {"status": "duplicate_open", "fingerprint": fingerprint}
+    # LB2 cross-rail dedup: for migrated kinds, an open PRE-migration row of
+    # the same family (adapter-read, same natural-key fingerprint) also
+    # suppresses — the queue must never show a legacy row and a bp row for
+    # the same thing. Full projection incl. autos; defensive (a broken
+    # adapter never blocks a propose — the bp-side fingerprint check above
+    # already ran).
+    if kind in MIGRATED_KINDS:
+        try:
+            legacy_fps = {
+                p.get("fingerprint")
+                for p in load_open_proposals(
+                    workspace_root, now_iso=now_iso, include_auto=True)
+                if p.get("source_family") != "brain"
+            }
+            if fingerprint in legacy_fps:
+                return {"status": "duplicate_open_legacy",
+                        "fingerprint": fingerprint}
+        except Exception:
+            pass
+
+    proposal_id, data, to_append = _proposal_rows(
+        workspace_root, kind=kind, fingerprint=fingerprint, evidence=evidence,
+        action_tuples=action_tuples, tier=tier, ttl_days=ttl_days,
+        detector=detector, render_line=render_line, thread_id=thread_id,
+        org_id=org_id, person_id=person_id, extra=extra, now_iso=now_iso,
+        n_events=len(events))
+    from event_gate import append_event
+
+    append_event(_events_path(workspace_root), to_append,
+                 holder="brain_proposals")
+    return {"status": "proposed", "proposal_id": proposal_id, "data": data}
+
+
+def _check_propose_call(*, tier, kind, fingerprint, detector, change_class,
+                        extra, action_tuples) -> None:
+    """The illegal calls `propose` refuses, raised as BrainProposalError."""
+    if tier not in ("auto", "confirm"):
+        raise BrainProposalError(f"tier must be auto|confirm, got {tier!r}")
+    if tier == "auto":
+        import brain_undo
+
+        if change_class not in AUTO_ALLOWED:
+            raise BrainProposalError(
+                f"change class {change_class!r} is not in AUTO_ALLOWED — "
+                "auto-apply is a class table, not a judgment call (D2)")
+        if not brain_undo.has_reverser(change_class):
+            raise BrainProposalError(
+                f"change class {change_class!r} has no registered reverser "
+                "in brain_undo.REVERSERS — auto-apply without a reverser is "
+                "illegal (D2/D5)")
+        if change_class == "entity_fact_structured":
+            # HIST1 S2 guard for any future propose-path caller (the
+            # shipped applier, entity_signal_detector.apply_structured_facts,
+            # applies directly and never proposes auto — FB-20 parity).
+            cat = (extra or {}).get("category")
+            if cat not in AUTO_FACT_CATEGORIES:
+                raise BrainProposalError(
+                    f"category {cat!r} is not auto-eligible — "
+                    "entity_fact_structured is limited to "
+                    f"{sorted(AUTO_FACT_CATEGORIES)} (S2); role/"
+                    "company_news facts stay confirm")
+    if not fingerprint or not detector:
+        raise BrainProposalError("fingerprint and detector are required")
+    if kind in MIGRATED_KINDS and not fingerprint.startswith(MIGRATED_KINDS[kind]):
+        raise BrainProposalError(
+            f"kind {kind!r} is a migrated family — its fingerprint must carry "
+            f"the family natural-key convention {MIGRATED_KINDS[kind]!r} "
+            f"(got {fingerprint!r}); cross-rail dedup against pre-migration "
+            "adapter rows keys on it (LB2 §3a)")
+    _validate_action_tuples(action_tuples)
+
+
+def _proposal_rows(workspace_root, *, kind, fingerprint, evidence,
+                   action_tuples, tier, ttl_days, detector, render_line,
+                   thread_id, org_id, person_id, extra, now_iso,
+                   n_events) -> tuple:
+    """`(proposal_id, data, rows to append)` for one proposal. Writes nothing."""
+    # UXR1 D3 fix — the event count salts the id. The old basis
+    # (fingerprint|now_iso) collided when the same fingerprint was
+    # re-proposed within one UTC second of a resolved twin (the undo
+    # reverser's re-open after an auto-apply is exactly that shape): the
+    # new row inherited the tombstoned row's id and rendered nowhere. The
+    # id is stored on the event and never re-derived, so salting is safe.
+    proposal_id = "bp_" + hashlib.sha256(
+        f"{fingerprint}|{now_iso}|{n_events}".encode("utf-8")
+    ).hexdigest()[:12]
+    data = {
+        "proposal_id": proposal_id,
+        "kind": kind,
+        "fingerprint": fingerprint,
+        "tier": tier,
+        "evidence": clip(evidence, PROPOSAL_EVIDENCE_MAX_CHARS),
+        "action_tuples": action_tuples,
+        "ttl_days": int(ttl_days),
+        "detector": detector,
+    }
+    if render_line:
+        data["render_line"] = render_line
+    for key, val in (("thread_id", thread_id), ("org_id", org_id),
+                     ("person_id", person_id)):
+        if val:
+            data[key] = val
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            data.setdefault(k, v)
+
+    to_append = [{
+        "type": "brain_proposal",
+        "source_skill": detector,
+        "primary_thread_id": thread_id,
+        "data": data,
+    }]
+    # Deal-kind proposals also write the reserved PIPE1 type alongside for
+    # the consumers PIPE1 already named (pipeline-tracker, cleanup). Only
+    # deal_update — its payload contract requires a thread_id; creation
+    # proposals have no thread yet and ride the generic type alone.
+    if kind == "deal_update" and thread_id:
+        legacy = {
+            "thread_id": thread_id,
+            "proposal_kind": (extra or {}).get("proposal_kind") or "update",
+            "evidence": clip(evidence, PROPOSAL_EVIDENCE_MAX_CHARS),
+            "fingerprint": fingerprint,
+        }
+        for k in ("proposed_stage", "proposed_value"):
+            if (extra or {}).get(k) is not None:
+                legacy[k] = extra[k]
+        to_append.append({
+            "type": "deal_update_proposed",
+            "source_skill": detector,
+            "primary_thread_id": thread_id,
+            "data": legacy,
+        })
+    return proposal_id, data, to_append
+
+
+def prepare_proposals(workspace_root, specs: list) -> list:
+    """`propose`'s checks for many confirm rows off ONE read of the ledger,
+    writing nothing (cr1#773). `specs` are `propose` keyword dicts. Each answer
+    is `{"status": ...}` as `propose` gives it, with `rows` to append when
+    "proposed", or "error" with `error`: one bad row never costs the others.
+
+    For a writer whose rows must land in one short write section: `propose`
+    reads the whole ledger per row, which on a large book outlives the lease
+    if it runs inside one. The caller appends `rows` itself, and re-checks
+    against anything written since."""
+    from proposal_ledger import active_cooldowns
+
+    now_iso = _now_iso()
+    now = _parse_ts(now_iso)
+    events = _load_events(workspace_root)
+    open_fps = {p["fingerprint"] for p in _open_brain_proposals(events, now=now)}
+    cooldowns: dict = {}
+    legacy_fps = None
+    out: list = []
+    for spec in specs:
+        fingerprint, kind = spec.get("fingerprint"), spec.get("kind")
+        detector = spec.get("detector")
+        try:
+            _check_propose_call(
+                tier=spec.get("tier"), kind=kind, fingerprint=fingerprint,
+                detector=detector, change_class=spec.get("change_class"),
+                extra=spec.get("extra"), action_tuples=spec.get("action_tuples"))
+            if spec.get("tier") != "confirm":
+                raise BrainProposalError("prepare_proposals is for confirm rows")
+            if detector not in cooldowns:
+                cooldowns[detector] = active_cooldowns(
+                    workspace_root, detector, now_iso=now_iso)
+            if fingerprint in cooldowns[detector]:
+                out.append({"status": "suppressed_cooldown"})
+                continue
+            if fingerprint in open_fps:
+                out.append({"status": "duplicate_open"})
+                continue
+            if kind in MIGRATED_KINDS:
+                if legacy_fps is None:
+                    try:
+                        legacy_fps = {
+                            p.get("fingerprint")
+                            for p in load_open_proposals(
+                                workspace_root, now_iso=now_iso,
+                                include_auto=True)
+                            if p.get("source_family") != "brain"}
+                    except Exception:
+                        legacy_fps = set()
+                if fingerprint in legacy_fps:
+                    out.append({"status": "duplicate_open_legacy"})
+                    continue
+            _pid, _data, rows = _proposal_rows(
+                workspace_root, kind=kind, fingerprint=fingerprint,
+                evidence=spec.get("evidence"),
+                action_tuples=spec.get("action_tuples"), tier="confirm",
+                ttl_days=spec.get("ttl_days", DEFAULT_TTL_DAYS),
+                detector=detector, render_line=spec.get("render_line", ""),
+                thread_id=spec.get("thread_id"), org_id=spec.get("org_id"),
+                person_id=spec.get("person_id"), extra=spec.get("extra"),
+                now_iso=now_iso, n_events=len(events))
+            out.append({"status": "proposed", "rows": rows})
+        except Exception as exc:  # noqa: BLE001 - one row never costs the rest
+            out.append({"status": "error",
+                        "error": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Legacy-family adapters — PERMANENT FOSSIL READERS (fossil-readers posture).
+# LB2 migrated the org/project/dormancy/schedule_add writers onto propose();
+# these adapters keep rendering PRE-migration rows (append-only history lives
+# on every client substrate forever) until they resolve or expire naturally.
+# person + commitment_review are still legacy-WRITTEN (LB3) — their adapters
+# are the live read path, not fossils. Never delete an adapter.
+# ---------------------------------------------------------------------------
+
+# FB-19 — the hygiene review row's registered wire verbs. These are the
+# `kind: commitment_review` handlers apply-choices already dispatches
+# (`confirm` → commitment_state.close_commitment; `not relevant` →
+# build_commitment_review_dismissed_event, the commitment STAYS OPEN), plus
+# FB-19's `hold`. Before FB-19 this list was literally `[]` with a comment
+# claiming the surface would supply verbs per-kind — no surface ever did, so
+# the row rendered with no way to answer it.
+_CRU_ACTIONS = [{"action": "confirm"},
+                {"action": "not relevant"},
+                {"action": "hold"}]
+
+
+def _cru_commitment_titles(workspace_root) -> dict:
+    """commitment_id -> title, for review proposals written before FB-19
+    started persisting the title on the event (legacy back-compat: the row
+    must be answerable on an EXISTING workspace, not just a fresh one — every
+    review proposal already in a live queue predates the writer fix).
+
+    NOTE the shape: `load_open_commitments` returns raw EVENT dicts, so the
+    id/title live under `data`, not at the top level. (Reading them off the
+    top level returns an empty map and silently drops every legacy row — it
+    looks like the drop-empty rule working correctly, which is what makes it
+    worth naming here.)"""
+    try:
+        from cru_match import load_open_commitments
+        out = {}
+        for ev in load_open_commitments(_events_path(workspace_root)):
+            d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            cid = d.get("id")
+            if cid:
+                out[cid] = (d.get("title") or "").strip()
+        return out
+    except Exception:
+        return {}
+
+
+def _cru_commitment_capture_ts(workspace_root) -> dict:
+    """commitment_id -> when the promise was made (WATCHGATE §2.5's
+    `promise_ts`; cr1#744: `cru_match.promise_time_raw`, the same answer the
+    matchers' fence reads, so a close the fence let through is not held here
+    for predating the row's capture).
+
+    WHEN THE PROMISE WAS MADE is the other half of the apply-moment ordering
+    check, and nothing was supplying it — the check existed but had no input,
+    so it could only ever fire in a test. The projection already knows; this
+    just reads it. Same defensive posture as the title map beside it: any
+    failure yields {} and the ordering check stays inert rather than
+    guessing."""
+    try:
+        from cru_match import load_open_commitments, promise_time_raw, promise_tz
+        out = {}
+        tz = promise_tz(workspace_root)
+        for ev in load_open_commitments(_events_path(workspace_root)):
+            d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            cid = d.get("id")
+            ts = promise_time_raw(ev, tz)
+            if cid and ts:
+                out[cid] = ts
+        return out
+    except Exception:
+        return {}
+
+
+def _watched_ids(workspace_root) -> set:
+    """MUST-FIX-1 — the commitments already parked on watch.
+
+    A parked row must LEAVE this queue. Parking exists to shrink the queue
+    ("weak proposals do NOT sit in the queue by default"); a park that leaves
+    the row exactly where it was shrinks nothing and re-offers the same
+    unprovable guess on the next fire, which is the rubber-stamp pressure the
+    whole design assumes and is trying to reduce.
+
+    Fails OPEN (empty set on any error): showing a parked row again is a
+    redundancy, hiding a row that should be offered is a disappearance."""
+    try:
+        from watch_gate import watched_commitment_ids
+
+        return watched_commitment_ids(workspace_root)
+    except Exception:
+        return set()
+
+
+def _cru_strength(evidence: str, has_completion_signal) -> tuple:
+    """(weak_reason, strength) for a proposal row — §2.1's badge, computed
+    from the SAME vocabulary the fence screens with, so the row a user reads
+    and the decision the fence makes can never disagree.
+
+    Note what is NOT passed: no ordering check. That one belongs at the APPLY
+    moment (§2.5) and would be a different answer here."""
+    try:
+        from watch_gate import evidence_strength, weakness_reason
+
+        reason = weakness_reason(evidence,
+                                 completion_signal=has_completion_signal)
+        return reason, evidence_strength(
+            evidence, completion_signal=has_completion_signal)
+    except Exception:
+        return "", "strong"
+
+
+def _cru_render_line(title: str, evidence: str,
+                     weak_reason: str = "",
+                     stamp_note: str = "") -> str:
+    """FB-19: the row's ASK, in the user's language.
+
+    The live 2026-07-16 render was "Housekeeping — matched your sent message
+    X": no name, no question, no verbs — a row that told the user something
+    had happened without saying what, and offered no way to respond. This
+    composes the question the row is actually asking.
+
+    HONESTY: this row is a PROPOSAL to close (the 0.30-0.55 ambiguous band).
+    It has NOT closed anything — anything confident enough to close already
+    closed silently and never reaches a card. So the copy asks; it never
+    reports ("I closed X — right?" would claim an action that did not
+    happen, and offering to "undo" it would compound the lie).
+
+    §2.1 (WATCHGATE) — the line now carries the row's STRENGTH, in plain
+    language and never as a number. Before this, a row whose entire basis was
+    the commitment's own words echoed back read exactly like a row backed by
+    someone saying they had sent the thing; the user learned the difference
+    only after answering. A weak row says what is missing, up front, so the
+    answer is informed rather than corrected.
+
+    RIDERS (c) — `stamp_note` is the PRODUCER'S own strength claim
+    (`watch_gate.stamped_strength_note`), appended when the writer stamped one.
+    It exists because the screen above reads the evidence TEXT, and a proposal
+    built from a meeting the user was never in carries real completion
+    language: it screened STRONG and read exactly like a firsthand one. Empty
+    for every row with no stamp — which is every row that existed before this
+    parameter did, so their line is byte-identical.
+    """
+    ask = "Did you already handle this?"
+    ev = (evidence or "").strip()
+    if weak_reason:
+        line = (f"{ask} I can't see proof it got done — {weak_reason}. "
+                f"Close it anyway?")
+    elif ev:
+        line = f"{ask} Command Room {ev} — close it?"
+    else:
+        line = f"{ask} — close it?"
+    note = (stamp_note or "").strip()
+    return f"{line} ({note})" if note else line
+
+
+def _cru_ambiguity_line(query: str, candidates: list, truncated: int = 0) -> str:
+    """CLOSEID1 — the either/or row's ASK.
+
+    An ambiguity is ONE question, not N. When a name matched more than one open
+    promise, `commitment_state.propose_ambiguous_close` writes a single row
+    carrying every candidate, and this composes the sentence that makes the
+    exclusivity visible: without it the user sees rows that look independent
+    and answers them independently, which is how a bulk confirm closes both
+    halves of an either/or and one of them is definitionally wrong.
+
+    It never claims a close happened and never picks a side — it names the
+    words that were ambiguous and lists what they hit, in the order the writer
+    recorded.
+    """
+    q = str(query or "").strip()
+    names = [str((c or {}).get("title") or "").strip()
+             for c in (candidates or [])]
+    names = [n for n in names if n]
+    if not names:
+        return ""
+    listed = "; ".join(f"{i}. {n}" for i, n in enumerate(names, 1))
+    more = ""
+    try:
+        n_more = int(truncated or 0)
+    except (TypeError, ValueError):
+        n_more = 0
+    if n_more > 0:
+        more = f" (and {n_more} more)"
+    lead = (f"Which one did you mean by '{q}'?" if q
+            else "Which one did you mean?")
+    return (f"{lead} {len(names)} open items match{more}, and only one of them "
+            f"can be the one you closed — {listed}. Say which, and I will "
+            f"close that one and leave the rest open.")
+
+
+def _is_policy_chip(ev: dict, data: dict) -> bool:
+    """POLICY1-B F-4 — True for a proposal the transcript closer wrote as an
+    in-row chip: `source_skill: past-meetings` AND `data.signal` (the
+    POLICY1-A field) AND not the non-attendee lane's stamped shape."""
+    if (ev.get("source_skill") or "") != "past-meetings":
+        return False
+    if not isinstance(data.get("signal"), str) or not data.get("signal"):
+        return False
+    if data.get("nonattendee_lane") is True or data.get("auto_close_blocked") is True:
+        return False
+    return True  # F-4: a policy chip lives on the row, never on the card
+
+
+def _adapt_commitment_reviews(workspace_root, *,
+                              now_iso: Optional[str] = None,
+                              window_now_iso: Optional[str] = None
+                              ) -> list[dict]:
+    from cru_match import load_open_review_proposals
+
+    # TWO CLOCKS, both defaulting to the WALL CLOCK — deliberately, and not
+    # to the projector's `now_iso`.
+    #
+    # `now_iso` here is the FS-11 TTL clock; `window_now_iso` anchors the
+    # reader's 7-day history window. Before WATCHGATE this adapter took
+    # neither: both floated on the wall clock even when its caller had asked
+    # for a simulated time, which made the whole adapter unpinnable — a
+    # fixture anchored anywhere but the last few real days returned nothing,
+    # and a suite written against it passed on an empty set, which reads
+    # exactly like passing on a correct one.
+    #
+    # These two parameters make it pinnable WITHOUT changing what any shipped
+    # caller gets: `load_open_proposals` passes neither, so its behavior is
+    # byte-identical to before. That restraint is deliberate — threading the
+    # projector's clock in is arguably more correct, but it changes what a
+    # simulated-time render of a live surface returns, and that is its own
+    # change with its own review, not a side effect of this one. See the
+    # rider in the build record.
+    now_iso = now_iso or _now_iso()
+    now = _parse_ts(now_iso)
+    titles = None
+    # MUST-FIX-1: computed ONCE per fire, not per row.
+    watched = _watched_ids(workspace_root)
+    promise_ts = _cru_commitment_capture_ts(workspace_root)
+    out = []
+    for ev in load_open_review_proposals(_events_path(workspace_root),
+                                         now_iso=window_now_iso):
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        cid = data.get("commitment_id")
+        if not cid:
+            continue
+        # MUST-FIX-1 — an item already on watch is not a question. It parked
+        # precisely because nobody could answer it from what was on file, and
+        # re-asking is how a queue grows instead of shrinking. It comes back
+        # by itself, through the expiry pass, only if it still cannot prove
+        # itself — or on demand, via `show watching`.
+        if cid in watched:
+            continue
+        # POLICY1-B F-4 (M ruling 2, default in force 2026-09-04: WITHHOLD).
+        # A POLICY chip — the transcript closer's own 0.65–0.80 in-row
+        # evidence, stamped `data.signal` by `apply_transcript_results` —
+        # is evidence riding a row, not a question: it resolves ITSELF at
+        # the four-day window (applies or retracts). It lives on the row
+        # (PLATE1 P7 `data.proposal`) and never renders here as a Staff
+        # Meeting confirm / not-relevant / hold row, nor counts in the
+        # brief's "N things need your eyes". A non-attendee lane row
+        # (`nonattendee_lane`) is NOT a policy chip — it is the one shape
+        # that still needs a person — and keeps rendering.
+        if _is_policy_chip(ev, data):
+            continue
+        # FS-11: an un-adjudicated review proposal older than its TTL expires
+        # instead of accumulating (default TTL only when the writer stamped one;
+        # legacy proposals with no ttl_days keep the prior forever-open behavior).
+        ttl = data.get("ttl_days")
+        if isinstance(ttl, (int, float)) and not isinstance(ttl, bool):
+            opened = _parse_ts(ev.get("ts"))
+            if opened is not None and now is not None and \
+                    opened + timedelta(days=int(ttl)) < now:
+                continue
+        # FB-19 — the row MUST be able to name what it is asking about. The
+        # title rides the event since FB-19; legacy events get it from the
+        # open-commitment projection (loaded lazily — only when one needs it).
+        title = (data.get("title") or "").strip()
+        if not title:
+            if titles is None:
+                titles = _cru_commitment_titles(workspace_root)
+            title = titles.get(cid, "")
+        # R-3: the RAW evidence, "" when the proposal recorded none. The
+        # default below is a RENDER fallback and must not reach the weakness
+        # screen — substituting prose for a missing record made an
+        # evidence-less proposal read as evidenced, which is the one thing
+        # the screen exists to notice.
+        evidence = (data.get("evidence") or "").strip()
+        render_evidence = evidence or "matched an outbound send"
+        completion = data.get("has_completion_signal")
+        if not isinstance(completion, bool):
+            completion = None
+        weak_reason, strength = _cru_strength(evidence, completion)
+        # RIDERS (c) — the WRITER'S OWN stamp, RENDER ONLY. GRANOLA1's
+        # non-attendee lane writes `evidence_strength` / `strength_reason` /
+        # `auto_close_blocked` on the proposal because it knows the provenance
+        # the evidence text cannot express, and nothing rendered them: a weak
+        # secondhand close-proposal was the same row on screen as a strong
+        # firsthand one, which is what blocks that lane's write-enable.
+        #
+        # A stamp may only make a row WEAKER (see `stamped_strength`), and it
+        # moves the render BADGE only. `weak_reason` is deliberately NOT
+        # touched: `confirm_review_rows` re-derives that field from the
+        # evidence text before screening, so writing the stamp into it would
+        # change nothing at the fence while breaking the invariant that a
+        # row's `weak_reason` is exactly what `weakness_reason(evidence)`
+        # returns. No threshold, no score, no write path moves here.
+        try:
+            from watch_gate import (stamped_strength, stamped_strength_fields,
+                                    stamped_strength_note)
+            stamp = stamped_strength(data)
+            stamp_fields = stamped_strength_fields(data)
+            stamp_note = stamped_strength_note(data)
+        except Exception:
+            stamp, stamp_fields, stamp_note = {}, {}, ""
+        if stamp_note:
+            strength = stamp["strength"]
+        # CLOSEID1 — THE READER for the ambiguity row's fields. The writer
+        # records one either/or instead of N yes/no rows; the ids and titles it
+        # carries ARE the question, so they have to reach the screen. A field
+        # written and rendered nowhere is the documented-and-read-by-nobody
+        # shape, and an either/or the user cannot see is the bulk-confirm
+        # double-close waiting to happen.
+        amb_cands = data.get("ambiguous_candidates")
+        amb_cands = list(amb_cands) if isinstance(amb_cands, list) else []
+        amb_query = str(data.get("ambiguous_query") or "").strip()
+        amb_truncated = data.get("ambiguous_truncated") or 0
+        amb_match = str(data.get("resolved_by_match") or "")
+        amb_line = (_cru_ambiguity_line(amb_query, amb_cands, amb_truncated)
+                    if len(amb_cands) >= 2 else "")
+        if amb_line:
+            # The row's own name is the question. The anchor commitment's title
+            # would read as "close this one?", which is the one thing this row
+            # must never say.
+            title = (f"Which item did you mean by '{amb_query}'?" if amb_query
+                     else "Which item did you mean?")
+
+        if not title:
+            # DROP-EMPTY (FB-19): no title means no honest ask — the row would
+            # render as a bare "Housekeeping" shrug, which is the defect this
+            # fix exists to kill. A row that cannot state its ask does not
+            # render at all. The commitment stays open and reachable; only
+            # this un-askable prompt is suppressed.
+            continue
+        out.append({
+            "id": f"cru:{cid}",
+            "source_family": "commitment_review",
+            "kind": "commitment_review",
+            "shape": "hygiene",
+            "tier": "confirm",
+            "fingerprint": f"cru:{cid}",
+            "title": title,
+            "evidence": evidence,
+            # CLOSEID1 F-9 — a row that ASKS "which one did you mean"
+            # offers no confirm: the button would close the anchor,
+            # i.e. the first hit. Dismiss and hold still apply.
+            "action_tuples": [a for a in _CRU_ACTIONS
+                              if not (amb_line and
+                                      a.get("action") == "confirm")],
+            "render_line": (amb_line or
+                            _cru_render_line(title, render_evidence,
+                                             weak_reason, stamp_note)),
+            "opened_at": ev.get("ts") or "",
+            "expires_at": "",
+            "detector": "reconcile-sent",
+            "seq": ev.get("seq"),
+            "commitment_id": cid,
+            "match_score": data.get("match_score"),
+            # §2.1 — the badge, on the row, before the user answers.
+            "strength": strength,
+            "weak_reason": weak_reason,
+            # The screen inputs the apply step passes straight to
+            # watch_gate.confirm_review_rows, so an executing model never has
+            # to re-derive (or guess at) any of them. `has_completion_signal`
+            # and `evidence_ts` ride the proposal event since WATCHGATE;
+            # `promise_ts` is the commitment's own capture time from the
+            # projection. All three are None on legacy rows, and None is
+            # "not assessed" everywhere downstream.
+            "has_completion_signal": completion,
+            "evidence_ts": data.get("evidence_ts"),
+            "promise_ts": promise_ts.get(cid),
+            # BUG-8330 item 9 — the digest key's thread-agreement input:
+            # rows sharing an evidence line digest together only when they
+            # also agree on thread (and counterparty, when carried).
+            "primary_thread_id": ev.get("primary_thread_id") or "",
+            # CLOSEID1 — carried onto the row so an apply surface can ask
+            # WHICH rather than act on the anchor. `commitment_id` above is an
+            # identity anchor for this row, never a close target, whenever
+            # `ambiguous_candidates` has more than one entry.
+            "ambiguous_query": amb_query,
+            "ambiguous_candidates": amb_cands,
+            "ambiguous_truncated": amb_truncated,
+            "resolved_by_match": amb_match,
+        })
+        # RIDERS (c) — the stamp rides the row ONLY when the writer set one, so
+        # an unstamped row's dict is key-for-key what it was before. A surface
+        # that wants the class rather than the sentence reads these; the two
+        # shared renderers read the sentence.
+        out[-1].update(stamp_fields)
+    return out
+
+
+_MONTH_ABBR = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _short_date(ts: str, workspace_path=None) -> str:
+    """"Jul 8" from an ISO ts — empty string when unparseable (a dated
+    evidence phrase NEVER invents a date, the deal-detector rule).
+
+    TZDATE3 — when `workspace_path` is passed, the ISO ts is localized via
+    `tz.localize_date` FIRST (an evening-Pacific capture must not read as
+    tomorrow's UTC date), then reformatted. `workspace_path=None` (the
+    default) keeps the pre-TZDATE3 raw-UTC behavior for any caller that
+    hasn't been updated."""
+    ts = str(ts or "")
+    if workspace_path and ts:
+        localized = _localize_date(ts, workspace_path)
+        if localized:
+            ts = localized
+    if len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
+        try:
+            return f"{_MONTH_ABBR[int(ts[5:7])]} {int(ts[8:10])}"
+        except (ValueError, IndexError):
+            return ""
+    return ""
+
+
+def person_proposal_is_low_context(p: dict) -> bool:
+    """FS-17 — a name-only single mention: no inferred role AND no inferred
+    org (nothing to decide on but the bare name). Shared with the backlog
+    sweep so the adapter TTL and the sweep's expire branch can never fork."""
+    return not (p.get("inferred_role") or p.get("inferred_org"))
+
+
+def person_proposal_already_on_file(workspace_root, p: dict) -> bool:
+    """FS-19 — is this "add person" proposal already satisfied by an existing
+    contact? The person queue's missing symmetry with the org adapter
+    (`_adapt_org_project_proposals` drops a proposal once `find_existing_org`
+    finds the org — "already created, the proposal was actioned"). People had
+    the age-out logic but never got the already-exists logic, so anyone
+    already on file re-surfaced as a fresh "add" forever — rich-context rows
+    never age out (F-46), and "adding" someone who already exists returns
+    needs_confirm which LEAVES the proposal open (person_backlog_sweep). That
+    is the every-week resurfacing M reported.
+
+    Only ADD-type proposals (`person_proposal`). A `person_update_proposal`
+    references an existing person on purpose (a new role/email on someone you
+    already have) — those must keep surfacing; existence is their premise, not
+    a reason to drop them.
+
+    THE predicate lives in `confirm_flow.person_name_on_file` (confident
+    matches only: full-name/email → True; lone first-name Tier-3 ambiguity →
+    False, the Bug #19 discipline; fail-open on error). This wrapper adds the
+    add-type gate. The queue adapter no longer calls this directly — it reads
+    `load_open_person_proposals(..., suppress_on_file=True)` so the filter is a
+    single chokepoint shared with the morning brief and the commitments chat.
+    Kept as public API + a direct-unit-test seam."""
+    if p.get("type") != "person_proposal":
+        return False
+    from confirm_flow import person_name_on_file
+
+    return person_name_on_file(workspace_root, p.get("name"))
+
+
+_PERSON_NO_RECORD = "no contact record yet"
+
+# WG1-B D-B1 — an id-shaped inferred_org (`org_045` live, `org-045` in the
+# seq-3774 sighting class) must NEVER render verbatim. Both separators, case-
+# insensitive; anchored so a real org whose NAME merely contains "org" never
+# matches.
+_ORG_ID_RE = re.compile(r"^org[-_]\d+$", re.IGNORECASE)
+
+
+def _org_id_names(workspace_root) -> dict:
+    """org_id -> canonical_name (D-B1 — the org analogue of _person_id_names).
+    Keys are normalized lowercase-with-underscores so the hyphen sighting class
+    (`org-045`) resolves against the live `org_045` ids. Defensive: an
+    unreadable entities.json means no map (id-shaped badges strip instead)."""
+    try:
+        ent_path = Path(workspace_root) / "_hq" / "data" / "entities.json"
+        data = json.loads(ent_path.read_text(encoding="utf-8"))
+        ent = data.get("entities") if isinstance(data.get("entities"), dict) \
+            else data
+        out = {}
+        for o in ent.get("orgs") or []:
+            if o.get("id") and o.get("canonical_name"):
+                out[str(o["id"]).lower().replace("-", "_")] = \
+                    o["canonical_name"]
+        return out
+    except Exception:
+        return {}
+
+
+def _resolve_org_display(org, org_names: Optional[dict] = None) -> str:
+    """D-B1 resolve-or-strip: an id-shaped org resolves to its canonical name
+    via `org_names` (the _org_id_names map) or STRIPS to "" — a raw id never
+    renders. Non-id-shaped text passes through verbatim. Render/adapt-side
+    only — the stored proposal payload is never rewritten."""
+    org = (org or "").strip()
+    if not org or not _ORG_ID_RE.match(org):
+        return org
+    key = org.lower().replace("-", "_")
+    return (org_names or {}).get(key, "") or ""
+
+
+def _evidence_snippet(text, limit: int = 140) -> str:
+    """D-B2 — the coalesced evidence as a quoted snippet, truncated on a word
+    boundary with an ellipsis. Empty evidence returns "" (the caller keeps
+    today's generic line — no fabricated quotes)."""
+    text = " ".join(str(text or "").split())
+    if not text:
+        return ""
+    if len(text) > limit:
+        cut = text[: limit + 1]
+        if " " in cut:
+            cut = cut[: cut.rfind(" ")]
+        text = cut.rstrip(" ,;:.–—-") + "…"
+    return f"“{text}”"
+
+
+def _possible_match_consequence(match_name: str) -> str:
+    """BUG C/D — the enriched consequence segment when a plausible existing
+    record was resolved for an add-type row: "possible match: {X} — same
+    person?" replaces the false "no contact record yet". Human-in-the-loop —
+    the row still renders and still offers Add person; this is a hint plus a
+    populated `same as` verb, never an auto-merge (Bug #19)."""
+    return f"possible match: {match_name} — same person?"
+
+
+def _possible_match_multi_consequence(count: int, name: str) -> str:
+    """IDM1 — the count-honest hint when the resolver finds 2+ same-name
+    records for an add-type row. Naming ONE of them (the pre-IDM1 shape)
+    invited a one-tap link to whichever same-name person ranked first — a
+    silent wrong-person merge. The count keeps the collision signal (losing
+    it was Bug D's original failure) without guessing; the unpopulated
+    `same as [existing]` verb alongside it forces the CEO to name which
+    record (input="required")."""
+    return (f"possible match: {count} people named {name} on file — "
+            f"same as one of them?")
+
+
+def _person_render_line(p: dict, *,
+                        consequence: str = _PERSON_NO_RECORD,
+                        org_names: Optional[dict] = None,
+                        workspace_path=None) -> str:
+    """FS-17 — the enriched identity row: `{badge} · {source-ref-with-date} ·
+    {snippet, when evidence exists} · {consequence}`, the same shape the deal
+    rows carry. Provenance-honest: the source noun comes from the proposal's
+    own source_ref/evidence text, the date from its captured ts — never
+    guessed, dropped when absent.
+
+    WG1-B D-B1: an id-shaped `inferred_org` resolves through `org_names`
+    (_org_id_names) or strips — the badge degrades to role-only /
+    "mentioned by name only"; a raw `org-045`-class id never renders.
+    WG1-B D-B2: non-empty evidence renders verbatim as a quoted ~140-char
+    snippet segment so the row is adjudicable; empty evidence keeps today's
+    line byte-identical.
+
+    `consequence` is the trailing segment — "no contact record yet" by
+    default, or the "possible match: X — same person?" hint (BUG C/D) when the
+    adapter resolved a plausible existing record for the cluster."""
+    role = (p.get("inferred_role") or "").strip()
+    org = _resolve_org_display(p.get("inferred_org"), org_names)
+    if role and org:
+        badge = f"looks like {role} at {org}"
+    elif org:
+        badge = f"looks connected to {org}"
+    elif role:
+        badge = f"looks like {role}"
+    else:
+        badge = "mentioned by name only"
+    src_text = f"{p.get('source_ref') or ''} {p.get('evidence') or ''}".lower()
+    if any(t in src_text for t in ("granola", "transcript", "meeting")):
+        noun = "your meeting notes"
+    elif any(t in src_text for t in ("mail", "inbox", "thread", "@", "sent")):
+        noun = "an email thread"
+    elif "slack" in src_text:
+        noun = "a Slack message"
+    else:
+        noun = "a captured note"
+    date = _short_date(p.get("captured_ts"), workspace_path)
+    evid = f"surfaced in {noun}" + (f" on {date}" if date else "")
+    snippet = _evidence_snippet(p.get("evidence"))
+    if snippet:
+        return f"{badge} · {evid} · {snippet} · {consequence}"
+    return f"{badge} · {evid} · {consequence}"
+
+
+def _person_row_title(p: dict, person_names: Optional[dict] = None) -> str:
+    """FB-8 — the row NAME is load-bearing ("{name — badge · evidence ·
+    consequence}"). The as-heard name when the proposal carried one (the
+    confirm_flow reader coalesces the legacy field spellings). PID1 title
+    fix: an update-type row carrying a `person_id` titles as the RECORD's
+    canonical name + " — update" (`person_names` is the adapter's id→name
+    map) — the live defect was 4 update rows rendering raw `granola:<uuid>`
+    strings. Fallback is a short evidence/review_reason snippet ONLY; a raw
+    source_ref is never a title. A nameless ADD row no longer reaches this
+    function at all (the adapter drops it — annotation tier, D5)."""
+    pid = p.get("person_id")
+    if pid and person_names and person_names.get(pid):
+        return f"{person_names[pid]} — update"
+    name = (p.get("name") or "").strip()
+    if name:
+        if p.get("type") == "person_update_proposal":
+            return f"{name} — update"
+        return name
+    for key in ("evidence", "review_reason"):
+        txt = str(p.get(key) or "").strip()
+        if txt:
+            return txt if len(txt) <= 60 else txt[:57].rstrip() + "…"
+    return ""
+
+
+def _cluster_render_line(cluster: dict, *,
+                         consequence: str = _PERSON_NO_RECORD,
+                         org_names: Optional[dict] = None,
+                         workspace_path=None) -> str:
+    """D3 — the identity-clustered row's evidence line: the FS-17 enriched
+    shape for a single mention, prefixed "seen N× — " with the newest
+    source phrases when the cluster merged multiple proposals. Provenance-
+    honest exactly like `_person_render_line`: nouns/dates come from each
+    proposal's own captured text, dropped when absent. WG1-B: id-shaped
+    inferred_org resolves-or-strips (D-B1, via `org_names`) and the newest
+    row's evidence renders as the quoted snippet segment (D-B2) — on the
+    multi-mention path too, where the segment swap used to drop it.
+
+    `consequence` is the trailing segment (BUG C/D) — the default
+    "no contact record yet" or the "possible match: X — same person?" hint."""
+    rows = cluster.get("rows") or []
+    best = dict(rows[0]) if rows else {}
+    best["name"] = cluster.get("name")
+    best["inferred_role"] = cluster.get("inferred_role")
+    best["inferred_org"] = cluster.get("inferred_org")
+    if len(rows) <= 1:
+        return _person_render_line(best, consequence=consequence,
+                                   org_names=org_names,
+                                   workspace_path=workspace_path)
+    base = _person_render_line(best, consequence=consequence,
+                               org_names=org_names,
+                               workspace_path=workspace_path)
+    # base = "{badge} · surfaced in {noun}[ on {date}][ · {snippet}] ·
+    # {consequence}" — swap the source segment for the multi-mention phrase;
+    # the snippet (recomputed, never index-parsed) rides after it (D-B2).
+    parts = base.split(" · ")
+    seen = []
+    for r in rows[:3]:  # newest-first, capped (T2.2 density)
+        src = _person_render_line({**r, "name": cluster.get("name")},
+                                  org_names=org_names,
+                                  workspace_path=workspace_path)
+        mid = src.split(" · ")[1] if src.count(" · ") >= 2 else ""
+        mid = mid.replace("surfaced in ", "")
+        if mid and mid not in seen:
+            seen.append(mid)
+    middle = f"seen {len(rows)}× — " + ", ".join(seen) if seen \
+        else f"seen {len(rows)}×"
+    snippet = _evidence_snippet(best.get("evidence"))
+    tail = [snippet, parts[-1]] if snippet else [parts[-1]]
+    if len(parts) >= 3:
+        return " · ".join([parts[0], middle] + tail)
+    return " · ".join([middle] + tail if snippet else [middle, consequence])
+
+
+_PERSON_ROW_ACTIONS = [
+    # Registered verbs (D10 discipline extends to adapters): `add person`
+    # and `proposal not relevant` dispatch per the W4b confirm-flow
+    # handlers — on a CLUSTER row they fan out across data.cluster_seqs
+    # (PID1 D3: one click adjudicates every underlying proposal); `snooze
+    # proposal 7d` is the shared snooze. `same as [existing]` stays
+    # available through chat / the commitments confirm section — three
+    # verbs keep the row dropdown lean (T2.2 density).
+    {"action": "add person"},
+    {"action": "proposal not relevant"},
+    {"action": "snooze proposal 7d"},
+]
+
+
+def _person_id_names(workspace_root) -> dict:
+    """person_id -> canonical_name, for the PID1 update-row title fix.
+    Defensive: an unreadable entities.json means no map (snippet fallback)."""
+    try:
+        ent_path = Path(workspace_root) / "_hq" / "data" / "entities.json"
+        data = json.loads(ent_path.read_text(encoding="utf-8"))
+        ent = data.get("entities") if isinstance(data.get("entities"), dict) \
+            else data
+        out = {}
+        for p in ent.get("people") or []:
+            if p.get("id") and p.get("canonical_name"):
+                out[p["id"]] = p["canonical_name"]
+        return out
+    except Exception:
+        return {}
+
+
+def _resolve_person_candidates(workspace_root, cluster: dict) -> list[dict]:
+    """BUG C/D — find the plausible EXISTING person records for an add-type
+    cluster so the daily row can offer "possible match: X — same person?" plus
+    a populated "same as X" action instead of the false "no contact record
+    yet".
+
+    NOT a filter and NOT an auto-merge: the confident-drop stays FS-19's job
+    (suppress_on_file at the loader). This runs on the rows that SURVIVE that
+    drop — the variants the confident, punctuation-blind, alias-blind
+    suppression let through — and only ENRICHES them. The row still renders and
+    still offers Add person, so a wrong candidate is a soft hint the human
+    overrides, never a silent hide (Bug #19 preserved).
+
+    Resolution widens from the confident-only suppression, cheapest first:
+      1. `identity_reconcile.classify_cluster` — the merge_propose tiers
+         (confident full-name / observed-address match) already carry a
+         `matched_person`; the WEEKLY reconcile rail's own resolver, now wired
+         into the DAILY adapter (the shared-root fix).
+      2. `people_writer.list_same_name_people` — token overlap against
+         canonical_name / aliases / nicknames. Catches a lone first name that
+         overlaps a multi-token record ("Bo"→"Bo Sample"), an existing first
+         name embedded in a captured note ("... (or Rio alt account)"), and a
+         "— update" suffix the whitespace/punctuation-blind confident check
+         misses.
+      3. `entity_resolve.resolve_all` (people only) — aliases.json + fuzzy +
+         phonetic, for the typo "skylar"→Skyler that no token check can reach.
+
+    Returns the matched person record dicts (each carries `id` +
+    `canonical_name`), or [] when nothing plausibly matches (a genuinely-new
+    name). IDM1: a multi-record return means the name COLLIDES with 2+ people
+    on file — the adapter must not pick one (any ranking still guesses on
+    genuine duplicates); it renders the count-honest hint + an unpopulated
+    `same as [existing]` verb instead. Exactly one record is the pre-IDM1
+    single-candidate shape, unchanged."""
+    name = (cluster.get("name") or "").strip()
+    if not name:
+        return []
+
+    # 1) Confident resolution — the weekly rail's classifier. Confident by
+    #    construction (full-name / observed-address match), so a hit stays a
+    #    single candidate — the IDM1 collision branch guards the PLAUSIBLE
+    #    tiers below, where same-name ambiguity actually lives.
+    try:
+        from identity_reconcile import classify_cluster
+        matched = classify_cluster(workspace_root, cluster).get("matched_person")
+        if isinstance(matched, dict) and (matched.get("id")
+                                          or matched.get("canonical_name")):
+            return [matched]
+    except Exception:
+        pass
+
+    # 2) Token overlap (alias/nickname aware) — the add-person elicit
+    #    pre-check, reused here to surface the candidate the confident tier
+    #    couldn't confirm. IDM1: the helper's natural return (no
+    #    max_candidates=1 cap) so a collision is DETECTED, not truncated to
+    #    one before the adapter ever learns it existed.
+    try:
+        from people_writer import list_same_name_people
+        cands = list_same_name_people(workspace_root, name)
+        if cands:
+            return cands
+    except Exception:
+        pass
+
+    # 3) Fuzzy / phonetic / aliases.json — the typo case. IDM1: every
+    #    distinct person hit (resolve_all dedupes by entity id), not
+    #    first-hit-wins — 2+ hits is the same collision as tier 2.
+    try:
+        from entity_resolve import resolve_all
+        people = [r.record for r in resolve_all(workspace_root, name)
+                  if r.entity_type == "person" and isinstance(r.record, dict)]
+        if people:
+            return people
+    except Exception:
+        pass
+
+    return []
+
+
+def _person_actions_with_candidates(cands: list[dict]) -> list[dict]:
+    """The row's action tuples. Exactly one plausible candidate → splice a
+    POPULATED `same as [existing]` verb (carrying the matched name + id) in
+    after `add person` — the pre-IDM1 shape, unchanged. 2+ candidates (IDM1) →
+    the verb ships UNPOPULATED (no value, no person_id): the handler's
+    input="required" path then forces the CEO to name which record — never
+    rank-and-pick among genuine duplicates. Every branch keeps Add person so
+    a wrong match is still the human's call (Bug #19). No candidate → the
+    unchanged three-verb row."""
+    if not cands:
+        return list(_PERSON_ROW_ACTIONS)
+    match = cands[0] if len(cands) == 1 else None
+    out: list[dict] = []
+    for tup in _PERSON_ROW_ACTIONS:
+        out.append(dict(tup))
+        if tup.get("action") == "add person":
+            if match is not None:
+                # `value` pre-fills the existing contact's name so
+                # apply-choices' `same as [existing]` handler
+                # (input="required") resolves without the user re-typing;
+                # `person_id` carries the record verbatim.
+                out.append({"action": "same as [existing]",
+                            "value": (match.get("canonical_name")
+                                      or "").strip(),
+                            "person_id": match.get("id")})
+            else:
+                # IDM1 collision — the required input IS the disambiguation
+                # step; a pre-fill here would silently pick a winner.
+                out.append({"action": "same as [existing]"})
+    return out
+
+
+# WG1-B D-B3 — org-marker name shapes: a trailing/embedded parenthetical that
+# is NOT an "(or …)" capture annotation (those stay the classify_cluster
+# confirm tier), or a legal-entity suffix. Deliberately narrow: a bare
+# name-only mention ("Skyler") never matches — name-only person rows are
+# legitimate (the row-19 negative control).
+_ORG_MARKER_RE = re.compile(
+    r"\((?!or\s)[^)]*\)"
+    r"|\b(?:inc|llc|ltd|corp|corporation|gmbh|plc|llp)\.?\s*$",
+    re.IGNORECASE)
+
+
+def _open_org_proposal_names(events: list[dict]) -> set:
+    """Normalized names of org_proposals the org rail will render (open, not
+    declined) — the D-B3 re-route target set."""
+    names: set = set()
+    declined: set = set()
+    for ev in events:
+        et = ev.get("type")
+        if et not in ("org_proposal", "org_proposal_declined"):
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        nm = " ".join((data.get("name") or data.get("org_name") or "")
+                      .lower().split())
+        if not nm:
+            continue
+        (names if et == "org_proposal" else declined).add(nm)
+    return names - declined
+
+
+def _org_shape_quarantine_row(row: dict) -> dict:
+    """The D-A6-shaped honest placeholder for an org-shaped payload stuck in
+    the person queue (D-B3): real wire id (so `show why` dispatches against
+    the source event), fixed copy naming the defect class — never the payload
+    content — and the single read-only verb."""
+    seq = row.get("seq")
+    if isinstance(seq, int) and not isinstance(seq, bool):
+        rid = f"person:{seq}"
+    elif row.get("fingerprint"):
+        rid = f"person:fp:{row['fingerprint']}"
+    else:
+        rid = "person:withheld"
+    return {
+        "id": rid,
+        "source_family": "person",
+        "kind": "person",
+        "shape": "identity",
+        "tier": "confirm",
+        "fingerprint": rid,
+        "evidence": "",
+        "action_tuples": [{"action": "show why"}],
+        "render_line": ("proposal withheld — org-shaped payload in the "
+                        "person queue"),
+        "opened_at": row.get("asked_ts") or row.get("captured_ts") or "",
+        "expires_at": "",
+        "detector": "confirm-flow",
+        "seq": seq,
+        "name": "1 row withheld",
+        "title": "1 row withheld",
+        "person_id": None,
+    }
+
+
+def _person_update_quarantine_row(row: dict) -> dict:
+    """UXR1 D5 — the WG1-A honest placeholder for a person_update_proposal
+    with NOTHING to decide (no name after person_id resolution, no evidence
+    after the loader's coalescing — the live seq-1591/1742 class when the
+    person_id no longer resolves). Same D-A6 shape as the org-shape gate's
+    placeholder: real wire id (so `show why` dispatches against the source
+    event), fixed copy naming the DEFECT CLASS — never the payload — and
+    the single read-only verb. A blank ask never renders."""
+    seq = row.get("seq")
+    if isinstance(seq, int) and not isinstance(seq, bool):
+        rid = f"person:{seq}"
+    elif row.get("fingerprint"):
+        rid = f"person:fp:{row['fingerprint']}"
+    else:
+        rid = "person:withheld"
+    return {
+        "id": rid,
+        "source_family": "person",
+        "kind": "person",
+        "shape": "identity",
+        "tier": "confirm",
+        "fingerprint": rid,
+        "evidence": "",
+        "action_tuples": [{"action": "show why"}],
+        "render_line": ("proposal withheld — identity row with nothing "
+                        "to decide"),
+        "opened_at": row.get("captured_ts") or "",
+        "expires_at": "",
+        "detector": "confirm-flow",
+        "seq": seq,
+        "name": "1 row withheld",
+        "title": "1 row withheld",
+        "person_id": row.get("person_id"),
+    }
+
+
+def _gate_org_shaped_person_rows(workspace_root, rows: list[dict],
+                                 events: list[dict],
+                                 *, now: Optional[datetime] = None):
+    """WG1-B D-B3 — the person queue's org-shape gate, run BEFORE clustering.
+
+    Only ADD-type rows carrying NO person signal (no inferred_role, no
+    evidence, no person_id) are eligible — a person-shaped row is never gated,
+    whatever its name matches (the live seq-3774 row names a real person whose
+    ORG record shares her name; role+evidence is what keeps her a person row).
+
+    Eligible rows:
+      - name matches an existing org (`find_existing_org`) → DROPPED — the
+        entity exists, the proposal was actioned (the org adapter's own
+        existence symmetry; render-side truth per the proposal-adapter
+        existence gotcha).
+      - name matches an OPEN org_proposal → DROPPED here — the org rail
+        renders that proposal as a well-formed selectable org row; keeping the
+        person row too would double-render the same subject (the re-route).
+      - org-marker name shape, unroutable → replaced by the honest quarantine
+        placeholder (never a descriptor-less unselectable person row).
+      - anything else (the name-only "Skyler" shape) → kept verbatim.
+
+    Aged low-context rows drop instead of quarantining — the gate honors the
+    same FS-17 age-out the queue view applies, so a placeholder can never
+    outlive the row it replaced.
+
+    Returns (kept_rows, quarantine_items) — quarantine items are already
+    projector-shaped."""
+    kept: list[dict] = []
+    quarantined: list[dict] = []
+    open_org_names = None  # lazy — most queues carry no org-shaped rows
+    for row in rows:
+        if row.get("type") != "person_proposal":
+            kept.append(row)
+            continue
+        if row.get("inferred_role") or row.get("evidence") \
+                or row.get("person_id"):
+            kept.append(row)
+            continue
+        name = (row.get("name") or "").strip()
+        if not name:
+            kept.append(row)  # nameless — the annotation tier owns it (D5)
+            continue
+        try:
+            from org_writer import find_existing_org
+            org_exists = find_existing_org(workspace_root,
+                                           name=name) is not None
+        except Exception:
+            org_exists = False
+        if org_exists:
+            continue  # actioned — the org is on file
+        if open_org_names is None:
+            open_org_names = _open_org_proposal_names(events)
+        if " ".join(name.lower().split()) in open_org_names:
+            continue  # re-routed — the org rail renders the open org_proposal
+        if _ORG_MARKER_RE.search(name):
+            if now is not None and person_proposal_is_low_context(row):
+                from confirm_flow import question_clock
+                opened = _parse_ts(question_clock(row))
+                if opened is not None and \
+                        (now - opened).days > PERSON_LOW_CONTEXT_STALE_DAYS:
+                    continue  # aged out — never quarantine a row FS-17 retires
+            quarantined.append(_org_shape_quarantine_row(row))
+            continue
+        kept.append(row)
+    return kept, quarantined
+
+
+def _adapt_person_proposals(workspace_root, events: list[dict],
+                            *, now: Optional[datetime] = None,
+                            surfacing_at: Optional[str] = None) -> list[dict]:
+    """FS-17 enrichment + PID1 D3 identity clustering: ONE row per person.
+
+    Add-type proposals group by normalized name (`identity_reconcile.
+    person_queue_view` — the SAME projection the morning-brief pointer
+    counts, so the two can never disagree); the row carries the cluster's
+    best name as title, merged newest-first evidence, and
+    `data.cluster_seqs` so apply-choices fans one click across every
+    underlying proposal. Nameless add rows NEVER render (annotation tier,
+    D5 — an undecidable row); update-type rows for an on-file person render
+    separately (existence is their premise) with the record's canonical
+    name as title (never a raw source_ref). Low-context single mentions
+    still age out after PERSON_LOW_CONTEXT_STALE_DAYS. Auto-eligible
+    clusters render as ordinary confirm rows until the Sunday reconciler
+    applies them — never render-and-also-auto-apply.
+
+    MERGE-WATCH (PGUARD1): this function's edits are adapter/clustering
+    only — the events-LOAD seam (`load_open_person_proposals(_events_path(
+    ...))`) is untouched by design."""
+    from confirm_flow import load_open_person_proposals, question_clock
+    from identity_reconcile import person_queue_view
+    from mute_ledger import active_dismissal_target_ids
+
+    dismissed = active_dismissal_target_ids(events, _now_iso())
+    # FS-19 — already a contact? `suppress_on_file=True` drops an "add person"
+    # row whose name confidently resolves to an existing record (the org
+    # adapter's find_existing_org symmetry), at the SHARED loader so the brief
+    # and commitments chat filter identically. Filter-only, like the org path
+    # — existence recomputes each render, no tombstone (the reconciler's
+    # merge-propose lane is what RESOLVES these; the filter stays render-side
+    # truth per the proposal-adapter existence gotcha).
+    # cr1#773: `surfacing_at` holds back a connector name stamped for a later
+    # day. Set for a named surface only: the diagnostic read keeps the waiting
+    # rows, like every other filter in `load_open_proposals`.
+    rows = load_open_person_proposals(_events_path(workspace_root),
+                                      dismissed_target_ids=dismissed,
+                                      suppress_on_file=True,
+                                      surfacing_at=surfacing_at)
+    # WG1-B D-B3 — org-shape gate BEFORE clustering: an org-shaped payload
+    # written as a person_proposal (the TDX-Arena row) re-routes to the org
+    # rail or quarantines; it never renders as a descriptor-less person row.
+    rows, quarantined = _gate_org_shaped_person_rows(workspace_root, rows,
+                                                     events, now=now)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ") if now is not None else None
+    view = person_queue_view(rows, now_iso=now_iso)
+    # WG1-B D-B1 — one entities read per adapt; badge composition resolves
+    # id-shaped inferred_org through this map or strips it.
+    org_names = _org_id_names(workspace_root)
+
+    out = list(quarantined)
+    for cluster in view["clusters"]:
+        newest = cluster["rows"][0] if cluster["rows"] else {}
+        # BUG C/D — resolve the plausible existing records for the SURVIVING
+        # cluster (FS-19 already dropped the confident matches). One hit swaps
+        # the false "no contact record yet" for a "possible match" hint and
+        # adds a populated `same as` verb; a miss leaves the row exactly as
+        # before. IDM1: 2+ hits render the count-honest collision hint and an
+        # UNPOPULATED `same as` verb — no match_name / match_person_id reach
+        # the wire, so nothing pre-picks among same-name people.
+        cands = _resolve_person_candidates(workspace_root, cluster)
+        match = cands[0] if len(cands) == 1 else None
+        match_name = ((match or {}).get("canonical_name") or "").strip() or None
+        if len(cands) >= 2:
+            consequence = _possible_match_multi_consequence(
+                len(cands), (cluster.get("name") or "").strip())
+        elif match_name:
+            consequence = _possible_match_consequence(match_name)
+        else:
+            consequence = _PERSON_NO_RECORD
+        out.append({
+            "id": cluster["row_id"],
+            "source_family": "person",
+            "kind": "person",
+            "shape": "identity",
+            "tier": "confirm",
+            "fingerprint": cluster["row_id"],
+            "evidence": newest.get("evidence") or newest.get("review_reason")
+                        or "",
+            "action_tuples": _person_actions_with_candidates(cands),
+            "render_line": _cluster_render_line(cluster,
+                                                consequence=consequence,
+                                                org_names=org_names,
+                                                workspace_path=workspace_root),
+            "opened_at": min((question_clock(r) or "")
+                             for r in cluster["rows"]) if cluster["rows"]
+                         else "",
+            "expires_at": "",
+            "detector": "confirm-flow",
+            "seq": cluster["seqs"][0] if cluster["seqs"] else None,
+            "name": cluster["name"],
+            # FS-17 / FB-8 — the row TITLE is the person's best as-heard
+            # spelling (build_card_view renders `title`).
+            "title": cluster["name"],
+            "person_id": None,
+            "inferred_role": cluster.get("inferred_role"),
+            # D-B1 — resolved-or-stripped on the emitted row too, so an
+            # id-shaped org never rides the item downstream. The stored
+            # proposal payload is untouched (adapt-side only).
+            "inferred_org": _resolve_org_display(cluster.get("inferred_org"),
+                                                 org_names),
+            # BUG C/D — the resolved candidate, carried to the wire so the
+            # populated `same as` verb dispatches without a re-type. None when
+            # no plausible match (a genuinely-new person) AND on an IDM1
+            # collision (2+ candidates — the wire must not carry a winner).
+            "match_person_id": (match or {}).get("id"),
+            "match_name": match_name,
+            # PID1 D3 — every underlying proposal id VERBATIM so one click
+            # adjudicates the whole cluster (fingerprints carry the D8
+            # seq-less rows).
+            "cluster_seqs": list(cluster["seqs"]),
+            "cluster_fingerprints": list(cluster["fingerprints"]),
+        })
+
+    person_names = _person_id_names(workspace_root) if view["updates"] else {}
+    for p in view["updates"]:
+        # UXR1 D5 — resolve-or-quarantine. A person_update_proposal with
+        # name=null but a person_id resolves its display name from the
+        # record (the map _person_row_title already titles from); when name
+        # AND evidence are BOTH empty after the loader's coalescing, the
+        # row has nothing to decide — it quarantines to the WG1-A honest
+        # placeholder instead of rendering a blank ask (the live
+        # seq-1591/1742 defect class).
+        resolved_name = ((p.get("name") or "").strip()
+                         or (person_names.get(p.get("person_id") or "")
+                             or "").strip())
+        evidence = p.get("evidence") or p.get("review_reason") or ""
+        if not resolved_name and not str(evidence).strip():
+            out.append(_person_update_quarantine_row(p))
+            continue
+        out.append({
+            "id": f"person:{p.get('seq')}",
+            "source_family": "person",
+            "kind": "person",
+            "shape": "identity",
+            "tier": "confirm",
+            "fingerprint": f"person:{p.get('seq')}",
+            "evidence": evidence,
+            "action_tuples": list(_PERSON_ROW_ACTIONS),
+            "render_line": _person_render_line(p, org_names=org_names,
+                                               workspace_path=workspace_root),
+            "opened_at": p.get("captured_ts") or "",
+            "expires_at": "",
+            "detector": "confirm-flow",
+            "seq": p.get("seq"),
+            # D5 — the resolved display name rides the row (None only when
+            # evidence carried the row past the quarantine gate).
+            "name": resolved_name or p.get("name"),
+            "title": _person_row_title(p, person_names),
+            "person_id": p.get("person_id"),
+            "inferred_role": p.get("inferred_role"),
+            # D-B1 — resolve-or-strip on the update rows too.
+            "inferred_org": _resolve_org_display(p.get("inferred_org"),
+                                                 org_names),
+        })
+    return out
+
+
+# STAFFCUT D1 — the org/project row's registered wire verbs. Both are already
+# in the apply-choices `cr-brain` dispatch table for these kinds; this list is
+# what finally puts them ON the row. `confirm [type]` takes OPTIONAL input (a
+# typed correction to the inferred name), so no row holds Apply on a missing
+# input (F-17).
+_ORG_PROJECT_ACTIONS = [{"action": "confirm [type]"},
+                        {"action": "not relevant"}]
+
+
+def _org_project_render_line(kind: str, name: str, evidence: str) -> str:
+    """The org/project row's ASK, in the user's language.
+
+    These rows rendered with `render_line: ""`, so `build_card_view` fell back
+    to the raw evidence — a phrase with no question in it. The row now says
+    what a click DOES (a new record on file) and what it rests on, and never
+    invents a source it cannot see (drop-empty on the evidence segment)."""
+    noun = "company" if kind == "org" else "project"
+    ask = f"Add {name} as a {noun} on file?"
+    snippet = _evidence_snippet(evidence)
+    return f"{ask} · {snippet}" if snippet else ask
+
+
+def _adapt_org_project_proposals(workspace_root, events: list[dict],
+                                 *, now: Optional[datetime] = None) -> list[dict]:
+    """org_proposal / project_proposal are prose-written (no shared selector)
+    — read defensively. Natural tombstones: an org_proposal_declined naming
+    the same org, or the entity already existing (the proposal was actioned).
+    Staleness window (review F2, mirrors _adapt_dont_forget): proposals older
+    than ORG_PROJECT_STALE_DAYS never surface — months-old zombie prose
+    proposals must not pollute the card on a mature workspace."""
+    from org_writer import find_existing_org
+
+    declined_names: set[str] = set()
+    for ev in events:
+        if ev.get("type") != "org_proposal_declined":
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        name = (data.get("name") or data.get("org_name") or "").strip().lower()
+        if name:
+            declined_names.add(name)
+
+    threads_names: set[str] = set()
+    try:
+        ent_path = Path(workspace_root) / "_hq" / "data" / "entities.json"
+        ent = json.loads(ent_path.read_text(encoding="utf-8"))
+        ent = ent.get("entities") if isinstance(ent.get("entities"), dict) else ent
+        for t in entities_collection(ent, "projects"):
+            nm = (t.get("display_name") or t.get("name") or "").strip().lower()
+            if nm:
+                threads_names.add(nm)
+    except Exception:
+        pass
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for ev in events:
+        etype = ev.get("type")
+        if etype not in ("org_proposal", "project_proposal"):
+            continue
+        if now is not None:
+            opened = _parse_ts(ev.get("ts"))
+            if opened is not None and (now - opened).days > ORG_PROJECT_STALE_DAYS:
+                continue  # zombie prose proposal — never surfaces (F2)
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        name = (data.get("name") or data.get("org_name")
+                or data.get("project_name") or data.get("title") or "").strip()
+        if not name:
+            continue
+        key = f"{etype}:{name.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        if etype == "org_proposal":
+            if name.lower() in declined_names:
+                continue
+            try:
+                if find_existing_org(workspace_root, name=name):
+                    continue  # already created — the proposal was actioned
+            except Exception:
+                pass
+            kind, family = "org", "org"
+        else:
+            if name.lower() in threads_names:
+                continue  # thread exists — actioned
+            kind, family = "project", "project"
+        out.append({
+            "id": f"{family}:{ev.get('seq')}",
+            "source_family": family,
+            "kind": kind,
+            "shape": "identity",
+            "tier": "confirm",
+            "fingerprint": f"{family}:{name.lower()}",
+            "evidence": data.get("evidence") or data.get("reason") or "",
+            # STAFFCUT D1 — these rows shipped with `action_tuples: []`
+            # hardcoded, so `_row_actions` returned nothing and they rendered
+            # BUTTONLESS: six permanently unanswerable rows on the audit day,
+            # in direct violation of the orchestrator's own contract ("every
+            # row states its ask and carries verbs, or it does not render").
+            # `propose()` refuses empty tuples at source (_validate_action_
+            # tuples), so only these legacy fossil-reader adapters could
+            # produce one.
+            #
+            # The verbs are NOT new: apply-choices has dispatched
+            # `confirm [type]` / `not relevant` for `kind: org` and
+            # `kind: project` since LB2 — `org` → `org_writer.create_org`
+            # (dedup-first through `find_existing_org`, which is also what
+            # already retires an actioned proposal above) and a decline →
+            # `org_proposal_declined` / `chat_dismissal`. Nothing new is
+            # written; the row simply stops hiding the verbs its own handler
+            # was waiting for.
+            "action_tuples": list(_ORG_PROJECT_ACTIONS),
+            "render_line": _org_project_render_line(
+                kind, name, data.get("evidence") or data.get("reason") or ""),
+            "opened_at": ev.get("ts") or "",
+            "expires_at": "",
+            "detector": "confirm-flow",
+            "seq": ev.get("seq"),
+            "name": name,
+            # FB-8 — build_card_view renders `title`; an org/project identity
+            # row without one renders the nameless shape fallback.
+            "title": name,
+        })
+    return out
+
+
+# STAFFCUT §3.7 / D1 — the dormancy row's registered wire verbs, the ones
+# apply-choices has dispatched for `kind: dormancy` since LB1 (the dont-forget
+# orchestrator's status handlers). Like the org rows, these shipped as `[]` and
+# rendered buttonless — a row titled "Housekeeping" with no subject and no way
+# to answer it. Demoting the row to on-demand does not excuse leaving it
+# unanswerable where it DOES render.
+_DORMANCY_ACTIONS = [{"action": "active"}, {"action": "archive"},
+                     {"action": "snooze 14d"}]
+
+
+def _entity_display_names(workspace_root) -> dict:
+    """id -> display name across threads, orgs and people — the dormancy
+    adapter's target map (a dormancy proposal names whichever of the three its
+    writer was looking at). Defensive like its siblings: an unreadable
+    entities.json means no map, and an un-nameable row drops rather than
+    rendering a wire id (RV-5)."""
+    out: dict = {}
+    try:
+        ent_path = Path(workspace_root) / "_hq" / "data" / "entities.json"
+        data = json.loads(ent_path.read_text(encoding="utf-8"))
+        ent = data.get("entities") if isinstance(data.get("entities"), dict) \
+            else data
+        for t in entities_collection(ent, "projects"):
+            nm = (t.get("display_name") or t.get("name") or "").strip()
+            if t.get("id") and nm:
+                out[str(t["id"])] = nm
+        for o in ent.get("orgs") or []:
+            if o.get("id") and (o.get("canonical_name") or "").strip():
+                out.setdefault(str(o["id"]), o["canonical_name"].strip())
+        for p in ent.get("people") or []:
+            if p.get("id") and (p.get("canonical_name") or "").strip():
+                out.setdefault(str(p["id"]), p["canonical_name"].strip())
+    except Exception:
+        return out
+    return out
+
+
+# The row header when the dormancy target no longer resolves to a name. An
+# honest generic beats both a wire id (RV-5) and the nameless "Housekeeping"
+# shape fallback the row used to get.
+_DORMANCY_UNNAMED_TITLE = "Something you were tracking"
+
+
+def _dormancy_render_line(title: str, reason: str) -> str:
+    """The dormancy row's ASK. It rendered as "" before, which
+    `build_card_view` degraded to the bare reason phrase — a statement, not a
+    question, under a nameless "Housekeeping" header."""
+    ask = f"{title} has gone quiet — still active, or archive it?"
+    snippet = _evidence_snippet(reason)
+    return f"{ask} · {snippet}" if snippet else ask
+
+
+def _adapt_dont_forget(workspace_root, events: list[dict],
+                       *, now: Optional[datetime]) -> list[dict]:
+    """Open dormancy-transition proposals (prose-written by the dont-forget
+    orchestrator). A proposal is retired by a later decline (14d cooldown),
+    snooze, or status_change on the same target.
+
+    STAFFCUT §3.7 (M ruling 2026-08-02): these rows are DEMOTED TO ON-DEMAND.
+    Whether a quiet client relationship is dormant is a judgment the CEO makes
+    when he asks — not weekly homework on the one surface that is now the only
+    door. The rows are NOT deleted and NOT tombstoned: each carries
+    `surface_hint = ON_DEMAND_SURFACE_HINT`, which `load_open_proposals` honors
+    by rendering it only for a caller that ASKED for the on-demand surface (the
+    dont-forget / dormant-customer-scan lane). The projector still holds them,
+    `include_auto` diagnostics still see them, and nothing about their
+    resolution path changes."""
+    latest: dict[str, dict] = {}
+
+    def _target(data: dict) -> str:
+        for k in ("thread_id", "project_id", "person_id", "target_id", "target"):
+            v = data.get(k)
+            if isinstance(v, str) and v:
+                return v
+        return ""
+
+    retired: set[str] = set()
+    for ev in events:
+        etype = ev.get("type")
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        tgt = _target(data)
+        if not tgt:
+            continue
+        if etype == "dont_forget_dormant_proposal":
+            latest[tgt] = ev
+        elif etype in ("dont_forget_dormant_proposal_declined",
+                       "dont_forget_snooze", "status_change"):
+            retired.add(tgt)
+    out = []
+    names = None  # lazy — most queues carry no dormancy rows at all
+    for tgt, ev in latest.items():
+        if tgt in retired:
+            continue
+        opened = _parse_ts(ev.get("ts"))
+        if now is not None and opened is not None and (now - opened).days > 30:
+            continue  # stale prose proposals age out of the queue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        if names is None:
+            names = _entity_display_names(workspace_root)
+        # A target that no longer resolves gets an honest generic, NOT a drop
+        # and never its wire id (RV-5). Dropping was the first draft and it was
+        # wrong twice over: it would change what a FOSSIL adapter renders on
+        # substrate where a thread record has since been archived away, and the
+        # row is answerable regardless — `active` / `archive` / `snooze 14d` act
+        # on the target id, which the row still carries verbatim.
+        title = names.get(tgt) or _DORMANCY_UNNAMED_TITLE
+        reason = data.get("reason") or data.get("evidence") or ""
+        out.append({
+            "id": f"dont_forget:{ev.get('seq')}",
+            "source_family": "dont_forget",
+            "kind": "dormancy",
+            "shape": "hygiene",
+            "tier": "confirm",
+            "fingerprint": f"dont_forget:{tgt}",
+            "evidence": reason,
+            "action_tuples": list(_DORMANCY_ACTIONS),
+            "render_line": _dormancy_render_line(title, reason),
+            "opened_at": ev.get("ts") or "",
+            "expires_at": "",
+            "detector": "dont-forget",
+            "seq": ev.get("seq"),
+            "target_id": tgt,
+            "title": title,
+            # §3.7 — on-demand only. See the docstring; this is the whole
+            # demotion, and it is one field rather than a filter in every
+            # surface because `load_open_proposals` is the one chokepoint.
+            "surface_hint": ON_DEMAND_SURFACE_HINT,
+        })
+    return out
+
+
+def _adapt_schedule_add(workspace_root, registered_task_ids) -> list[dict]:
+    """RETIRED (STAFFCUT §3.6) — later-add schedule proposals no longer feed
+    the confirm queue. Returns [] always.
+
+    WHY IT RETIRED, and why retiring it costs nothing:
+      * 0 of 4 proposals ever produced a `schedule_created` event — the row was
+        a pointer, and nobody followed it;
+      * it had no reverser, so it could never move to the auto tier;
+      * registration only ever actually happens through the change-schedule /
+        update-bridge path, which this row never invoked and apply-choices
+        explicitly refuses to invoke;
+      * and the row shipped with `action_tuples: []`, so it rendered
+        BUTTONLESS — one of the three verb-less adapter classes D1 names.
+      * Measured at a2e5e20 before removal: `build_staff_meeting_view` calls
+        `load_open_proposals` WITHOUT `registered_task_ids`, and this adapter
+        returned [] whenever that argument is None — so the staff meeting never
+        actually rendered a schedule_add row anyway. What retires here is a
+        dormant path, not a working one.
+
+    `schedule_proposals.propose_later_add_tasks` and its 6-week suppression are
+    UNTOUCHED (other callers / future use). The `registered_task_ids` parameter
+    stays on `load_open_proposals` / `select_confirm_card` for caller
+    back-compat and is simply no longer consulted for a queue row.
+
+    The function itself is kept, empty, for the same reason the fossil readers
+    are never deleted: something may still import it, and an ImportError is a
+    worse answer than an honest empty list."""
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Projector + card selection
+# ---------------------------------------------------------------------------
+
+def _shown_path(workspace_root) -> Path:
+    return Path(workspace_root) / "_hq" / ".system" / "brain_card_shown.json"
+
+
+def _load_shown(workspace_root) -> dict:
+    path = _shown_path(workspace_root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def mark_shown(workspace_root, proposal_ids, surface: str,
+               *, now_iso: Optional[str] = None) -> None:
+    """R2 shown-markers: record that these ids rendered on `surface` today.
+    Render state, not substrate — lives under _hq/.system/. Never raises."""
+    try:
+        from atomic_write import atomic_write_json
+
+        now = now_iso or _now_iso()
+        day = now[:10]
+        shown = _load_shown(workspace_root)
+        # prune other days so the file never grows
+        shown = {k: v for k, v in shown.items()
+                 if isinstance(v, dict) and v.get("date") == day}
+        for pid in proposal_ids:
+            shown[pid] = {"date": day, "surface": surface}
+        path = _shown_path(workspace_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, shown)
+    except Exception:
+        pass
+
+
+def _drop_settled_money_rows(workspace_root, items: List[dict]) -> List[dict]:
+    """CUTB item 1(b) — drop every deal-signal row (`deal_creation` /
+    `deal_update`) whose org is a client or carries a won deal, or whose
+    thread is terminal. One entities read, only when a deal row is present;
+    any failure degrades to "filter nothing" rather than a dead surface."""
+    deal_rows = [i for i in items
+                 if i.get("kind") in ("deal_creation", "deal_update")]
+    if not deal_rows:
+        return items
+    try:
+        from deal_signal_retire import (RETIRE_KINDS, settled_orgs,
+                                        terminal_deal_threads)
+        from entities_io import entities_collection
+        ent_path = Path(workspace_root) / "_hq" / "data" / "entities.json"
+        if not ent_path.exists():
+            return items
+        raw = json.loads(ent_path.read_text(encoding="utf-8"))
+        ent = raw["entities"] if isinstance(raw.get("entities"), dict) else raw
+        clients = {o.get("id") for o in entities_collection(ent, "orgs")
+                   if isinstance(o, dict)
+                   and o.get("relationship_type") == "client"}
+        settled = set(settled_orgs(ent, _load_events(workspace_root)))
+        terminal = terminal_deal_threads(ent)
+    except Exception:  # pragma: no cover — never a dead surface
+        return items
+
+    def _settled(i: dict) -> bool:
+        if i.get("kind") not in RETIRE_KINDS:
+            return False
+        oid = i.get("org_id")
+        tid = i.get("thread_id")
+        return bool((oid and (oid in clients or oid in settled))
+                    or (tid and tid in terminal))
+
+    return [i for i in items if not _settled(i)]
+
+
+def screen_past_lifetime(items: List[dict], workspace_root, *,
+                         now_iso: Optional[str] = None,
+                         stats: Optional[dict] = None) -> List[dict]:
+    """The rows a surface may still OFFER — FOLD1-B 1.2 item 1.
+
+    One call to `question_ttl.within_lifetime` per row, and nothing else:
+    the rule, the classes and the importance hold all live in that module,
+    beside the engine that applies the defaults, so the read gate and the
+    write gate can never drift onto two answers.
+
+    DEGRADES TO SHOWING EVERYTHING. A screen that cannot run must not empty
+    a customer's card — an unreadable gate is a missing gate, never a
+    silent queue.
+
+    `stats`, when a caller passes a dict, is filled with
+    `{"n_hidden": <rows this screen held back>}` — FIX ROUND 1 (reviewer
+    F-2). THE HIDE IS IMMEDIATE AND THE DEFAULT IS NOT: the row is settled
+    later, by its own weekly rail, and that rail marked itself FAILED in 7
+    of 9 runs in the attended window. Before this gate a failing rail was
+    loud (the questions kept showing); after it, the same failure is
+    silent unless the number is written down. A screen that could not run
+    reports 0 held back, which is the truth: it held nothing back.
+    """
+    if stats is not None:
+        stats["n_hidden"] = 0
+    try:
+        from question_ttl import within_lifetime
+    except Exception as exc:  # pragma: no cover — the module ships beside us
+        sys.stderr.write(f"[brain_proposals] lifetime screen skipped: {exc}\n")
+        return list(items or [])
+    out = []
+    for it in items or []:
+        try:
+            keep = within_lifetime(it, workspace_root, now_iso=now_iso)
+        except Exception as exc:  # pragma: no cover
+            sys.stderr.write(f"[brain_proposals] lifetime screen degraded on "
+                             f"{(it or {}).get('id')!r}: {exc}\n")
+            keep = True
+        if keep:
+            out.append(it)
+    if stats is not None:
+        stats["n_hidden"] = len(items or []) - len(out)
+    return out
+
+
+def load_open_proposals(
+    workspace_root,
+    surface: Optional[str] = None,
+    *,
+    now_iso: Optional[str] = None,
+    registered_task_ids=None,
+    include_legacy: bool = True,
+    include_auto: bool = False,
+    screen_stats: Optional[dict] = None,
+) -> List[dict]:
+    """THE projector (D1): one normalized open-proposal queue — generic
+    brain_proposal events (minus tombstones/TTL) PLUS adapter reads over the
+    legacy families. Each item: {id, source_family, kind, shape, tier,
+    fingerprint, evidence, action_tuples, render_line, opened_at,
+    expires_at, detector, seq, ...family extras}.
+
+    **The queue contains CONFIRM-tier items only by default** (LB2 parity
+    fix, the FB-20 mandate): auto-tier proposals are applied-then-narrated,
+    never adjudicated — they are not "things that need your eyes", so no
+    surface may render or count one. `include_auto=True` is the explicit
+    escape for diagnostic consumers (the parity test, resting-auto checks)
+    — never for an adjudication surface.
+
+    `surface` drives the R2 cross-surface dedup: on a DAILY_DEDUP_SURFACES
+    surface, items already shown TODAY on a DIFFERENT surface are dropped.
+    staff-meeting / system-health / None see the full set (deliberate
+    exemption — the full-queue surfaces and explicit asks).
+
+    `screen_stats` (FIX ROUND 1, reviewer F-2) is an optional dict the
+    lifetime gate fills with `n_hidden` — what this read held back because
+    it was past its class lifetime. A surface that RECORDS that number
+    cannot hide questions silently when the rail that settles them fails.
+    """
+    now_iso = now_iso or _now_iso()
+    now = _parse_ts(now_iso)
+    events = _load_events(workspace_root)
+    items = _open_brain_proposals(events, now=now)
+    if include_legacy:
+        # Neither clock is threaded here — see the two-clock note in
+        # _adapt_commitment_reviews. This call is byte-identical to its
+        # pre-WATCHGATE form on purpose.
+        items += _adapt_commitment_reviews(workspace_root)
+        items += _adapt_person_proposals(
+            workspace_root, events, now=now,
+            surfacing_at=now_iso if surface is not None else None)
+        items += _adapt_org_project_proposals(workspace_root, events, now=now)
+        items += _adapt_dont_forget(workspace_root, events, now=now)
+        # STAFFCUT §3.6 — `_adapt_schedule_add` is RETIRED and returns []; the
+        # call stays so the retirement is visible where the queue is assembled
+        # rather than only in a docstring, and `registered_task_ids` keeps its
+        # signature for every existing caller.
+        items += _adapt_schedule_add(workspace_root, registered_task_ids)
+    # STAFFCUT §3.7 — the on-demand demotion, applied at THE chokepoint so
+    # every NAMED surface inherits it in one move.
+    #
+    # `surface is None` keeps seeing the full set, and that is load-bearing
+    # rather than lenient: the un-named call is the DIAGNOSTIC / dedup read,
+    # and one of its callers is `propose()`'s own cross-rail dedup a few
+    # hundred lines up. Filtering there would let a migrated dormancy writer
+    # re-propose something already open as a legacy row, and the queue would
+    # then show both — the exact trap LB2 §3a's dedup exists to close. It also
+    # matches the posture this function already documents for None.
+    if surface is not None and surface != ON_DEMAND_SURFACE_HINT:
+        items = [i for i in items
+                 if i.get("surface_hint") != ON_DEMAND_SURFACE_HINT
+                 and i.get("kind") not in ON_DEMAND_KINDS]
+    # LIFECYCLE1 §7a — the RETIRED kinds go for EVERY named surface, including
+    # the on-demand one: a demotion says "ask for it and you get it", a
+    # retirement says nobody renders it at all. `surface is None` keeps seeing
+    # them for the same reason the demotion does — that call is the diagnostic
+    # / cross-rail dedup read, and a retired-but-open row must still suppress a
+    # duplicate write and still be visible to an audit.
+    if surface is not None:
+        items = [i for i in items if i.get("kind") not in RETIRED_KINDS]
+    # CUTB / M ruling R-B — the deal question is withheld from every named
+    # surface (see WITHHELD_KINDS). Same posture as the retirement above.
+    if surface is not None:
+        items = [i for i in items if i.get("kind") not in WITHHELD_KINDS]
+    # CUTB item 1(b) — a READ-TIME settled filter. A money row about an org
+    # that is a CLIENT, or that has a WON deal, never renders on a named
+    # surface — whatever the Sunday `deal-signals` job did or did not get to.
+    # The write-time retirement (`deal_signal_retire.retire_settled`) runs
+    # only inside that job, so a proposal opened before the org settled kept
+    # rendering until the job fired; on the v5.28.0 attended test two orgs
+    # won and converted on 08-18 were still "a live deal" on 09-06. Belt to
+    # the withhold's braces: the two filters are independent, and this one
+    # is pinned with the withhold switched off (run_cutb_test [1b]).
+    if surface is not None:
+        items = _drop_settled_money_rows(workspace_root, items)
+    # FOLD1-B 1.2 item 1 — THE LIFETIME GATE, at the same chokepoint and with
+    # the same `surface is not None` posture as the four filters above it.
+    #
+    # TTL1 gave every question class a lifetime and an engine that applies its
+    # default. Nothing ever asked the age at RENDER time, so a question past
+    # its lifetime kept being offered until the next expiry run happened to
+    # take it — and `rank_proposals` puts the oldest row first, so the rows
+    # furthest past the bar are the ones that FRONT the card. That is how the
+    # operator's Staff Meeting opened, on 2026-09-07, with identity questions
+    # first asked on June 30.
+    #
+    # The screen belongs here rather than in `select_confirm_card` alone
+    # because the Staff Meeting does not go through that selector: it reads
+    # this projector directly. One filter at the chokepoint is what makes
+    # "no question past its window is offered anywhere" true of every named
+    # surface, this one and the next one.
+    #
+    # `surface is None` KEEPS SEEING THE AGED ROWS, and that is load-bearing,
+    # not lenient: the un-named read is the diagnostic one, and one of its
+    # callers is `question_ttl._queue_rows` — the expiry engine's own read of
+    # what is past its lifetime. Screening there would blind the engine to
+    # exactly the rows it exists to retire, and the questions would then be
+    # hidden from the customer AND never defaulted. Same reason the demotion,
+    # the retirement and the withhold all exempt it.
+    if surface is not None:
+        items = screen_past_lifetime(items, workspace_root, now_iso=now_iso,
+                                     stats=screen_stats)
+    # cr1#773: a connector's project row stamped for a later day waits, the
+    # same posture again: the un-named read keeps it for dedup and expiry.
+    if surface is not None:
+        from confirm_flow import may_surface
+        today = _localize_date(now_iso, str(workspace_root))
+        items = [i for i in items if may_surface(i.get("surface_on"), today)
+                 and not _held_project_on_file(workspace_root, i)]
+    # Uniform snooze/decline gate (review F1): a chat_dismissal whose
+    # target_id is a projector item id retires that item for the
+    # dismissal's TTL — this is what `snooze proposal 7d` and the
+    # project-row `not relevant` write. The person adapter pre-filters
+    # internally (same ledger); double-filtering is harmless.
+    try:
+        from mute_ledger import active_dismissal_target_ids
+        dismissed = active_dismissal_target_ids(events, now_iso)
+        if dismissed:
+            items = [i for i in items if i["id"] not in dismissed]
+    except Exception:
+        pass
+    # LB2 parity default — auto-tier items leave the projection HERE, so
+    # every consumer (staff meeting, brief pointer, system-health counts,
+    # schedule readiness) inherits the filter in one move, future call
+    # sites included. Adapters only emit confirm-tier rows, so this bites
+    # bp rows alone.
+    if not include_auto:
+        items = [i for i in items if i.get("tier") != "auto"]
+    if surface in DAILY_DEDUP_SURFACES:
+        day = now_iso[:10]
+        shown = _load_shown(workspace_root)
+        items = [
+            i for i in items
+            if not (
+                isinstance(shown.get(i["id"]), dict)
+                and shown[i["id"]].get("date") == day
+                and shown[i["id"]].get("surface") != surface
+            )
+        ]
+    return items
+
+
+def _held_project_on_file(workspace_root, item: dict) -> bool:
+    """A connector's stamped project row whose project is in the book by now:
+    nothing is left to ask. Filter only, like the org rail's existence gate,
+    and the name is read each render so it follows the book."""
+    if item.get("kind") != "project" or not item.get("surface_on"):
+        return False
+    try:
+        from lifecycle_pass import project_is_on_file
+        return project_is_on_file(workspace_root,
+                                  item.get("name") or item.get("title") or "")
+    except Exception:
+        return False
+
+
+# FB-20 — the money carve-out's prose, one sentence per kind. The brief is
+# read-only now, so these sentences carry NO verbs and NO row: they name the
+# signal and point at the surface that adjudicates it. Chat-phrase
+# adjudication ("say staff meeting"), propose-only, never silent.
+_MONEY_PROSE = {
+    "deal_creation": "Command Room thinks {name} is a live deal — say "
+                     "`staff meeting` to confirm.",
+    "deal_update": "Command Room thinks the {name} deal moved — say "
+                   "`staff meeting` to confirm.",
+    # HIST1 Part 2 (step 12) — the org account-value lane rides the same
+    # carve-out: propose-only prose, adjudication at the staff meeting.
+    "org_money": "Command Room spotted an account value for {name} — say "
+                 "`staff meeting` to confirm.",
+}
+
+
+def money_prose_lines(items: List[dict], *, cap: int = 3) -> List[str]:
+    """FB-20: the money-class items from a proposal queue, as one prose
+    sentence each (ranked, capped, drop-empty).
+
+    THE ONE EXCEPTION to the read-only brief. Every other class the brief
+    used to card is now reachable only via the pointer line; money is named
+    outright because a deal signal that goes silent for a day is the one
+    failure with a price tag. Propose-only by construction: prose carries no
+    action tuples, so nothing here can be applied from the brief — the
+    sentence's own copy routes the user to the staff meeting.
+
+    `cap` bounds the render, not the truth: the caller's pointer count
+    includes every capped item. Returns [] when no money is open — the brief
+    then says nothing about deals (drop-empty; never an all-clear line)."""
+    out: List[str] = []
+    for item in rank_proposals([i for i in items
+                                if kind_shape(i.get("kind") or "") == "money"]):
+        if len(out) >= cap:
+            break
+        template = _MONEY_PROSE.get(item.get("kind"))
+        if not template:
+            continue  # an unmapped money kind gets no invented sentence
+        name = (item.get("title") or "").strip()
+        if not name:
+            continue  # never "Command Room thinks  is a live deal"
+        out.append(template.format(name=name))
+    return out
+
+
+def rank_proposals(items: List[dict]) -> List[dict]:
+    """D3 ordering: money > identity > hygiene, then age (oldest first;
+    undated items last within their shape)."""
+    def _key(item):
+        shape = _SHAPE_RANK.get(item.get("shape"), 2)
+        dt = _parse_ts(item.get("opened_at"))
+        age_key = dt.timestamp() if dt else float("inf")
+        return (shape, age_key, str(item.get("id")))
+    return sorted(items, key=_key)
+
+
+def select_confirm_card(
+    workspace_root,
+    surface: str,
+    *,
+    now_iso: Optional[str] = None,
+    registered_task_ids=None,
+    cap: int = DAILY_CONFIRM_CAP,
+) -> dict:
+    """The "Needs your eyes" card selector (D3/D10): ranked, capped at
+    `cap`, max MAX_SLOTS_PER_DETECTOR per detector. Returns
+    {items, overflow_count, total_open, overflow_line}. On daily surfaces
+    the returned items are marked shown (R2)."""
+    now_iso = now_iso or _now_iso()
+    open_items = load_open_proposals(
+        workspace_root, surface, now_iso=now_iso,
+        registered_task_ids=registered_task_ids)
+    # Review F5: auto-tier proposals never enter the confirm card — an
+    # auto change is applied-then-narrated (the change feed's job), not
+    # queued for consent. Redundant since LB2 flipped the projector default
+    # (include_auto=False) — kept as defense-in-depth.
+    open_items = [i for i in open_items if i.get("tier") != "auto"]
+    # LB2 — surface routing: a row whose writer named a surface renders only
+    # there (config_drift → staff meeting). The daily card drops hinted rows
+    # for other surfaces; load_open_proposals callers (the staff meeting)
+    # see the full set, hint included.
+    open_items = [i for i in open_items
+                  if not i.get("surface_hint")
+                  or i["surface_hint"] == surface]
+    ranked = rank_proposals(open_items)
+    picked: list[dict] = []
+    per_detector: dict[str, int] = {}
+    for item in ranked:
+        if len(picked) >= cap:
+            break
+        det = item.get("detector") or "unknown"
+        if per_detector.get(det, 0) >= MAX_SLOTS_PER_DETECTOR:
+            continue
+        per_detector[det] = per_detector.get(det, 0) + 1
+        picked.append(item)
+    overflow = max(0, len(open_items) - len(picked))
+    if surface in DAILY_DEDUP_SURFACES and picked:
+        mark_shown(workspace_root, [i["id"] for i in picked], surface,
+                   now_iso=now_iso)
+    return {
+        "items": picked,
+        "overflow_count": overflow,
+        "total_open": len(open_items),
+        "overflow_line": OVERFLOW_LINE.format(n=overflow) if overflow else "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Card / queue VIEW builder (FS-09 / FS-10 — mechanize the row + section shape
+# so the runtime renders the queue instead of improvising opaque clusters).
+# ---------------------------------------------------------------------------
+
+# OBJ2: the "objective" labels are plain-English placeholders — flagged for
+# the product owner and easy to rename at review.
+_SHAPE_SECTION_LABEL = {"money": "MONEY", "identity": "IDENTITY",
+                        "hygiene": "HYGIENE", "objective": "OBJECTIVES"}
+_SHAPE_TILE_LABEL = {"money": "Money", "identity": "Identity",
+                     "hygiene": "Hygiene", "objective": "Objectives"}
+_SHAPE_NAME_FALLBACK = {"money": "Deal signal", "identity": "Needs confirming",
+                        "hygiene": "Housekeeping",
+                        "objective": "Objective proposal"}
+
+
+# PLATENUM1 fix round 1 (REVIEW F-9) — NAMED FOR ITS SURFACE.
+# This shipped as a bare `card_header`, which is also the name of
+# `attribution_doors.card_header(questions, workspace_root=None)` — a
+# different function, with a different signature, exported from a
+# different module and referenced bare in prose. Two `card_header`s in
+# one tree makes every sentence about either one ambiguous, so this
+# one carries what it is about.
+#: The surface NAME, per surface. The header is this and nothing else
+#: (FOLD1-B 1.2 item 3, ruling R-4).
+SURFACE_LABELS = {"staff-meeting": "Staff Meeting"}
+DEFAULT_SURFACE_LABEL = "Needs your eyes"
+
+#: The wording a header may never carry again, and the reason each one is
+#: listed. `assert_no_debt_header` scans for these.
+DEBT_HEADER_PHRASES = ("waiting on you", "waiting for you", "open items",
+                       "needs your call", "outstanding")
+
+#: THE FOOTER THE HEADER'S COUNT BECAME — FOLD1-B 1.2 item 3, built in fix
+#: round 1 (reviewer F-3). The top line names the surface; what the page
+#: held back is said at the BOTTOM, where it reads as a door rather than as
+#: a debt, and it teaches the verb that opens it.
+CARD_MORE_FOOTER = "{n} more — say `show more`"
+
+
+def card_more_footer(n_more) -> str:
+    """The card's trailing "N more" line, or `""` when the page shows
+    everything — FOLD1-B 1.2 item 3.
+
+    Same empty-string contract as `end_of_day.resting_line` and the same
+    posture as `OVERFLOW_LINE`: a line reporting zero is noise, and this
+    surface has a rule about that. The sentence is composed HERE and run
+    through `chat_output_validator.validate_chat_output` before it is
+    returned, because it is a composed customer sentence and the standing
+    fence says every one of those goes through the validator. A line the
+    validator refuses is dropped rather than shipped — the page loses a
+    pointer, never gains a violation.
+    """
+    try:
+        n = int(n_more)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    line = CARD_MORE_FOOTER.format(n=n)
+    try:
+        from chat_output_validator import validate_chat_output
+        if not validate_chat_output(line).ok:  # pragma: no cover — a fence
+            sys.stderr.write("[brain_proposals] footer refused by the chat "
+                             "output validator; dropped\n")
+            return ""
+    except Exception as exc:  # pragma: no cover — never cost the page
+        sys.stderr.write(f"[brain_proposals] footer validation skipped: "
+                         f"{exc}\n")
+    return line
+
+
+def surface_card_header(surface: str, n_rows: int = 0, *,
+                        shape_totals: Optional[dict] = None) -> str:
+    """The card's header line — FOLD1-B 1.2 item 3 (ruling R-4): THE HEADER
+    NAMES THE SURFACE, NOT A DEBT.
+
+    It used to say "Staff Meeting — 6 of 109 waiting on you". PLATENUM1
+    built that sentence to fix a real defect (B2.7: a header of 6 above
+    tiles reading 109 and 24, with no way to tell which population either
+    belonged to) and it fixed it — by stating the debt more precisely.
+    M's design rule of 2026-09-06 says the Staff Meeting carries no
+    "N waiting on you" header at all: a customer who opens a surface to
+    answer two questions should not be met with a number that reads as an
+    accusation, and 109 of anything is why people stopped opening it.
+
+    NEITHER NUMBER IS LOST, and this is the part worth reading before
+    changing it back. The TILES carry the honest per-shape totals
+    (LIFECYCLE1 §7b) and they sum to the whole queue; the section titles
+    carry what the page bound held back, in words ("showing the front 5 of
+    17 — the rest stay queued and lead the next one", `proposal_digests.
+    section_notes`); the daily card's own `overflow_line` says the same. So
+    the arithmetic B2.7 asked for is on the page in two places — attached to
+    the rows it describes, which is where a number means something — and the
+    top line says where you are.
+
+    `n_rows` and `shape_totals` stay in the signature: every caller passes
+    them, they are what `assert_no_debt_header` is checked against, and a
+    surface that ever wants a count again should have to change this one
+    function rather than re-derive it.
+    """
+    return SURFACE_LABELS.get(surface, DEFAULT_SURFACE_LABEL)
+
+
+def assert_no_debt_header(header) -> None:
+    """THE NAG SCAN (FOLD1-B 1.2 item 3). Raises when a composed card header
+    carries a debt count instead of naming its surface.
+
+    Accepts the header string or a whole built view. This is a fence and not
+    a preference: the header is one line that every fire of the surface
+    puts in front of the customer, and "N waiting on you" is the single
+    sentence M named when he said people had stopped opening it.
+    """
+    text = header.get("header") if isinstance(header, dict) else header
+    text = str(text or "")
+    low = text.lower()
+    for phrase in DEBT_HEADER_PHRASES:
+        if phrase in low:
+            raise BrainProposalError(
+                f"the card header says {phrase!r} — the header names its "
+                f"surface and the counts ride the tiles and the section "
+                f"titles (design rule 2026-09-06 §2, ruling R-4): {text!r}")
+    if any(ch.isdigit() for ch in text):
+        raise BrainProposalError(
+            "the card header carries a count — the honest totals ride the "
+            f"tiles and the section titles, never the top line: {text!r}")
+
+
+def _row_actions(item: dict) -> list:
+    """Registered wire verbs for a row — the action ids from the proposal's
+    own action_tuples (validated at propose() time via D10). NEVER an invented
+    bulk verb; the display label is the verb taxonomy's job at render time."""
+    out = []
+    for t in item.get("action_tuples") or []:
+        act = t.get("action") if isinstance(t, dict) else None
+        if act:
+            out.append(act)
+    return out
+
+
+#: The registered verbs that MEAN "let this one go", in the order a row is
+#: searched for one. Every entry is a canonical action id; the list is an
+#: ordering, not a new vocabulary.
+LET_GO_VERBS = ("proposal not relevant", "not relevant", "dismiss proposal",
+                "never track this", "drop", "archive")
+#: The plain-words answer each pre-pick is announced with. The row says the
+#: ANSWER, never the verb id: "likely: let it go" is a sentence a CEO reads;
+#: "likely: proposal_not_relevant" is a log line.
+PREPICK_PHRASE = "likely: {answer}"
+LET_GO_ANSWER = "let it go"
+#: At most this many verbs render on a card row. The rest of a row's
+#: registered verbs stay answerable from the on-demand queue and from chat —
+#: they are not removed from the row, they are not put on the card.
+MAX_RENDERED_VERBS = 2
+
+
+def _is_digest_row(item: dict) -> bool:
+    """A grouped row standing for several underlying ones (STAFFCUT)."""
+    return bool(item.get("digest_members") or item.get("digest_class")
+                or item.get("digest_count"))
+
+
+def row_prepick(item: dict) -> Optional[dict]:
+    """The likely answer for ONE card row, or None — FOLD1-B 1.2 item 2.
+
+    Returns `{"action", "answer"}`: the registered verb that would be tapped
+    and the plain-words answer the row announces.
+
+    IDENTITY rows pre-pick the resolved candidate — the one the wire already
+    carries as a populated `same as [existing]` verb. THE SAME-NAME ROW
+    PRE-PICKS NOTHING, and that fence is IDM1's, not this lane's: with two or
+    more plausible records the adapter deliberately ships that verb
+    UNPOPULATED so the handler forces the CEO to say which record is meant.
+    A default here would silently pick a winner among genuine duplicates,
+    which is the one thing the identity rail refuses to do.
+
+    HOUSEKEEPING and MONEY rows pre-pick their CLASS DEFAULT — what the
+    expiry engine would do anyway if nobody answered (`question_ttl.CLASSES`)
+    — so the pre-pick and the timeout can never disagree about what "no
+    answer" means. A row carrying no verb for that default gets no pre-pick
+    rather than an invented one.
+    """
+    if not isinstance(item, dict):
+        return None
+    if _is_digest_row(item):
+        return None
+    verbs = _row_actions(item)
+    shape = str(item.get("shape") or "hygiene")
+    if shape == "identity":
+        for t in item.get("action_tuples") or []:
+            if not isinstance(t, dict) or t.get("action") != "same as [existing]":
+                continue
+            name = str(t.get("value") or "").strip()
+            if name and t.get("person_id"):
+                return {"action": "same as [existing]",
+                        "answer": f"same as {name}"}
+            return None     # IDM1 collision — the wire carries no winner
+        return None
+    if shape != "hygiene":
+        # MONEY PRE-PICKS NOTHING, deliberately. The deal-signal class's
+        # default IS a let-go at seven days, and announcing "likely: let it
+        # go" on a live deal signal is the product taking the one side M
+        # named as the expensive one to get wrong ("a deal signal that goes
+        # silent for a day is the one failure with a price tag", FB-20). The
+        # class default still applies if nobody ever answers — that is the
+        # timeout's business, and a timeout nobody watched is not the same
+        # act as a suggestion put in front of the customer. The row keeps
+        # its own verb order, so the affirmative leads.
+        return None
+    try:
+        from question_ttl import CLASSES, DEFAULT_LET_GO, SHAPE_CLASSES
+        klass = SHAPE_CLASSES.get(shape)
+        default = CLASSES[klass]["default"] if klass in CLASSES else None
+    except Exception:  # pragma: no cover — the module ships beside this one
+        return None
+    if default != DEFAULT_LET_GO:
+        return None
+    for verb in LET_GO_VERBS:
+        if verb in verbs:
+            return {"action": verb, "answer": LET_GO_ANSWER}
+    return None
+
+
+def rendered_verbs(item: dict, prepick: Optional[dict] = None) -> list:
+    """The verbs a CARD row shows — FOLD1-B 1.2 item 2: one tap, and one way
+    to say "not that". At most `MAX_RENDERED_VERBS`.
+
+    M's rule of 2026-09-06: "We want to show less options to clients — they
+    are overwhelmed." A five-verb dropdown on a row whose likely answer is
+    already known is four decisions asked to collect one. The pre-picked verb
+    leads; the row's next own registered verb is the way to disagree; the
+    rest are still registered, still dispatchable from the on-demand queue
+    and from chat, and simply not on this card.
+
+    Order is otherwise the row's own — never re-sorted, so a reader who knows
+    a family's verbs still meets them in the order that family declares.
+    """
+    verbs = _row_actions(item)
+    if _is_digest_row(item):
+        # A DIGEST ROW KEEPS ITS THREE. It is one row standing for several,
+        # and its affirmative EXPANDS (`show these` re-renders the members as
+        # their own rows, each with its own close — BUG-8330 item 9). Hiding
+        # the expand behind a cap would turn a group into a thing you can
+        # only dismiss, and pre-picking a group dismiss is a bulk act with a
+        # default attached. Neither is "one tap with the likely answer": the
+        # likely answer to a group is to look at it.
+        return verbs
+    lead = (prepick or {}).get("action")
+    if lead and lead in verbs:
+        rest = [v for v in verbs if v != lead]
+        return ([lead] + rest)[:MAX_RENDERED_VERBS]
+    return verbs[:MAX_RENDERED_VERBS]
+
+
+def _row_name(item: dict) -> str:
+    """The row header — the deal/org/person display name (title), never an id.
+    Falls back to a shape label only when no title was stored."""
+    title = (item.get("title") or "").strip()
+    if title:
+        return title
+    return _SHAPE_NAME_FALLBACK.get(item.get("shape"), "Needs your eyes")
+
+
+# STAFFCUT — the keys `watch_gate.confirm_review_rows` reads off a review row,
+# embedded in the widget payload so the two dispatch shapes are equivalent. The
+# SAME list `proposal_digests._REVIEW_MEMBER_KEYS` puts on a digest member,
+# minus the two badge fields (`strength` / `weak_reason`): those are what the
+# user already read, not inputs, and apply-choices says not to recompute them.
+_REVIEW_DISPATCH_KEYS = ("commitment_id", "evidence", "match_score",
+                         "has_completion_signal", "evidence_ts", "promise_ts")
+
+# The ONE row family whose widget payload carries those keys. Scoping this was a
+# review finding, not a tidy-up: the embed loop ran for every kind, so an org
+# row's 387-character evidence string travelled in a payload no org handler
+# reads, and a deal row carried a `match_score` that means nothing to a deal.
+# The renderer never serializes `data` into the page, so nothing leaked — but a
+# payload is a trust window, and it should be exactly as wide as the fence that
+# needs it. Only the commitment-review family dispatches THROUGH the fence, so
+# only it gets the fence's inputs.
+_REVIEW_DISPATCH_KINDS = frozenset({"commitment_review"})
+
+
+def _row_target_ids(item: dict) -> dict:
+    """The F2 identity rule for card rows: embed every underlying target id
+    VERBATIM alongside the proposal id so apply-choices dispatches exactly.
+    PID1: cluster rows also embed cluster_seqs / cluster_fingerprints (one
+    click adjudicates the whole cluster) and person_link/person_merge rows
+    embed their record ids.
+
+    STAFFCUT: a DIGEST row embeds `digest_members` — every grouped member's own
+    id plus the exact dispatch payload its handler reads — so a grouped answer
+    is still N per-id resolutions and a single member can be answered out of
+    the group. Same rule as the PID1 cluster keys above: verbatim, never
+    re-derived at dispatch time.
+
+    THE ONE EXCEPTION to "target ids", named because it is one: a
+    COMMITMENT-REVIEW row also embeds the bulk-accept fence's own INPUTS
+    (`_REVIEW_DISPATCH_KEYS` — evidence, match score, completion signal,
+    timestamps), because that family is the only one that dispatches through the
+    fence, and a dispatcher reading the persisted widget has nowhere else to get
+    them. Without them the fence read "nothing recorded" and PARKED a row whose
+    commitment had real source text behind it. No other kind gets them
+    (`_REVIEW_DISPATCH_KINDS`): a payload is a trust window, and it is kept
+    exactly as wide as the fence requires."""
+    data = {"id": item["id"]}
+    for k in ("thread_id", "org_id", "person_id",
+              # LIFECYCLE1 fix round — the FOSSIL dormancy adapter's own target
+              # key. `_adapt_dont_forget` has always emitted `target_id` (the
+              # thread/org/person its prose writer was looking at) and this
+              # copy list never carried it, so a rendered fossil dormancy row's
+              # payload was `{"id": ...}` and NOTHING ELSE: the `archive` /
+              # `active` / `snooze 14d` verbs STAFFCUT put back on that row
+              # dispatched on a key the widget did not have. The row was
+              # answerable in the projector and unanswerable on screen.
+              "target_id",
+              "cluster_seqs",
+              # REVIEW THREADANN1 F1 — the thread_split confirm's own dispatch
+              # payload (parent + the annotation's cluster assignment,
+              # verbatim, never re-derived at dispatch time). Same rule as the
+              # PID1 cluster keys: a rendered card row must equip its handler
+              # as well as the projector row does.
+              "parent_thread_id", "clusters",
+              "cluster_fingerprints", "keep_id", "duplicate_id",
+              # BUG C/D — the resolved possible-match candidate, so the
+              # populated `same as [existing]` verb dispatches without a re-type.
+              "match_person_id", "match_name",
+              # STAFFCUT — the digest row's per-id dispatch payload.
+              "digest_class", "digest_key", "digest_count", "digest_members"):
+        if item.get(k):
+            data[k] = item[k]
+    # STAFFCUT — a review row's own FENCE INPUTS, verbatim, so a dispatcher
+    # reading the WIDGET (stateless `src` dispatch) is as well-equipped as one
+    # reading the projector. These are exactly the keys apply-choices tells the
+    # dispatcher to copy across, and every one of them is already on the item.
+    #
+    # Without them a rendered card row reached the fence with no evidence, so
+    # `weakness_reason` said "nothing recorded" and PARKED a row whose
+    # commitment had real source text behind it — a hold the user could not
+    # explain and had not earned. The digest MEMBERS carried these from the
+    # start; ordinary rows were the half of the design left unfinished.
+    #
+    # `is not None`, not truthiness: `has_completion_signal: False` is the
+    # signal "we looked and found none", and dropping it as falsy would
+    # downgrade the row to "not assessed" — a weaker screen, silently.
+    if item.get("kind") in _REVIEW_DISPATCH_KINDS:
+        for k in _REVIEW_DISPATCH_KEYS:
+            if item.get(k) is not None:
+                data[k] = item[k]
+    return data
+
+
+def build_card_view(
+    items: List[dict],
+    *,
+    surface: str = "staff-meeting",
+    header: Optional[str] = None,
+    extra_sections: Optional[list] = None,
+    section_notes: Optional[dict] = None,
+    shape_totals: Optional[dict] = None,
+    extra_dropped: int = 0,
+) -> dict:
+    """Build the ready-to-render widget data view for the Living Brain card /
+    Staff Meeting queue from a RANKED proposal list (FS-09 / FS-10).
+
+    Groups the queue into money > identity > hygiene sections, each titled with
+    its HONEST count, and builds each row as
+    `{name — badge · evidence-with-date · consequence}` carrying ONLY the
+    proposal's registered verbs (no invented bulk verbs). Header tiles show the
+    per-shape counts. `extra_sections` (e.g. the Staff Meeting "This week's
+    moves" rows) append after the queue sections.
+
+    `shape_totals` (LIFECYCLE1 §7b, optional) maps a SHAPE to the honest total
+    of open items it stands for across the WHOLE queue, not just this page.
+    When supplied it is what the tiles show — one honesty convention with the
+    section titles instead of two on one widget. Omitted → the tiles count the
+    page, byte-identical to the pre-LIFECYCLE1 output.
+
+    `section_notes` (STAFFCUT §3.1, optional) maps a SHAPE to one honest-totals
+    suffix appended to that section's title — the meeting fold's shipped idiom
+    ("… — showing 8; say `needs your call` for the rest"). It exists because
+    the header count must keep equalling the rows the widget SHOWS (RV-4), so
+    a page that groups or bounds rows has to state the full arithmetic
+    somewhere else. Omitted / empty → byte-identical to the pre-STAFFCUT
+    output.
+
+    Returns a dict suitable for `render_and_persist(data_view=...)` /
+    `render_chat_output_widget` — `source_skill` is "cr-brain" so the renderer
+    stamps `src` for stateless apply-choices dispatch.
+    """
+    by_shape: dict[str, list] = {"money": [], "identity": [],
+                                 "hygiene": [], "objective": []}
+    for it in items:
+        by_shape.setdefault(it.get("shape", "hygiene"), []).append(it)
+
+    sections: list[dict] = []
+    display_n = 0  # T2.2 (RV-5): sequential VISIBLE number; `n` stays the wire id
+    for shape in ("money", "identity", "hygiene", "objective"):
+        rows_in = by_shape.get(shape) or []
+        if not rows_in:
+            continue
+        rows: list[dict] = []
+        for it in rows_in:
+            display_n += 1
+            row = {
+                "n": it["id"],                       # id embedded verbatim (F2)
+                "display_n": display_n,              # what the row SHOWS (RV-5)
+                "name": _row_name(it),
+                # `context_tag` is the renderer's per-row context line — it
+                # renders as "{name} — {context_tag}", giving M's agreed shape
+                # "Acme Co — likely deal · proposal language in your
+                # Jul 8 sent mail · no pipeline record" (render_line verbatim,
+                # Bug #92b).
+                "context_tag": it.get("render_line") or it.get("evidence") or "",
+                "data": _row_target_ids(it),
+                "actions": _row_actions(it),
+            }
+            # FOLD1-B 1.2 item 2 — ONE TAP, THE LIKELY ANSWER PRE-PICKED.
+            # The row says the answer in words and leads with the verb that
+            # applies it; the rest of its registered verbs stay answerable on
+            # the on-demand queue and in chat. A row with no computable
+            # default says nothing about one and keeps the first two verbs it
+            # declares — a `likely:` the product cannot stand behind is worse
+            # than no suggestion at all.
+            prepick = row_prepick(it)
+            if prepick:
+                row["default"] = prepick["action"]
+                tag = row["context_tag"]
+                phrase = PREPICK_PHRASE.format(answer=prepick["answer"])
+                row["context_tag"] = f"{tag} · {phrase}" if tag else phrase
+            row["actions"] = rendered_verbs(it, prepick)
+            rows.append(row)
+        title = f"{_SHAPE_SECTION_LABEL[shape]} ({len(rows_in)})"
+        note = str((section_notes or {}).get(shape) or "").strip()
+        if note:
+            title = f"{title} — {note}"
+        sections.append({"title": title, "items": rows})
+
+    # LIFECYCLE1 §7b — ONE honesty convention on the widget.
+    #
+    # The tiles counted the PAGE (`len(by_shape[s])` — what this fire renders
+    # after grouping and the page bound) while the section titles carried the
+    # FULL counts in their notes. M's 2026-08-03 walk read tiles of 1 / 7 / 6
+    # above titles saying 41 and 18, on the same widget, about the same rows.
+    # Two conventions on one surface is worse than either convention: the
+    # reader cannot tell which number is the truth without knowing which
+    # mechanism produced it.
+    #
+    # §7b's ruling was: the tiles adopt the titles' convention — the honest
+    # total per shape, with the page bound governing only what RENDERS. That
+    # reasoning is preserved above deliberately; it is not deleted, because
+    # the problem it names is real and the fix it chose was one of two.
+    #
+    # WRAPSTAFF1 4.5 — M RULED THE OTHER WAY (R-19b, 2026-09-17), REVERSING
+    # §7b. On 2026-09-15 the card tiled 28 / 7 over a body of 27 / 6
+    # (ATTENDED_TEST_v5.31.0 B2.7). His rule: **the tiles equal the body** —
+    # a number on a card is something the reader should be able to count on
+    # screen, and a tile that cannot be counted teaches the reader to stop
+    # trusting the numbers rather than to look somewhere else for them.
+    #
+    # The honest full totals are NOT lost and were never only here: for a
+    # shape that renders AT LEAST ONE row they ride the section title, which
+    # `proposal_digests.section_notes` writes ("showing the front 8 of 24 —
+    # the rest stay queued and lead the next one"). That is where the
+    # arithmetic belongs, next to the rows it is about. `shape_totals` stays
+    # in the signature and still reaches `surface_card_header` and
+    # `card_more_footer`; the TILES no longer read it.
+    #
+    # The HEADER count is deliberately NOT touched: since FOLD1-B it carries
+    # no digit at all and `assert_no_debt_header` raises on one.
+    totals = shape_totals or {}
+    tiles = [
+        {"label": _SHAPE_TILE_LABEL[s], "value": len(by_shape.get(s) or [])}
+        for s in ("money", "identity", "hygiene", "objective")
+        # Drop-empty BEFORE rendering — the tile component refuses a 0-value
+        # tile (an empty frame is never data). A shape the page bound cut
+        # ENTIRELY now tiles NOTHING rather than tiling a number with no rows
+        # under it.
+        #
+        # CORRECTED (review F-2, 2026-09-17): such a lane has no section
+        # either, so `section_notes` does not reach it — the earlier claim
+        # that the section title is the reader's door was false for exactly
+        # this case. The rows ARE still counted, in `card_more_footer`'s
+        # "N more — say `show more`" below, which names a number but not the
+        # lane. Whether a fully-cut lane should be NAMED on the card is open:
+        # R-19b closed the tile question and did not rule on this one, and
+        # LIFECYCLE1 §7b raised the hazard ("indistinguishable from having
+        # lost it"). Behaviour unchanged pending M.
+        if by_shape.get(s)
+    ]
+
+    # RV-4 off-by-one: the header count must equal the ROWS THE WIDGET SHOWS —
+    # queue rows PLUS extra-section rows (the moves row was narrated but not
+    # counted). Extra rows also continue the visible numbering.
+    extras = list(extra_sections or [])
+    n_extra = 0
+    for sec in extras:
+        for it in sec.get("items", []) or []:
+            # WG1-B D-B4 — fail LOUD at build-view time, naming the section:
+            # an extra-section row without a wire id used to surface only as
+            # the renderer's opaque "Item missing required 'n' field" deep in
+            # the render (the scheduled-moves drop class).
+            if not isinstance(it, dict) or it.get("n") is None:
+                raise ValueError(
+                    "build_card_view: extra_sections item in "
+                    f"{(sec.get('title') or 'untitled section')!r} is missing "
+                    "its wire id 'n' — every appended row must arrive "
+                    "renderer-ready (see relationship_moves."
+                    "moves_rows_from_candidates for the moves shape)")
+            n_extra += 1
+            if "display_n" not in it:
+                it["display_n"] = display_n + n_extra
+    total = len(items) + n_extra
+    if header is None:
+        header = surface_card_header(surface, total, shape_totals=totals)
+    # FOLD1-B 1.2 item 3 — the fence runs on EVERY composed card, including
+    # a header a caller supplied itself. A surface that wants its own top
+    # line may have one; it may not put the debt back.
+    assert_no_debt_header(header)
+    view = {
+        "source_skill": "cr-brain",
+        "header": header,
+        "tiles": tiles,
+        "sections": sections + extras,
+    }
+    # FOLD1-B 1.2 item 3, built in FIX ROUND 1 (reviewer F-3) — THE FOOTER
+    # THE HEADER'S COUNT BECAME. The queue's honest total is what the tiles
+    # carry; this says how many of it this fire did not put on screen, at
+    # the bottom, with the verb that shows the rest. Only derivable when the
+    # caller supplied the honest totals — a builder with no full queue must
+    # not invent one — and DROP-EMPTY, so a page that shows everything is
+    # byte-identical to the one before this existed. Relayed verbatim, the
+    # same contract `select_confirm_card`'s `overflow_line` already has.
+    if totals:
+        # REVIEW_NIGHT11C M-6 (2026-09-15) — AND THE ROWS THE CEILING CUT
+        # FROM THE EXTRA SECTIONS ARE IN THE NUMBER. This counted the queue
+        # remainder only, so on a page where `bound_extra_sections` dropped
+        # the overdue / held / meeting-fold rows the footer said a smaller
+        # number than the truth — and the design rule made this footer the
+        # replacement for the header's count, so undercounting here is the
+        # count going quiet rather than moving. `extra_dropped` is that
+        # bound's own `extra_stats["dropped"]`, handed in by the builder.
+        footer = card_more_footer(sum(int(v) for v in totals.values())
+                                  - len(items) + max(0, int(extra_dropped or 0)))
+        if footer:
+            view["footer_line"] = footer
+            # AND IT RENDERS. The widget contract has no card-level footer
+            # field, and `chat_output_renderer.py` has no owner on this
+            # train — but a section's `footer_note` is rendered by that same
+            # widget path (BUG-8330 item 5), and the LAST section is the
+            # bottom of the card body, which is where a footer goes. So the
+            # line reaches the screen through a shipped key rather than
+            # sitting on a view nothing reads: `footer_line` is the same
+            # string for any caller that relays it as text.
+            all_sections = view["sections"]
+            if all_sections:
+                all_sections[-1]["footer_note"] = footer
+    return view
+
+
+# ---------------------------------------------------------------------------
+# Resolution + expiry
+# ---------------------------------------------------------------------------
+
+def resolve_proposal(
+    workspace_root,
+    proposal_id: str,
+    user_action: str,
+    *,
+    resolved_by: str,
+    source_skill: str,
+    note: str = "",
+) -> dict:
+    """Adjudicate ONE brain-family proposal (bp_*): append the
+    brain_proposal_resolved tombstone AND the shared-ledger decision row
+    (pass = detector) so cooldown math is shared with the learning loops.
+    Legacy-family items resolve through their existing flows — this function
+    refuses non-bp ids loudly. Idempotent over already-resolved ids.
+
+    `user_action` values: applied / edited / declined / skipped, plus
+    `superseded` (T2.2 review F-4) — the proposal's premise no longer holds
+    (e.g. a deal_creation whose org is already covered per
+    deal_state.org_deal_coverage), retired by the SYSTEM on a user click that
+    was NOT a decline. Same tombstone + the same 60d cooldown as declined
+    (covered items must not re-propose), but the audit/ledger row tells the
+    truth about what happened."""
+    if user_action not in ("applied", "edited", "declined", "skipped",
+                           "superseded"):
+        raise BrainProposalError(
+            f"user_action must be applied|edited|declined|skipped|superseded, "
+            f"got {user_action!r}")
+    if not proposal_id.startswith("bp_"):
+        raise BrainProposalError(
+            f"{proposal_id!r} is not a brain-family proposal id — pre-"
+            "migration legacy items resolve through their own shipped flows "
+            "(the adapters are permanent fossil readers; new writes for the "
+            "migrated families arrive as bp_ rows and resolve here)")
+    events = _load_events(workspace_root)
+    match = None
+    for item in _open_brain_proposals(events, now=None):
+        if item["id"] == proposal_id:
+            match = item
+            break
+    if match is None:
+        return {"status": "already_resolved", "proposal_id": proposal_id}
+
+    from event_gate import append_event
+    from proposal_ledger import append_decision
+
+    to_append = [{
+        "type": "brain_proposal_resolved",
+        "source_skill": source_skill,
+        "data": {
+            "proposal_id": proposal_id,
+            "user_action": user_action,
+            "kind": match["kind"],
+            "fingerprint": match["fingerprint"],
+            "detector": match["detector"],
+            "resolved_by": resolved_by,
+            "note": (note or "")[:200],
+        },
+    }]
+    # Declined/superseded deal-kind proposals also write the reserved PIPE1
+    # dismissal type for its named consumers (detector cooldown check,
+    # usage-report).
+    if user_action in ("declined", "superseded") and match["kind"] in _MONEY_KINDS \
+            and match.get("thread_id"):
+        to_append.append({
+            "type": "deal_update_dismissed",
+            "source_skill": source_skill,
+            "primary_thread_id": match.get("thread_id"),
+            "data": {
+                "thread_id": match["thread_id"],
+                "fingerprint": match["fingerprint"],
+                "reason": (note or "declined on the confirm card")[:200],
+            },
+        })
+    append_event(_events_path(workspace_root), to_append,
+                 holder="brain_proposals")
+    append_decision(
+        workspace_root,
+        pass_name=match["detector"],
+        fingerprint=match["fingerprint"],
+        user_action=user_action,
+        summary=match.get("evidence") or "",
+    )
+    return {"status": "resolved", "proposal_id": proposal_id,
+            "user_action": user_action, "kind": match["kind"]}
+
+
+def expire_stale(
+    workspace_root,
+    *,
+    now_iso: Optional[str] = None,
+    source_skill: str = "cleanup",
+) -> dict:
+    """The cleanup expiry sweep (D3/D10): tombstone every open brain-family
+    proposal past its TTL with a silent brain_proposal_expired — logged,
+    never nagged. Returns {n_expired, expired}."""
+    now_iso = now_iso or _now_iso()
+    now = _parse_ts(now_iso)
+    events = _load_events(workspace_root)
+    live = _open_brain_proposals(events, now=None)         # tombstone-filtered
+    fresh_ids = {i["id"] for i in _open_brain_proposals(events, now=now)}
+    stale = [i for i in live if i["id"] not in fresh_ids]
+    if not stale:
+        return {"n_expired": 0, "expired": []}
+
+    from event_gate import append_event
+
+    append_event(_events_path(workspace_root), [{
+        "type": "brain_proposal_expired",
+        "source_skill": source_skill,
+        "data": {
+            "proposal_id": i["id"],
+            "kind": i["kind"],
+            "fingerprint": i["fingerprint"],
+            "detector": i["detector"],
+            "opened_ts": i["opened_at"],
+        },
+    } for i in stale], holder="brain_proposals")
+    return {"n_expired": len(stale), "expired": [i["id"] for i in stale]}
+
+
+def resting_auto_proposals(
+    workspace_root,
+    *,
+    now_iso: Optional[str] = None,
+) -> List[dict]:
+    """AUTO LIFECYCLE CONTRACT violation detector (LB2 §3c, the FB-20
+    mandate): open auto-tier bp rows. By contract this list is ALWAYS empty —
+    a detector that proposes auto must apply + `resolve_proposal(...,
+    "applied")` in the same run, so an open auto proposal is a detector bug
+    (it would be invisible on every adjudication surface yet still expire
+    into the rot ledger — the latent honesty gap §2d names). Diagnostic
+    consumer: passes include_auto=True explicitly."""
+    now_iso = now_iso or _now_iso()
+    events = _load_events(workspace_root)
+    return [i for i in _open_brain_proposals(events, now=_parse_ts(now_iso))
+            if i.get("tier") == "auto"]
+
+
+def card_health_counts(
+    workspace_root,
+    *,
+    now_iso: Optional[str] = None,
+    window_days: int = 30,
+) -> dict:
+    """Cleanup Monday-note card health (D10): open count + how many expired
+    unseen in the window — rot made visible. `resting_auto` (LB2) counts
+    open auto-tier rows — contract violations (see resting_auto_proposals);
+    always 0 on a healthy workspace. `open` counts CONFIRM-tier items only
+    (what actually waits on the user — parity with every surface)."""
+    now_iso = now_iso or _now_iso()
+    now = _parse_ts(now_iso)
+    events = _load_events(workspace_root)
+    open_items = _open_brain_proposals(events, now=now)
+    n_resting_auto = sum(1 for i in open_items if i.get("tier") == "auto")
+    n_open = len(open_items) - n_resting_auto
+    n_expired = 0
+    for ev in events:
+        if ev.get("type") != "brain_proposal_expired":
+            continue
+        dt = _parse_ts(ev.get("ts"))
+        if dt is not None and now is not None \
+                and (now - dt).days <= window_days:
+            n_expired += 1
+    return {"open": n_open, "expired_in_window": n_expired,
+            "resting_auto": n_resting_auto}
+
+
+__all__ = [
+    "DAILY_CONFIRM_CAP",
+    "DAILY_CONNECTOR_QUESTION_CAP",
+    "DEFAULT_TTL_DAYS",
+    "MAX_SLOTS_PER_DETECTOR",
+    "AUTO_ALLOWED",
+    "DAILY_DEDUP_SURFACES",
+    "ON_DEMAND_SURFACE_HINT",
+    "ON_DEMAND_KINDS",
+    "RETIRED_KINDS",
+    "WITHHELD_KINDS",
+    "OVERFLOW_LINE",
+    "CARD_MORE_FOOTER", "card_more_footer",
+    "BrainProposalError",
+    "kind_shape",
+    "person_proposal_is_low_context",
+    "person_proposal_already_on_file",
+    "PERSON_LOW_CONTEXT_STALE_DAYS",
+    "MIGRATED_KINDS",
+    "propose",
+    "open_brain_proposals",
+    "load_open_proposals", "screen_past_lifetime",
+    "assert_no_debt_header", "SURFACE_LABELS", "DEBT_HEADER_PHRASES",
+    "row_prepick", "rendered_verbs", "LET_GO_VERBS",
+    "MAX_RENDERED_VERBS", "PREPICK_PHRASE", "LET_GO_ANSWER",
+    "resting_auto_proposals",
+    "rank_proposals",
+    "select_confirm_card",
+    "build_card_view",
+    "surface_card_header",
+    "resolve_proposal",
+    "expire_stale",
+    "card_health_counts",
+    "mark_shown",
+]

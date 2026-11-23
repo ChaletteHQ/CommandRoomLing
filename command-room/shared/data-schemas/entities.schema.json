@@ -1,0 +1,1041 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "command-room://schemas/entities.schema.json",
+  "title": "Entities",
+  "description": "Canonical registry of all entities (people, threads, orgs) tracked in the workspace. Source of truth. Markdown views (PEOPLE.md, MASTER_TRACKER.md) are regenerated from this file.",
+  "type": "object",
+  "required": ["version", "last_updated", "last_writer", "entities"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically incremented on every write. Used for optimistic concurrency."
+    },
+    "last_updated": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 datetime (workspace-local, no timezone suffix). e.g., 2026-04-20T14:32:00"
+    },
+    "last_writer": {
+      "type": "string",
+      "description": "Name of the skill that performed the last write."
+    },
+    "entities": {
+      "type": "object",
+      "required": ["people", "projects", "orgs"],
+      "properties": {
+        "people": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/person" }
+        },
+        "projects": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/project" }
+        },
+        "orgs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/org" }
+        },
+        "engagements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/engagement" },
+          "description": "Non-ownership relationships between orgs (fund engagements, portfolio links, deals, advisory, vendor, etc.). Optional. Distinct from org.parent_org_id which encodes ownership only."
+        }
+      }
+    },
+    "workspace": {
+      "$ref": "#/$defs/workspace_settings",
+      "description": "Per-workspace settings: user_id, user_timezone, first_go_months, etc. Optional but, when present, consumed by tz.py / people_writer.py / org_writer.py / workspace-manager."
+    }
+  },
+  "$defs": {
+    "brand": {
+      "type": "object",
+      "description": "OPTIONAL, DORMANT-BY-DEFAULT deliverable theme (SPEC OUT1). A PARTIAL override deep-merged over shared/scripts/brand.py DEFAULT_BRAND at render time — every key is optional and an omitted key keeps the (premium) default. An ABSENT brand object = byte-stable defaults, no warning, no event. NOTHING in onboarding sets this; it is written by hand into a client's entities.json during a paid customization engagement — on the top-level `workspace` object (all that client's docs) or on a single `org` (that org's docs only, overriding the workspace brand). Colors are 6-hex WITHOUT '#'. Fonts are NAMES only and must be installed on the reader's machine.",
+      "additionalProperties": false,
+      "properties": {
+        "palette": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Color overrides (6-hex, no '#').",
+          "properties": {
+            "ink": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "heading": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "accent": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "muted": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "rule": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "tile_bg": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "zebra": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "table_header": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "col_header": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "highlight": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "flag_ok": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "flag_warn": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" },
+            "flag_bad": { "type": "string", "pattern": "^[0-9A-Fa-f]{6}$" }
+          }
+        },
+        "fonts": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Font NAME overrides — must be installed on the reader's machine (a downloadable/custom font that isn't present will silently fall back in Word).",
+          "properties": {
+            "heading": { "type": "string", "minLength": 1 },
+            "body": { "type": "string", "minLength": 1 },
+            "mono": { "type": "string", "minLength": 1 }
+          }
+        },
+        "footer_line": {
+          "type": "string",
+          "description": "Centered footer text. Defaults to 'Command Room'. NEVER provenance metadata (CONTRACT Rule 15)."
+        },
+        "logo_path": {
+          "type": ["string", "null"],
+          "description": "Path to a letterhead image (absolute, or relative to workspace root). Renders right-aligned <= 0.35in at the top of the document ONLY if the file exists; a missing file silently falls back to the quiet no-logo header (R26). Null (default) = no logo."
+        },
+        "eyebrow_style": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": { "type": "number" },
+            "bold": { "type": "boolean" },
+            "upper": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "person": {
+      "type": "object",
+      "required": ["id", "canonical_name", "first_seen"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^person_[0-9]{3,}$",
+          "description": "Stable identifier. Never reused. Format: person_001, person_002, ..."
+        },
+        "canonical_name": {
+          "type": "string",
+          "description": "Full first + last name, title case. Source of truth for display."
+        },
+        "aliases": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Name-resolution corpus — every string a user might type that should resolve to this person. Used by workspace-manager / transcript-search / aliases.json reverse lookup."
+        },
+        "nicknames": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Informal display variants (v3.13.0+). Distinct from `aliases`: nicknames is for display/quick-reference; aliases is the search corpus. Most consumers want both flattened together via the get_person_display_names() helper."
+        },
+        "role": {
+          "type": "string"
+        },
+        "primary_org_id": {
+          "type": ["string", "null"],
+          "description": "The org this person primarily belongs to. Drives affiliation-aware name resolution."
+        },
+        "affiliation_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "All orgs this person is affiliated with (board roles, co-ownership, cross-company). Primary is usually also listed here."
+        },
+        "org_id": {
+          "type": ["string", "null"],
+          "description": "DEPRECATED. Use primary_org_id."
+        },
+        "email": {
+          "type": ["string", "null"],
+          "format": "email",
+          "description": "DEPRECATED v3.13.0+. Use `emails` array. Kept for back-compat reads. New writers prefer `emails`; readers use the get_person_emails() helper which merges both."
+        },
+        "emails": {
+          "type": "array",
+          "items": { "type": "string", "format": "email" },
+          "description": "Canonical email shape (v3.13.0+). Array of all known email addresses for this person, work + personal. Use get_person_emails() to read."
+        },
+        "phones": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Phone numbers (v3.13.0+). Array — no singular equivalent."
+        },
+        "project_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Threads this person is involved in."
+        },
+        "first_seen": {
+          "type": "string",
+          "format": "date"
+        },
+        "last_interaction": {
+          "type": ["string", "null"],
+          "format": "date"
+        },
+        "last_touched_at": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "ISO datetime of the most recent write/touch on this record. Bumped by intro-broker when an intro_made event fires. Optional."
+        },
+        "cadence_override_days": {
+          "type": ["number", "null"],
+          "description": "Phase 6 Quick Win B. User-taught cadence baseline in days. The (now RETIRED — SPEC LIFECYCLE1) Pulse chat's 'just busy' reply (dont_forget_feedback) widened it via dormancy.record_just_busy so dormancy math (dormancy.effective_baseline) stops re-flagging a gap the CEO has said is normal for this person. Absent on legacy records (reads as no override). Optional."
+        },
+        "tie": {
+          "type": "string",
+          "enum": ["work", "personal"],
+          "description": "SPEC BAL1 D1. Work/personal partition line. Absent means WORK (back-compat). tie=personal people are read ONLY by the Balance surface: dormancy.emit_dormancy_signal refuses them at the shared emit chokepoint (SPEC LIFECYCLE1 moved that gate out of the retired Pulse chat's prose and into code), relationship-moves drops them at the load/score boundary, and the secondary dormancy emitters (team-intelligence, dormant-customer-scan) skip them at their emit gates. NOT `relationship_type` — that name is forbidden (org-level). Optional."
+        },
+        "source_identifiers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind"],
+            "properties": {
+              "kind": { "type": "string" },
+              "tool_id": { "type": "string" },
+              "company": { "type": "string" }
+            }
+          },
+          "description": "cr1#825. What the person was added on: the source tool's own id for them (`tool_id`) or the company the source stated (`company`), with the kind of source. Written by people_writer on an add and the ids are read by identity_reconcile.sighting_against_record, so a later person of the same name is asked about and never filed here. Optional."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["Client contact", "Prospect", "Partner or referral source", "Peer or advisor", "Vendor or service provider", "Team or hiring", "Personal", "Unclear"],
+          "description": "cr1#110 part 1 (train 2 part 3b). The relationship kind. Written ONLY by people_writer.set_person_field (door_set_person_field), undone by brain_undo's person_field_set reverser. Optional."
+        },
+        "introduced_by": {
+          "type": "object",
+          "required": ["person_id", "channel", "evidence", "confidence"],
+          "properties": {
+            "person_id": { "type": "string" },
+            "name": { "type": "string" },
+            "channel": { "type": "string", "enum": ["email", "imessage", "meeting", "contact_card"] },
+            "evidence": { "type": "string" },
+            "confidence": { "type": "string", "enum": ["stated", "card_tag", "inferred"] },
+            "date": { "type": ["string", "null"] },
+            "set_at": { "type": "string" }
+          },
+          "description": "cr1#110 part 2 (train 2 part 3b). Who brought this person to the owner, how, the words that show it and how sure that is. Written ONLY by people_writer.set_person_field. Optional."
+        },
+        "handle_with_care": {
+          "type": "string",
+          "maxLength": 280,
+          "description": "Train 2 part 3b. The owner's own line about this person, shown only on the owner's surfaces (the person card's owner-only section). Written ONLY by people_writer.set_person_field. Optional."
+        },
+        "cadence_days": {
+          "type": ["number", "null"],
+          "description": "SPEC BAL1 D1(b). Personal RE-SURFACE interval in days (date-night cadence for a spouse, call cadence for a parent) — read ONLY by shared/scripts/balance.py. The OPPOSITE of cadence_override_days (dormancy's max-widening suppression knob): this one GENERATES a reconnect nudge when the gap exceeds it. Never routed through dormancy.effective_baseline. Meaningful only with tie=personal. Optional."
+        },
+        "connections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["person_id", "connection_source"],
+            "properties": {
+              "person_id": { "type": "string", "pattern": "^person_[0-9]{3,}$" },
+              "connection_source": { "type": "string", "description": "e.g. 'intro_made'" },
+              "connection_event_seq": { "type": "integer" },
+              "connected_ts": { "type": "string", "format": "date-time" }
+            }
+          },
+          "description": "Optional relationship-graph edges between this person and others. Currently written by intro-broker when an intro_made event fires (one entry per intro, on both sides). Per WORKSPACE_API.md, the connections[] sub-array is namespaced to intro-broker — no collision with people-crm."
+        },
+        "notes": {
+          "type": ["string", "null"]
+        },
+        "communication_style": {
+          "type": ["string", "null"]
+        },
+        "reports_to_id": {
+          "type": ["string", "null"],
+          "description": "The person id of whoever this person reports to. A personal layer's `reports_to` is folded into this field by the person schema migration (cr1#132)."
+        },
+        "is_user": {
+          "type": "boolean",
+          "description": "Legacy primary-user flag that personal layers write (cr1#132). Read only through primary_user.resolve_primary_user, after the canonical workspace.user_id pointer."
+        },
+        "pronouns": {
+          "type": ["string", "null"],
+          "description": "How this person is referred to, as a personal layer records it (cr1#132)."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "archived"],
+          "default": "active"
+        },
+        "needs_enrichment": {
+          "type": "boolean",
+          "description": "Provisional record awaiting the people-crm enrichment pull (deep-audit #21). The on-entity enrichment flag; cleared (false) after enriching. Replaces the forbidden pending_review/inferred_from on-entity trigger."
+        }
+      }
+    },
+    "project": {
+      "type": "object",
+      "description": "A tracked unit of attention (a 'thread'). User-facing language is 'thread'; the 'project_' id prefix is historical. See 'kind' for the full taxonomy.",
+      "required": ["id", "folder_name", "status", "first_seen"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^project_[0-9]{3,}$"
+        },
+        "folder_name": {
+          "type": ["string", "null"],
+          "description": "Exact folder name under workspace root (nested 'Parent/Child' allowed). Kinds without a filesystem presence may use a logical name. null when no real directory matches — the canonical writer resolves this against disk and refuses to guess a slug (FOLDERGUARD)."
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "canonical_name": {
+          "type": "string",
+          "description": "The thread's name as the CEO says it. Present on every live thread and allowed by thread_writer since it shipped; declared here 2026-07-25 (it was allowed-but-undeclared, the same drift class as the field additions below). Readers resolve canonical_name first and fall back to display_name."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "dormant", "paused", "blocked", "archived", "exploring", "scoping", "resolved"],
+          "description": "Project lifecycle state. v2.10.3+ adds 'dormant' between active and archived: real activity but quiet for 30+ days. Don't Forget proposes the active→dormant transition at 30d and auto-flips at 60d if no user action. Dormant projects are accessible by name (go [project]) but invisible in daily flows. Re-opening a dormant project (go [project] + adding a session note) auto-revives to active. 2026-07-25: 'exploring' / 'scoping' / 'resolved' declared here to match thread_writer.VALID_STATUSES, which has accepted them since it shipped — the enum, not the writer, was the stale side."
+        },
+        "stage": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "affiliation_id": {
+          "type": ["string", "null"],
+          "pattern": "^(org_[a-z0-9_]+|personal)$",
+          "description": "DEPRECATED alias of org_id (ENTITY1). Tolerated on records that already carry it and read as a fallback; never newly written — the writer normalises it to org_id."
+        },
+        "org_id": {
+          "type": ["string", "null"],
+          "pattern": "^(org_[a-z0-9_]+|personal)$",
+          "description": "The org this thread belongs to (most specific level, e.g. org_acme_restaurant rather than the holding org_acme_co) — the canonical thread→org field (ENTITY1). Required at creation: 'personal' EXPLICITLY for a deliberately unaffiliated thread, so 'never set' stays distinguishable from a choice."
+        },
+        "parent_thread_id": {
+          "type": ["string", "null"],
+          "description": "Parent thread if this is a nested thread (replaces subproject model). Must reference an existing project id; no cycles."
+        },
+        "spawned_from_thread_id": {
+          "type": ["string", "null"],
+          "description": "Lineage: the thread from which this one was spawned. Informational; not a hierarchy."
+        },
+        "cross_refs": {
+          "type": "array",
+          "description": "Soft links to other threads that are related without being hierarchical.",
+          "items": {
+            "type": "object",
+            "required": ["thread_id", "reason"],
+            "properties": {
+              "thread_id": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["initiative", "deal", "objective", "coaching", "cohort", "advisory", "investment", "board", "relationship", "theme", "concern", "ritual", "personal", "product", "engagement", "operating", "venture", "prospect", "marketing", "project", "other"],
+          "description": "The semantic kind of this thread. SPEC COACH1 §4.1 adds 'coaching' (one coaching engagement with one client — the arc a coach reads) and 'cohort' (a group/peer-group engagement with a roster; carries the `cohort` sub-object below). SPEC THREADBIND1 §0 ruling 4 closes the vocabulary and widens it to match every real-substrate spelling `tests/fixtures/thread_shapes/entities.json` carries: 'product' plus 'engagement', 'operating', 'venture', 'prospect', 'marketing' (all previously off-enum and unvalidated). 'product_build' is a typo-split of 'product' and is NOT a valid value — `thread_writer.repair_thread_kind_drift` self-heals it to 'product' on read (`thread_writer.KIND_MIGRATION_MAP`), additive: a future drifted spelling earns its own map line, never a silent enum admission. Widening only — no existing kind changed meaning, and no reader keys off the enum's length. THREADBIND1 also closes the vocabulary at the writer: `thread_writer.create_thread` / `update_thread` reject a `kind` not in this enum (previously unvalidated — `_validate_thread` checked `status` but never `kind`)."
+        },
+        "project_class": {
+          "type": "string",
+          "description": "DEPRECATED. Use 'kind'."
+        },
+        "owner_person_id": {
+          "type": ["string", "null"]
+        },
+        "stakeholder_person_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "last_activity": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "DEPRECATED (v4.5.2, F-54/F-61): no writer maintains this field — an ingest-era stamp. Never rank or compute staleness from it; derive recency from events via shared/scripts/thread_activity.py. Zero-event fallback only."
+        },
+        "next_step": {
+          "type": ["string", "null"]
+        },
+        "success_criteria": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "first_seen": {
+          "type": "string",
+          "format": "date"
+        },
+        "session_count": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Number of sessions this project has been touched in. Maintained by workspace-manager."
+        },
+        "dormancy_reviewed_at": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "ISO datetime of the last time insight-generator's Pass 7 connector probe ran against this project. Used to gate the 14-day re-probe cooldown. Optional."
+        },
+        "archived_at": {
+          "type": ["string", "null"],
+          "format": "date"
+        },
+        "archive_reason": {
+          "type": ["string", "null"]
+        },
+        "paused_at": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "When this thread was paused — the pair-mate of archived_at for status='paused'. User-authored; no code reader today."
+        },
+        "paused_by": {
+          "type": ["string", "null"],
+          "description": "Who paused this thread — the pair-mate of archive_reason for status='paused'. User-authored; no code reader today."
+        },
+        "key_contact_id": {
+          "type": ["string", "null"],
+          "description": "Person id of the main contact for this thread. Read by build_workspace_map_input (which also tolerates the legacy spelling primary_contact_id) and by transcript-search's project scoping."
+        },
+        "notes": {
+          "type": ["string", "null"],
+          "description": "Free-text context on the thread. Read by build_workspace_map_input (the map's project line) and build_dcc_input (first sentence as the next_action fallback)."
+        },
+        "roster_overrides": {
+          "type": ["object", "null"],
+          "description": "Pin/suppress overrides applied on top of the derived thread roster (thread_roster.derive_roster). Allowed by thread_writer since the brain-substrate fix; declared here 2026-07-25."
+        },
+        "deal": {
+          "type": "object",
+          "description": "SPEC PIPE1 (v4.8): sales-deal fields, allowed ONLY on kind='deal' threads (thread_writer rejects it elsewhere). Namespaced so deal.stage (sales stage, string enum) never collides with the integer project-lifecycle `stage`. Written ONLY by shared/scripts/deal_state.py — the single writer/closure path; hand edits are the bug class the typed writers exist to kill. Consistency rules enforced in code: outcome='lost' requires a loss_reason; outcome is terminal and set only by deal_state.close_deal (won → thread status 'resolved', lost → 'archived'). `value` is user-stated or user-confirmed money — NEVER estimated (quantify.py discipline); absent value renders no money tag. Recency/rot derive from events via thread_activity — nothing here stores activity.",
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "type": ["number", "null"],
+              "description": "Deal value in `currency`. User-stated or confirmed only; never estimated. Null = unknown (ranges are out of v1 scope — store null + a note in `source`)."
+            },
+            "currency": {
+              "type": "string",
+              "default": "USD"
+            },
+            "stage": {
+              "type": "string",
+              "enum": ["lead", "qualified", "proposal_sent", "negotiating"],
+              "description": "Active sales stage (fixed v1 set). Won/lost are NOT stages — they are the terminal `outcome`."
+            },
+            "stage_entered": {
+              "type": ["string", "null"],
+              "format": "date",
+              "description": "Date the current stage was entered. Stamped by deal_state.set_stage; resets on every move, including backward moves."
+            },
+            "expected_close": {
+              "type": ["string", "null"],
+              "format": "date"
+            },
+            "forecast_category": {
+              "type": ["string", "null"],
+              "enum": ["commit", "best_case", "pipeline", null],
+              "description": "Categorical forecast judgment per deal (weighted-pipeline math is statistically meaningless at 5-50 deals; the haircut number is a secondary tile at most)."
+            },
+            "source": {
+              "type": ["string", "null"],
+              "description": "Free text — where the deal came from (e.g. 'referral — Bowie'). Also holds value-range notes."
+            },
+            "outcome": {
+              "type": ["string", "null"],
+              "enum": ["won", "lost", null],
+              "description": "Terminal. Set only by deal_state.close_deal — never hand-written, never a stage."
+            },
+            "loss_reason": {
+              "type": ["string", "null"],
+              "enum": ["no_decision", "price", "competitor", "diy", "timing", "bad_fit", "other", null],
+              "description": "Required (in code) when outcome='lost'."
+            },
+            "loss_note": {
+              "type": ["string", "null"]
+            },
+            "opened_at": {
+              "type": ["string", "null"],
+              "format": "date"
+            },
+            "closed_at": {
+              "type": ["string", "null"],
+              "format": "date"
+            }
+          }
+        },
+        "objective": {
+          "type": "object",
+          "description": "SPEC OBJ1 (draft): standing-objective fields, allowed ONLY on kind='objective' threads (thread_writer rejects it elsewhere). An objective is a CEO-level standing priority — too big to mark done in a day, spanning weeks, tracked through ONE of three bindings the CEO picks (meeting / self / activity). Written ONLY by shared/scripts/objective_state.py — the single writer/closure path (mirrors deal_state doctrine). Directional status is NEVER stored here — it derives from objective_review / objective_report / linked-entity events via shared/scripts/objective_math.py. Consistency rules enforced in code: binding.type determines which binding fields are required; outcome is terminal and set only by objective_state.complete_objective / archive_objective (completed → thread status 'resolved', archived → 'archived').",
+          "additionalProperties": false,
+          "properties": {
+            "statement": {
+              "type": "string",
+              "description": "The objective in the CEO's own plain words (e.g. 'Land three enterprise pilots'). Doubles as the topical match surface for relevance capture (alias-style matching via entity_resolve)."
+            },
+            "horizon": {
+              "type": ["string", "null"],
+              "format": "date",
+              "description": "Target date, or null for an open horizon. Never used to fabricate a status — display and drift context only."
+            },
+            "binding": {
+              "type": "object",
+              "description": "HOW this objective is tracked — the one deliberate choice the CEO makes at creation (the three-way toggle). The system proposes the target inside the chosen path; the CEO confirms. Exactly one binding per objective in v1.",
+              "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": ["meeting", "self", "activity"],
+                  "description": "meeting = reviewed in a recurring meeting (status harvested from its transcripts); self = owner reports in the weekly objectives touch; activity = derived from linked threads'/deals' own events."
+                },
+                "series_key": {
+                  "type": ["string", "null"],
+                  "description": "meeting binding only: normalized title of the recurring meeting (the series fingerprint). There is no calendar series id in the substrate — title(+people) matching is the established recurrence convention."
+                },
+                "series_match": {
+                  "type": ["string", "null"],
+                  "enum": ["title_and_people", "title_only", null],
+                  "description": "meeting binding only: how the series fingerprint matches a processed transcript. title_and_people (default) = normalized title plus usual-attendee overlap; title_only = distinctive unique names (e.g. a named leadership call) where attendee churn must not break the match. Proposed automatically: title unique in meeting history → title_only, generic title → title_and_people."
+                },
+                "series_people": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "meeting binding only: person_ids of the usual attendees, used when series_match='title_and_people'."
+                },
+                "cadence_days": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "description": "self binding only: expected days between self-reports (default 7 — the weekly objectives touch). Drift math counts missed cycles against this."
+                },
+                "entity_ids": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "activity binding only: the linked thread/deal ids whose OWN events drive status. Topic over party — always threads or deals, never a bare person (party overlap is not a join)."
+                },
+                "target_note": {
+                  "type": ["string", "null"],
+                  "description": "activity binding only, optional: plain-text description of the concrete target (e.g. 'deal reaches negotiating', '3 pilots signed'). Display/context only in v1 — a directional status still requires an unambiguous signal (deal stage/outcome), never a parsed guess from this text."
+                }
+              }
+            },
+            "anchor_thread_id": {
+              "type": ["string", "null"],
+              "description": "Optional link to the existing project/deal thread this objective is about (any binding type). The topical join relevance capture uses: events attributed to the anchor (or to activity-binding entity_ids) count as movement on the objective. Cold-start proposals set this instead of mutating the existing thread's kind."
+            },
+            "milestones": {
+              "type": "array",
+              "description": "Optional light step list — display and progress context only, never a status source. No per-step chores: steps flip via the same confirmation surfaces, not scheduled prompts.",
+              "items": {
+                "type": "object",
+                "required": ["title"],
+                "additionalProperties": false,
+                "properties": {
+                  "title": { "type": "string" },
+                  "done": { "type": "boolean", "default": false }
+                }
+              }
+            },
+            "outcome": {
+              "type": ["string", "null"],
+              "enum": ["completed", "archived", null],
+              "description": "Terminal. Set only by objective_state.complete_objective / archive_objective — never hand-written (completed → thread status 'resolved', archived → 'archived')."
+            },
+            "outcome_note": {
+              "type": ["string", "null"],
+              "description": "Optional one-liner recorded at close (why archived / what completing looked like)."
+            },
+            "opened_at": {
+              "type": ["string", "null"],
+              "format": "date"
+            },
+            "closed_at": {
+              "type": ["string", "null"],
+              "format": "date"
+            }
+          }
+        },
+        "is_primary_focus": {
+          "deprecated": true,
+          "description": "LEGACY-TOLERATED, never written (thread_writer.LEGACY_THREAD_FIELDS). This is an ORG field — every reader takes it off an org record. Pre-writer ingest copied it onto 21 live threads, inconsistently (three sibling threads of one org carry different values). Tolerated so those records round-trip; a thread bubbles up via its org, never a thread-side copy."
+        },
+        "last_writer": {
+          "deprecated": true,
+          "description": "LEGACY-TOLERATED, never written (thread_writer.LEGACY_THREAD_FIELDS). This is the entities.json ENVELOPE field set by _save_entities; it leaked onto one thread record from a prose write. Not a thread field."
+        },
+        "created_at": {
+          "deprecated": true,
+          "description": "LEGACY-TOLERATED, never written (thread_writer.LEGACY_THREAD_FIELDS). Creation provenance belongs in the thread_created event — but THREE of the four live threads carrying this (project_020, project_021, project_026) have NO such event, so it is their only record of when they were created. Preserved for that reason; new threads get the event instead. Was FORBIDDEN (silently dropped) until 2026-07-25, which destroyed it on any unrelated update. (project_019 is the fourth and DOES have a thread_created event; the first survey missed it because pre-writer rows carry the thread id at top-level primary_thread_id, not under data.primary_thread_id — survey both shapes.)"
+        },
+        "created_by": {
+          "deprecated": true,
+          "description": "LEGACY-TOLERATED, never written (thread_writer.LEGACY_THREAD_FIELDS). Same story as created_at — the only creation provenance those three records have."
+        },
+        "aliases": {
+          "deprecated": true,
+          "description": "LEGACY-TOLERATED, never written (thread_writer.LEGACY_THREAD_FIELDS). Threads have no alias resolver: entity_resolve builds its corpus from person.aliases and org.aliases and matches threads on canonical_name only. Present on the workspace_mini test fixture; absent from every live thread. Declare a resolver before making this canonical."
+        },
+        "cohort": {
+          "type": "object",
+          "description": "SPEC COACH1 §4.2: group/peer-group engagement fields, allowed ONLY on kind='cohort' threads (thread_writer rejects it elsewhere). Follows the deal/objective sub-object shape exactly. A group is a book of business with a ROSTER — `stakeholder_person_ids` is insufficient because each seat carries its own state (when they joined, whether they're paused, who pays for them). Read ONLY through shared/scripts/coach_state.py; the pack's writers are the only writers. NOTHING derived is stored here: session counts, arc items, billable tallies and renewal windows are all computed from events, never stamped (the `last_activity` lesson).",
+          "additionalProperties": false,
+          "properties": {
+            "cadence": {
+              "type": ["string", "null"],
+              "enum": ["monthly", "biweekly", "quarterly", "other", null],
+              "description": "How often this cohort meets. Drives the scheduled prep/capture passes. 'other' when the real cadence doesn't fit — the interval then lives in the coach's own directives, not here."
+            },
+            "seat_count": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "description": "CONTRACTED seats — what the coach sold, which legitimately differs from how many are currently filled (a departed member frees a seat that is still paid for, or still being sold). It is NOT a cached len(members): occupancy derives from `members` via coach_state.cohort_roster, which returns seats_contracted AND seats_filled side by side and never reconciles one into the other. Null = the coach never stated a contracted number."
+            },
+            "members": {
+              "type": "array",
+              "description": "The roster. One entry per seat, past and present — a departed member stays on the roster with status='departed' so history, billing periods, and the member's own arc remain readable. Never pruned.",
+              "items": {
+                "type": "object",
+                "required": ["person_id"],
+                "additionalProperties": false,
+                "properties": {
+                  "person_id": {
+                    "type": "string",
+                    "description": "Canonical person id. Must reference an existing person; the pack resolves through entity_resolve before writing (never a bare name)."
+                  },
+                  "joined_at": {
+                    "type": ["string", "null"],
+                    "format": "date"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": ["active", "paused", "departed"],
+                    "default": "active",
+                    "description": "Seat state. 'paused' still holds the seat (and usually still bills); 'departed' does not."
+                  },
+                  "departed_at": {
+                    "type": ["string", "null"],
+                    "format": "date",
+                    "description": "Required in code when status='departed' — a departure with no date can't be billed to a period boundary."
+                  },
+                  "also_1to1": {
+                    "type": ["boolean", "null"],
+                    "default": false,
+                    "description": "HINT ONLY: this member is also a 1:1 coaching client. The truth is whether a kind='coaching' thread names this person, and coach_state.member_is_also_1to1 derives it that way — this flag is the fallback when no coaching thread has been created yet. Never treated as authoritative (a stored duplicate of a derivable fact is the drift class the typed readers exist to prevent)."
+                  },
+                  "billing_target": {
+                    "type": ["object", "null"],
+                    "description": "SPEC COACH1 §8.1: who pays for THIS seat. Null means the cohort's own payer (`cohort.billing.payer`) — the common case. Set when one company's person sits in a cohort but is invoiced to their own company rather than the cohort's payer.",
+                    "additionalProperties": false,
+                    "required": ["kind", "id"],
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": ["person", "org"]
+                      },
+                      "id": {
+                        "type": "string",
+                        "description": "person_id or org_id matching `kind`."
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "materials_thread_id": {
+              "type": ["string", "null"],
+              "description": "Optional link to the thread holding this cohort's placemat / materials history."
+            },
+            "term_end": {
+              "type": ["string", "null"],
+              "format": "date",
+              "description": "SPEC COACH1 §4.3, cohort side: the contracted end of this cohort's term. A cohort has a term of its own, distinct from any single seat's. Null = no stated term, and renewal watching is OFF for this cohort (stated plainly at enable-coach rather than inferred from silence)."
+            },
+            "renewal_date": {
+              "type": ["string", "null"],
+              "format": "date",
+              "description": "When the renewal conversation is due. Usually before `term_end`; null falls back to term_end minus the workspace's coach.renewal_lead_days."
+            },
+            "billing": {
+              "type": ["object", "null"],
+              "description": "SPEC COACH1 §8.1: the cohort's own payer and rate — the default every seat with a null `billing_target` rolls up to. Written by the pack's billing skill in Phase 4; defined here in Phase 1 so `billing_target: null` has a documented referent from the start. Money is user-stated or user-confirmed only, never estimated (quantify.py discipline).",
+              "additionalProperties": false,
+              "properties": {
+                "payer": {
+                  "type": ["object", "null"],
+                  "additionalProperties": false,
+                  "required": ["kind", "id"],
+                  "properties": {
+                    "kind": { "type": "string", "enum": ["person", "org"] },
+                    "id": { "type": "string" }
+                  }
+                },
+                "unit": {
+                  "type": ["string", "null"],
+                  "enum": ["session", "hour", "retainer", null]
+                },
+                "rate": {
+                  "type": ["number", "null"],
+                  "description": "Rate per `unit` in `currency`. Null = unknown; an absent rate renders no money figure rather than a guess."
+                },
+                "currency": {
+                  "type": "string",
+                  "default": "USD"
+                },
+                "consolidate_by_payer": {
+                  "type": ["boolean", "null"],
+                  "default": true,
+                  "description": "True = one invoice per payer per period, itemized per person and per cohort seat (§8.1 roll-up rule)."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "org": {
+      "type": "object",
+      "required": ["id", "canonical_name"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^org_[a-z0-9_]+$",
+          "description": "Stable org id. Readable slug preferred (e.g., org_acme_co, org_holding_co)."
+        },
+        "canonical_name": {
+          "type": "string"
+        },
+        "legal_name": {
+          "type": ["string", "null"],
+          "description": "Formal registered company name when it differs from canonical_name (e.g. 'Acme Lab Inc.' vs the everyday 'Acme Labs'). Real data — admitted v4.8.1 (F-05) so records carrying it stop failing validation. Matched by org_writer.find_existing_org's name lookup; canonical_name remains the display source of truth."
+        },
+        "aliases": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["holding", "operating", "division", "brand", "fund", "other"],
+          "description": "What role this org plays in the tree. 'holding' = top-level parent with operating children. 'operating' = revenue-generating unit. 'division' = sub-unit inside operating. 'brand' = customer-facing label. 'fund' = investment vehicle. 'other' = escape hatch with scope_label."
+        },
+        "scope_label": {
+          "type": ["string", "null"],
+          "description": "Free-text label when scope='other'."
+        },
+        "parent_org_id": {
+          "type": ["string", "null"],
+          "description": "Parent org for nested structures. Null for top-level entities. No cycles."
+        },
+        "relationship_type": {
+          "type": "string",
+          "enum": ["operating", "partner", "board", "advisory", "investment", "client", "portfolio_company", "beneficiary", "vendor", "prospect", "service_provider", "other"],
+          "default": "other",
+          "description": "The CEO's role vs this org. 'operating' = runs it. 'partner' = co-founded/co-owned. 'board' = board seat. 'advisory' = advisor/consultant. 'investment' = holds equity, doesn't run. 'client' = paid engagement. 'portfolio_company' = portco of a fund the CEO runs. 'beneficiary' = family office beneficiary/grantor. 'vendor' = a third party who sells the CEO products/services (added v2.10.3). 'prospect' = a third party in active sales conversation, not yet a client (added v2.10.3). 'service_provider' = a vendor with ongoing relationship — accountant, lawyer, agency (added v2.10.3). 'other' = escape hatch with relationship_label."
+        },
+        "relationship_label": {
+          "type": ["string", "null"],
+          "description": "Free-text label when relationship_type='other'."
+        },
+        "account_owner": {
+          "type": ["string", "null"],
+          "pattern": "^person_[a-z0-9_]+$",
+          "description": "Person id of the operator who owns the RELATIONSHIP (ORGSCHEMA1). Ownership is a property of the org relationship, not of each project under it — project-level owner_person_id is the per-engagement override. Outreach-ranking surfaces (relationship-moves, dormant-customer-scan) exclude orgs whose account_owner is another operator; absent means unclaimed and ranks for everyone."
+        },
+        "tier": {
+          "type": "string",
+          "enum": ["primary", "secondary", "external", "passive"],
+          "default": "secondary",
+          "description": "Visual + filtering tier (added v2.10.3). 'primary' = the CEO's own org(s) — holding + operating units they run. Renders prominent in Orgs Map; surfaces in every daily flow. 'secondary' = active client/partner/advisor — high-signal external relationships. Renders normally; surfaces in daily flows. 'external' = vendor/prospect/service_provider — low-signal third parties. Renders smaller / under collapsed External section in Orgs Map; only surfaces in daily flows when there's an open commitment or a meeting on the calendar. 'passive' = dormant/archived/orphan — historical reference only. Hidden from daily flows; accessible by name. Tier is set by inference rules at onboarding (primary-affiliation gate + interaction-volume thresholds) or explicitly by the user."
+        },
+        "is_primary_focus": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bubbles this org to the top of briefings. Multiple orgs can be primary focus (portfolio/holding-co operators)."
+        },
+        "domains": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Email/web domains associated with this org. Used for connector-driven discovery and aliasing."
+        },
+        "slack_workspace_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "inferred_from": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["email_domain_cluster", "slack_workspace", "calendar_attendee_cluster", "drive_folder", "email_signature", "user_input", "manual_edit", "migration_v1_8"]
+          },
+          "description": "What signals led to this org's existence in the registry. Supports weekly-audit boundary and drift checks."
+        },
+        "first_seen": {
+          "type": ["string", "null"],
+          "format": "date"
+        },
+        "last_interaction": {
+          "type": ["string", "null"],
+          "format": "date"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "archived"],
+          "default": "active"
+        },
+        "type": {
+          "type": "string",
+          "description": "DEPRECATED. Use relationship_type + is_primary_focus. Legacy values: 'home' | 'side' | 'personal'."
+        },
+        "domain": {
+          "type": ["string", "null"],
+          "description": "DEPRECATED. Use domains[]."
+        },
+        "notes": {
+          "type": ["string", "null"]
+        },
+        "needs_enrichment": {
+          "type": "boolean",
+          "description": "Provisional org from reactive discovery, awaiting CEO confirm (deep-audit #18). On-entity flag; cleared on confirm. Replaces the forbidden pending_review."
+        },
+        "money": {
+          "type": "object",
+          "description": "SPEC HIST1 Part A: recurring account/revenue money for this org — the fallback quantify.money_time_tag reads when an item has no deal.value (an org can have both; the stated per-deal figure still wins on deal-thread items). Inner keys are EXACTLY the conventional names in quantify._MONEY_FIELDS so the grouped object resolves through _money_part's candidate list. Written ONLY via org_writer.set_org_money(confirmed=True) — reachable only from an explicit user statement or a confirmed brain_proposal; NEVER estimated, never auto (Bug #92 / PIPE1 D9 money discipline). Absent money = no dollar tag, exactly as before.",
+          "additionalProperties": false,
+          "properties": {
+            "account_value": {
+              "type": ["number", "null"],
+              "description": "Recurring account value in `currency` (e.g. 120000 for a $120k/yr account). User-stated or confirmed only."
+            },
+            "revenue": {
+              "type": ["number", "null"],
+              "description": "Known revenue figure for the relationship. User-stated or confirmed only."
+            },
+            "arr": {
+              "type": ["number", "null"],
+              "description": "Annual recurring revenue. User-stated or confirmed only."
+            },
+            "mrr": {
+              "type": ["number", "null"],
+              "description": "Monthly recurring revenue. User-stated or confirmed only."
+            },
+            "currency": {
+              "type": "string",
+              "default": "USD"
+            },
+            "source": {
+              "type": ["string", "null"],
+              "description": "Where the figure came from — 'user statement', 'confirmed proposal', 'QBO sales-by-customer', … Required in code by set_org_money (money is always sourced)."
+            },
+            "as_of": {
+              "type": ["string", "null"],
+              "format": "date",
+              "description": "Date the figure was stated/confirmed."
+            }
+          }
+        },
+        "brand": {
+          "$ref": "#/$defs/brand",
+          "description": "OPTIONAL, DORMANT per-org deliverable theme (SPEC OUT1). Overrides the workspace brand for documents scoped to THIS org (via make_brief org_id=). Absent = the workspace brand (or premium defaults). Set by hand during a paid customization engagement; never touched by onboarding."
+        }
+      }
+    },
+    "engagement": {
+      "type": "object",
+      "description": "A non-ownership edge between two orgs (fund engagement, portfolio company, deal, advisory, vendor, etc.). The orgs map renderer surfaces these under the from-org as 'Engaged with:' rows, visually distinct from owned children. Engaged orgs remain at top level — engagements form a graph, not a tree.",
+      "required": ["id", "from_org_id", "to_org_id", "kind"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^engagement_[0-9]{3,}$",
+          "description": "Stable engagement id. Sequential: engagement_001, engagement_002, …"
+        },
+        "from_org_id": {
+          "type": "string",
+          "description": "The engaging org (the one that 'has' the relationship). Must reference an existing org id."
+        },
+        "to_org_id": {
+          "type": "string",
+          "description": "The target org (the one being engaged with). Must reference an existing org id."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["fund_engagement", "portfolio", "deal", "client", "vendor", "advisor", "partner_other"],
+          "description": "Initial taxonomy. Renderer treats unknown kinds as generic 'engaged with'."
+        },
+        "label": {
+          "type": ["string", "null"],
+          "description": "Short display label, e.g., 'Fund-level partnership', 'Pilot deal — AP automation'."
+        },
+        "notes": {
+          "type": ["string", "null"],
+          "description": "Free-text context. Surfaced in tooltips / detail views."
+        },
+        "started_at": {
+          "type": ["string", "null"],
+          "format": "date"
+        },
+        "ended_at": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "When the engagement ACTUALLY ended (backward-looking). Distinct from `term_end`, which is the contracted end date and may sit in the future on a live engagement."
+        },
+        "term_end": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "SPEC COACH1 §4.3: the contracted end of the current term — forward-looking, and set while the engagement is still live. Renewal watching reads this instead of leaning on the dormancy heuristic: a coaching term has a real end date, so `dormant-customer-scan`'s pattern gets reused against a real date rather than inferred silence. Null = no stated term, and renewal watching is OFF for this engagement (said plainly at setup, never guessed). Additive and optional — every existing engagement record stays valid unchanged."
+        },
+        "renewal_date": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "SPEC COACH1 §4.3: when the renewal conversation is due. Usually earlier than `term_end`; null falls back to term_end minus the workspace's coach.renewal_lead_days."
+        },
+        "is_active": {
+          "type": "boolean",
+          "default": true,
+          "description": "Inactive engagements are filtered from the renderer."
+        },
+        "inferred_from": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "workspace_settings": {
+      "type": "object",
+      "description": "Per-workspace user/locale/onboarding settings. Lives at top-level `workspace` field of entities.json. All fields optional; readers handle missing fields with sensible defaults.",
+      "properties": {
+        "user_id": {
+          "type": "string",
+          "pattern": "^person_[0-9]{3,}$",
+          "description": "The primary user's person_id. Read through primary_user.resolve_primary_user by every consumer that needs to know whose workspace this is: the Friday Wrap internal/external split, the dormancy scan's and relationship-moves' account-owner filters (dormancy.outreach_scope, relationship_moves), the capture gate's self detection, and the receipt writers. Canonical signal — preferred over the legacy `is_primary_user: true` person field."
+        },
+        "user_timezone": {
+          "type": "string",
+          "description": "IANA timezone name (e.g. America/New_York). Read by tz.py to_local() for workspace-local date math. Falls back to UTC if missing — but missing should be filled by command-room-onboarding Step 1c."
+        },
+        "first_go_months": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many months back the user wants the initial backfill to cover at first install. Set by command-room-onboarding Step 1c. Optional after first install."
+        },
+        "schedule_timezone": {
+          "type": "string",
+          "description": "Timezone used by scheduled tasks. Usually identical to user_timezone but can be set separately for cases where the user travels."
+        },
+        "brand": {
+          "$ref": "#/$defs/brand",
+          "description": "OPTIONAL, DORMANT deliverable theme applied to ALL of this workspace's .docx output (SPEC OUT1). Absent = premium defaults. Set by hand during a paid customization engagement; never touched by onboarding."
+        },
+        "personal_calendars": {
+          "type": "array",
+          "items": {
+            "anyOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "required": ["id"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "label": { "type": "string" }
+                }
+              }
+            ]
+          },
+          "description": "SPEC BAL1 D5. The declared personal/family calendar ids (personal Google primary, shared family calendar, or an ICS feed id) the Balance surface reads for open evenings. Calendar-specific — deliberately NOT the mail-keyed workspace.accounts[]. Absent/empty = Balance refuses honestly (not-configured != healthy). Set via workspace-manager; read-only calendars unless the user confirms a hold."
+        },
+        "evening_start": {
+          "type": "string",
+          "description": "SPEC BAL1 D5. 'HH:MM' start of the protected evening window for open-evening detection (default 18:00)."
+        },
+        "evening_end": {
+          "type": "string",
+          "description": "SPEC BAL1 D5. 'HH:MM' end of the evening window (default 22:00)."
+        },
+        "min_block_hours": {
+          "type": "number",
+          "description": "SPEC BAL1 D5. Minimum free-block length (hours) for an evening to count as open (default 2)."
+        },
+        "balance_default_cadence_days": {
+          "type": "number",
+          "description": "SPEC BAL1 D2. Default personal re-surface cadence (days) for a tie with no cadence_days of its own (default 14). Read only by shared/scripts/balance.py."
+        },
+        "coach": {
+          "type": "object",
+          "description": "SPEC COACH1 §4.4: the coach pack's workspace block. ABSENT on every non-coach workspace, and absence is the off switch — `coach_state.get_coach_config` returns {} and every coach surface stays silent. Written at enable-coach (Phase 2) through shared/scripts/workspace_settings.py so the `workspace_setting_changed` receipt can never separate from the write. Values here are the workspace-wide DEFAULTS; a per-engagement value on the thread always wins, and a per-skill knob in _hq/data/skill_config/<skill>.json wins over both.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Master switch. False (or the whole block absent) = the pack's scheduled passes and surfaces do nothing. Set true only when enable-coach has completed."
+            },
+            "practice_name": {
+              "type": ["string", "null"],
+              "description": "The coaching practice's own name, as the coach says it. Used in member-facing artifacts (§9) — never a Chalette or Command Room string."
+            },
+            "default_session_minutes": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "description": "Default scheduled session length. Per-engagement value wins. Feeds the billable-unit derivation when the calendar event carries no duration."
+            },
+            "default_cadence_days": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "description": "Default days between sessions (e.g. 30 for monthly). Drives the prep/capture pass anchors and the 'a session was missed' read. Per-engagement cadence wins."
+            },
+            "renewal_lead_days": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "default": 60,
+              "description": "How far before `term_end` a renewal window opens when no explicit `renewal_date` is set. The one derived-date default, kept here so the number is stated once."
+            },
+            "report_output_shape": {
+              "type": ["string", "null"],
+              "enum": ["file_per_session", "single_running_document", null],
+              "default": "file_per_session",
+              "description": "§5.2. `file_per_session` (default) writes one record per session. `single_running_document` appends newest-first to one file — SHIPS, but only via the atomic-write path with a per-session copy kept alongside so the running doc is always reconstructible. A plain read-modify-write append on Drive-synced storage loses history when a stale second machine writes (§5.3 — a known clobber pattern in this system, not a hypothetical)."
+            },
+            "personal_thread_split": {
+              "type": ["boolean", "null"],
+              "default": false,
+              "description": "§5.1 / §12. True = follow-up and action items render work and personal separately. The SPLIT is a knob; the personal/business FIREWALL is not — it holds either way."
+            },
+            "attribution_footer": {
+              "type": ["boolean", "null"],
+              "default": true,
+              "description": "§9.3 (OPEN — M's ruling pending): one restrained attribution line in the footer of member-facing artifacts. Default on; flipping the default is this one value and nothing else."
+            },
+            "billing": {
+              "type": ["object", "null"],
+              "description": "§8.1 workspace-wide billing defaults. Per-engagement and per-seat values win. Rate is user-stated only — never estimated.",
+              "additionalProperties": false,
+              "properties": {
+                "unit": {
+                  "type": ["string", "null"],
+                  "enum": ["session", "hour", "retainer", null]
+                },
+                "rate": { "type": ["number", "null"] },
+                "currency": { "type": "string", "default": "USD" },
+                "invoice_posture": {
+                  "type": ["string", "null"],
+                  "enum": ["draft_then_send", null],
+                  "default": "draft_then_send",
+                  "description": "M ruling 7, and the ONLY legal value in v1: the draft assembles automatically, the coach confirms EACH invoice, one confirm sends one invoice. There is deliberately no batch or scheduled auto-send value to select — the enum is single-valued so a future 'auto' can only be added by a deliberate schema change."
+                },
+                "consolidate_by_payer": {
+                  "type": ["boolean", "null"],
+                  "default": true
+                },
+                "qbo_connected": {
+                  "type": ["boolean", "null"],
+                  "default": false,
+                  "description": "§8.4. False = the tally, the unbilled-contact confirmation pass, and an exportable invoice-ready summary all still work; only the send step is unavailable. Billing must never present a dead surface to a coach who never connects QuickBooks."
+                }
+              }
+            },
+            "hero_template_ref": {
+              "type": ["string", "null"],
+              "description": "§7.3. Workspace-relative path to the coach's own session-record template (conventionally _hq/coach/templates/session_record.md). Null = the shipped hero template. Once supplied it is NEVER ours — same posture as advisor_profile: read, never rewritten."
+            },
+            "placemat_template_ref": {
+              "type": ["string", "null"],
+              "description": "§7.3. Workspace-relative path to the coach's own group-placemat template. Null = the shipped default."
+            }
+          }
+        }
+      }
+    }
+  }
+}

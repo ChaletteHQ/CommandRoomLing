@@ -1,0 +1,5112 @@
+#!/usr/bin/env python3
+"""
+CRU (Cross-Reference and Update) layer (v2.14.6+).
+
+Auto-resolve open commitments when downstream signal proves the commitment was
+fulfilled. Five paths:
+
+- **Path 1 (apply-choices send)** — after `send` fires for an item, check whether
+  the recipient is the counter-party on any open commitment owned by the user
+  AND the subject/body matches the commitment title. HIGH match → write
+  `commitment_resolved`. MEDIUM match → write `pending_review` event for next
+  confirm queue to surface for one-click confirm.
+
+- **Path 2 (bulk Gmail/Outlook scan)** — same logic as Path 1 but run over the
+  user's outbound mail since the last fire (default last 7 days). Catches sends
+  made directly from native mail clients OUTSIDE the Claude app (Gmail on phone, Outlook
+  desktop, etc.). Implementation lives in `orchestrator-commitments.md` Phase
+  2.5 — the daily Commitments scheduled task runs this pre-render scan via the
+  same `match_send_to_commitments` helper as Path 1.
+
+- **Path 3 (past-meetings transcript)** — for each newly-processed transcript,
+  score against open commitments where any meeting attendee is the owner.
+  HIGH match + completion language → auto-resolve. Schedule-shift language →
+  `commitment_updated`. New-ask language → spawn new commitment with
+  `supersedes` link. **Circularity-fenced (AUTOAPPLY §6):** callers pass
+  `transcript_source_ref` + `exclude_captured_since` so a transcript can
+  never score against the commitments it (or its same-fire siblings) just
+  created — see `match_transcript_to_commitments`.
+
+- **Path 4 (inbound email)** — for each inbound message, score against open
+  commitments where the SENDER is the owner (i.e. the counter-party owes the
+  user, and their email proves they delivered). HIGH match + completion
+  language ("here's the", "attached the", "as promised") → auto-resolve.
+  Schedule-shift language ("I'll get it to you next week") → `commitment_updated`.
+  Real-time leg runs in `orchestrator-inbox.md` per inbox fire; daily backstop
+  runs in `orchestrator-commitments.md` Phase 2.6 over inbound mail since the
+  last fire (catches counter-party deliveries that arrived between inbox fires).
+  Both legs call the same `match_inbound_to_commitments` helper.
+
+- **Path 5 (calendar event)** — the scheduling-close path (v3.14.7+). A whole
+  class of commitments is fulfilled NOT by sending a message but by an event
+  appearing on the calendar: "set up the build call with Bo", "lock
+  Monday with Rio", "find time with the integrator". Paths 1/2/4 are all
+  message-direction scans — they never look at the calendar, so these closed
+  the moment the user created the invite but stayed surfaced as "reply to X to
+  lock time" for days. Path 5 scores open commitments OWED BY THE USER that carry
+  scheduling intent in their title against calendar events whose attendees
+  include the commitment's counter-party. An event existing with that person
+  (created at/after the commitment) is the fulfillment — analogous to Path 1
+  where the act of sending IS the fulfillment. Counter-party acceptance
+  (`responseStatus: accepted`) is bonus confidence. This ALSO subsumes the
+  mirror "counter-party accepted my invite" signal that the inbox classifier
+  was discarding as calendar-noise. Real-time leg runs in `calendar-writer`
+  when CR creates the event; daily backstop runs in `orchestrator-commitments.md`
+  Phase 2.7 over calendar events created/updated since the last fire (catches
+  invites M made directly in Google/Outlook calendar, outside the Claude app). Both
+  legs call the same `match_calendar_to_commitments` helper.
+
+All paths conservative: HIGH-confidence auto-resolve only. Borderline goes to
+pending_review queue surfaced in the confirm queue for one-click confirm. Path 5's
+high-precision gate is structural: owed-by-user + scheduling-intent title +
+a real calendar event with the named counter-party. A non-scheduling
+commitment ("send the deck") never auto-resolves just because a meeting got
+booked — the title-intent gate blocks it.
+
+THE MATCHING MODEL
+==================
+
+Two scores computed and the higher of the two becomes the match score:
+
+1. Unigram overlap coefficient: |a ∩ b| / min(|a|, |b|). Picked over Jaccard
+   because commitment titles (≤ 120 chars) are usually shorter than the
+   queries we score them against (email body, transcript chunk). Jaccard
+   over-penalizes the long side; overlap rewards "this short title's content
+   words all appear in the longer query."
+
+2. Bigram Jaccard. Catches phrasings that share an ordered word pair (e.g.,
+   "send the deck" / "send pricing deck"). Stricter than unigrams; rare to
+   exceed unigram overlap unless the phrasing is near-identical.
+
+Tokens are stop-word + punctuation + casing filtered. No stemming (kept
+intentionally simple — `sending` won't match `send` exactly, but the rest of
+the title usually carries the signal). No external deps.
+
+Thresholds (tunable):
+  HIGH_CONFIDENCE_THRESHOLD = 0.55  → auto-resolve
+  PENDING_REVIEW_THRESHOLD  = 0.30  → flag for one-click confirm in next
+                                       confirm queue
+  below 0.30                        → no action
+
+Recipient match (Path 1) and attendee match (Path 3) PRE-FILTER the candidate
+commitments before title scoring. So 0.30 over an already-narrowed candidate
+set has high signal — it's not "match against any commitment in the workspace,"
+it's "match against the commitments where this person is involved."
+
+PER CONTRACT.md RULE 9
+======================
+
+Resolution is silent. The chat ack does NOT narrate "auto-resolved 2
+commitments." Events are written to events.jsonl; the user sees the result on
+the next Commitments fire (the resolved item simply doesn't appear).
+"""
+from __future__ import annotations
+try:
+    from text_clip import clip  # noqa: E402
+except ImportError:  # pragma: no cover — direct-path fallback
+    import sys as _sys_tc
+    from pathlib import Path as _Path_tc
+    _sys_tc.path.insert(0, str(_Path_tc(__file__).resolve().parent))
+    from text_clip import clip  # noqa: E402
+
+import datetime
+import json
+import re
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+
+# v3.5.0+: canonical source in shared/scripts/confidence.py. Aliased here
+# for back-compat — existing callers can keep importing the old names.
+from confidence import MATCH_SCORE_AUTO_RESOLVE, MATCH_SCORE_PENDING_REVIEW
+import confidence as _confidence
+# POLICY1-A — the one resolution home: the quote, the signal field, the
+# fixed-string refusal and the proposal-ledger readers (D4/D5/D15).
+import commitment_policy as _policy
+
+# Read-side timestamp normalization (Phase 1 Foundation) — ts → timestamp →
+# date. History is never rewritten; readers normalize.
+from event_time import event_time
+
+# SPEC PROV2 — identity comparisons on STORED source pointers route through
+# Layer A4's derivation, never a raw `==` (guard G30). Imported at MODULE level
+# so the projector's provenance folds cannot silently degrade; the lazy imports
+# inside `commitment_matches_source_ref` / `commitment_matches_thread_ref` are
+# left exactly as they are, so their documented fail-open branches keep their
+# shape (this import failing takes the whole module down first, loudly, which
+# is what those docstrings already ask for).
+from connector_adapters.provenance import dedup_key_of
+
+# Bilingual overlay (Spanish beta). Inert for English installs: when no non-en
+# language is active in the workspace, every accessor returns the English
+# default unchanged and accent-folding is a no-op. See shared/scripts/lexicon.py
+# + references/SPANISH_BUILD_PLAN.md. Guarded so a missing module can never
+# change English-native behavior.
+try:
+    import lexicon as _lex
+except Exception:  # pragma: no cover
+    _lex = None
+
+HIGH_CONFIDENCE_THRESHOLD = MATCH_SCORE_AUTO_RESOLVE   # 0.55
+PENDING_REVIEW_THRESHOLD = MATCH_SCORE_PENDING_REVIEW  # 0.30
+
+# TITLEMINT1 D1 — how many review proposals ONE FIRE may write on the
+# title-match close rail. NOT a threshold and never to be read as one: the
+# match floors above are untouched by this build, and a candidate the cap
+# suppresses was a candidate at the same score it always was. This bounds
+# VOLUME, which nothing bounded before — a single 2026-08-19 fire wrote 70
+# proposals in about 35 seconds.
+REVIEW_PROPOSAL_FIRE_CAP = 25
+
+
+class ReviewProposalTitleError(ValueError):
+    """A `commitment_review_proposed` event was built with no title.
+
+    Refuse at the writer, the same posture `close_commitment` takes with
+    `CommitmentIdError`. A proposal is a QUESTION put to a person — "did this
+    get done?" — and a question with no subject cannot be answered. The
+    2026-08-19 fire wrote 70 of them because the builder carried a `""`
+    default and the caller that forgot to pass a title looked exactly like a
+    caller that meant to omit one.
+
+    Every matcher on this rail already puts the commitment's own title in its
+    result row, so a caller has it a dict away; and a titleless commitment
+    scores 0.0 (`score_match` returns 0.0 when either side tokenizes empty),
+    which is below every proposal floor. A raise here therefore means a caller
+    bug, never a data shape the substrate can legitimately produce.
+    """
+
+
+def _workspace_from_events_path(events_jsonl_path):
+    """CLOCK1 - the workspace root containing an events.jsonl, or None.
+
+    This module's readers are handed a PATH INSIDE the substrate rather than a
+    root, so there is nothing to thread; the root is derived from the path
+    instead. Defensive: None simply means the clock falls back to the other
+    resolution routes, exactly as it did before.
+    """
+    try:
+        from trusted_now import workspace_root_for_path
+
+        return workspace_root_for_path(events_jsonl_path)
+    except Exception:
+        return None
+
+
+def _clock_now(workspace_root=None):
+    """CLOCK1 - the corroborated UTC instant this module stamps from.
+
+    Swaps the CLOCK SOURCE only: every window, cutoff, threshold and output
+    format around it is unchanged. A machine clock that has not synced used to
+    write its own wrong reading straight into the permanent record; this reads
+    the same clock, cross-checked against the newest timestamp the workspace
+    already holds. Falls back to the raw machine clock if the helper is
+    unavailable, so a stamp can never fail for want of corroboration.
+
+    `workspace_root` is threaded in wherever the calling function already
+    has one, because a helper that has to GUESS which workspace it is in
+    guesses wrong exactly when it matters: a fire's early phases run in
+    their own subprocesses, before anything has registered a root.
+    """
+    try:
+        from trusted_now import trusted_now_utc
+
+        return trusted_now_utc(workspace_root)
+    except Exception:
+        import datetime as _clock_dt
+
+        return _clock_dt.datetime.now(_clock_dt.timezone.utc)
+
+
+def _match_thresholds(workspace_root=None):
+    """(auto_resolve, pending_review) match thresholds, honoring a Loop-4
+    `_hq/data/confidence-overrides.json` when `workspace_root` is given, else the
+    shipped constants. Passing None reproduces pre-Phase-6 behavior exactly, so
+    every existing caller (and test) is unaffected."""
+    if workspace_root is None:
+        return HIGH_CONFIDENCE_THRESHOLD, PENDING_REVIEW_THRESHOLD
+    return (_confidence.match_score_auto_resolve(workspace_root),
+            _confidence.match_score_pending_review(workspace_root))
+
+
+# Common English stop-words. Keep this list tight — a commitment title like
+# "Send updated pricing deck to Mira" is mostly content words; over-filtering
+# kills signal.
+STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has",
+    "have", "he", "her", "him", "his", "i", "in", "is", "it", "its", "me",
+    "my", "of", "on", "or", "our", "she", "the", "their", "them", "they",
+    "this", "to", "was", "we", "were", "will", "with", "you", "your", "yours",
+    "but", "if", "so", "do", "did", "done", "than", "then", "that", "these",
+    "those", "what", "when", "where", "which", "who", "whom", "why", "how",
+    "would", "should", "could", "into", "out", "up", "down", "about", "over",
+    "under", "again", "any", "no", "not", "only", "own", "same", "all", "more",
+    "most", "such", "very", "just", "now",
+})
+
+# Completion-indicator phrases (Path 3). Anchored on common English fulfillment
+# language. Case-insensitive substring match — keep tight.
+COMPLETION_PHRASES = (
+    "sent the", "sent over", "sent it", "sent that", "sent you",
+    "delivered the", "delivered it",
+    "shared the", "shared it", "shared that",
+    "got the", "got it", "received the", "received it",
+    "as promised", "as discussed",
+    "here's the", "here is the", "here you go",
+    "attaching the", "attached the",
+    "wrapped up", "knocked out", "finished the",
+    "done with", "all set on",
+)
+
+# Schedule-shift phrases (Path 3). Indicates the deadline moved, not that the
+# work is done.
+SCHEDULE_SHIFT_PHRASES = (
+    "pushed to", "pushing to", "moving to", "moved to",
+    "delayed to", "delayed until", "deferring to", "deferred to",
+    "rescheduled to", "rescheduling to",
+    "now targeting", "new target",
+    "slipping to", "slipped to",
+    "won't make", "wont make", "miss the",
+)
+
+# New-ask phrases (Path 3). Indicates a new commitment was layered on the
+# existing one, NOT a resolution.
+NEW_ASK_PHRASES = (
+    "can you also", "could you also",
+    "additionally please", "additionally can",
+    "one more thing", "while you're at it", "while you are at it",
+    "and also send", "and also share",
+    "actually can you", "actually could you",
+)
+
+
+# Scheduling-intent phrases (Path 5). Detected in a COMMITMENT TITLE to decide
+# whether a calendar event with the counter-party should auto-resolve it. The
+# bar is "this commitment is about putting time on a calendar with someone",
+# NOT "this commitment mentions a meeting in passing". Kept meeting-flavored so
+# the structural pre-filter (owed-by-user + attendee-on-a-real-event) does the
+# heavy lifting and this just blocks deliverable-style commitments ("send the
+# deck") from resolving when an unrelated meeting gets booked.
+SCHEDULING_PHRASES = (
+    "schedule", "reschedule",
+    "set up a call", "set up a meeting", "set up the call", "set up the meeting",
+    "set up a time", "set up time", "set a time", "set up a sync", "set up a",
+    "book a call", "book a meeting", "book time", "book a time",
+    "find time", "find a time", "grab time", "grab 15", "grab 30",
+    "lock in", "lock the", "lock monday", "lock a time", "lock time",
+    "propose times", "propose a time", "propose some times", "send times",
+    "pick a time", "confirm the time", "confirm a time", "nail down a time",
+    "put on the calendar", "put time on", "get on a call", "get on the calendar",
+    "call with", "meeting with", "sync with", "get time with", "time with",
+    "send an invite", "send the invite", "send a calendar invite", "calendar invite",
+)
+
+_PUNCT_RE = re.compile(r"[^\w\s]+")
+_WS_RE = re.compile(r"\s+")
+
+
+def _phrases(key: str, default: tuple) -> tuple:
+    """Merged phrase tuple for a ``cru_match`` phrase-list, or the English
+    default when the bilingual overlay is inactive or absent (production path)."""
+    if _lex is None:
+        return default
+    return _lex.load_lexicon_terms("cru_match", key, default)
+
+
+def _tokenize(text: Optional[str]) -> list[str]:
+    """Lowercase, strip punctuation, split on whitespace, drop stop-words and
+    single-char tokens. Returns a LIST (preserves order for bigrams) — caller
+    converts to set for unigram match.
+
+    Two-char tokens kept (e.g., `ap`, `q2`, `id` carry signal in commitment
+    titles like "Q2 deck" or "AP demo"); only single-char garbage is dropped.
+    """
+    if not text:
+        return []
+    text = text.lower()
+    text = _PUNCT_RE.sub(" ", text)
+    text = _WS_RE.sub(" ", text).strip()
+    if _lex is None:
+        return [w for w in text.split() if len(w) >= 2 and w not in STOPWORDS]
+    # Bilingual overlay: merged stop-words + accent-folding when a non-English
+    # language is active. English-only workspaces get STOPWORDS back verbatim
+    # and fold=False, so the comprehension below is identical to production.
+    stop = _lex.stopwords(STOPWORDS)
+    fold = _lex.accent_fold_enabled()
+    if not fold:
+        return [w for w in text.split() if len(w) >= 2 and w not in stop]
+    out = []
+    for w in text.split():
+        w = _lex.fold_accents(w)
+        if len(w) >= 2 and w not in stop:
+            out.append(w)
+    return out
+
+
+def _bigrams(tokens: list[str]) -> set[tuple[str, str]]:
+    return {(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _overlap_coefficient(a: set, b: set) -> float:
+    """|a ∩ b| / min(|a|, |b|). Better than Jaccard for matching short titles
+    against longer queries — rewards "this title's content words all appear in
+    the longer text" instead of penalizing the longer side.
+    """
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def extract_snippet(query: Optional[str], text: Optional[str],
+                    *, length: int = 200) -> str:
+    """Extract a topic-aware snippet from a long body of text (e.g. a meeting
+    transcript). Used by `transcript-search` (v2.14.8+) so snippets are
+    deterministic — the LLM doesn't fabricate quotes that aren't actually in
+    the transcript.
+
+    Algorithm:
+      1. Tokenize the query into content words (stopword-filtered).
+      2. Walk through text looking for windows where the most query words
+         appear in proximity.
+      3. Extract a ~length-char window centered on that match. Trim at
+         sentence boundaries (`.`, `?`, `!`, `\n`) when possible.
+      4. Return with leading/trailing ellipses to signal it's a fragment.
+
+    Returns empty string if no query token appears in text.
+    """
+    if not query or not text:
+        return ""
+    q_tokens = set(_tokenize(query))
+    if not q_tokens:
+        return ""
+
+    text_lower = text.lower()
+    # Find positions of any query token (any non-overlapping occurrence). Pick
+    # the position with the densest match in a 200-char window around it.
+    positions: list[int] = []
+    for tok in q_tokens:
+        start = 0
+        while True:
+            idx = text_lower.find(tok, start)
+            if idx == -1:
+                break
+            positions.append(idx)
+            start = idx + len(tok)
+
+    if not positions:
+        return ""
+
+    # Score each position by counting how many distinct query tokens appear
+    # within the window centered there.
+    half = length // 2
+    best_pos = positions[0]
+    best_density = 0
+    for p in positions:
+        win_start = max(0, p - half)
+        win_end = min(len(text), p + half)
+        window = text_lower[win_start:win_end]
+        density = sum(1 for tok in q_tokens if tok in window)
+        if density > best_density:
+            best_density = density
+            best_pos = p
+
+    win_start = max(0, best_pos - half)
+    win_end = min(len(text), best_pos + half)
+
+    # Trim to sentence boundaries when possible
+    snippet = text[win_start:win_end]
+    # Trim leading partial sentence
+    for boundary in [". ", "? ", "! ", "\n"]:
+        i = snippet.find(boundary)
+        if 0 < i < length // 3:
+            snippet = snippet[i + len(boundary):]
+            break
+    # Trim trailing partial sentence
+    for boundary in [". ", "? ", "! ", "\n"]:
+        i = snippet.rfind(boundary)
+        if i > length * 2 // 3:
+            snippet = snippet[:i + 1]
+            break
+
+    snippet = snippet.strip()
+    leading = "..." if win_start > 0 else ""
+    trailing = "..." if win_end < len(text) else ""
+    return f"{leading}{snippet}{trailing}"
+
+
+def score_match(query_text: Optional[str], commitment_title: Optional[str]) -> float:
+    """Compute match score between a query (subject+body OR transcript chunk)
+    and a commitment title. Returns float 0.0 - 1.0. Higher = better match.
+
+    Method: max of (unigram overlap coefficient, bigram Jaccard). Overlap is
+    the dominant signal because titles are usually shorter than queries;
+    bigrams catch ordered-phrasing matches that unigram-only might miss.
+    """
+    q_tokens = _tokenize(query_text)
+    c_tokens = _tokenize(commitment_title)
+    if not q_tokens or not c_tokens:
+        return 0.0
+    unigram = _overlap_coefficient(set(q_tokens), set(c_tokens))
+    bigram = _jaccard(_bigrams(q_tokens), _bigrams(c_tokens))
+    return max(unigram, bigram)
+
+
+# cr1#468 - contractions are not words about the promise. `_tokenize` turns
+# the apostrophe into a space, so "won't" becomes the token "won" and "Sam's"
+# becomes "sam". A negative contraction is dropped whole; any other contraction
+# keeps its stem ("Sam's deck" still says "sam" and "deck").
+_NEG_CONTRACTION_RE = re.compile(r"\b\w+n['’]t\b", re.IGNORECASE)
+_CONTRACTION_SUFFIX_RE = re.compile(r"['’](?:s|re|ve|ll|d|m)\b", re.IGNORECASE)
+
+
+def _content_tokens(text: Optional[str]) -> set[str]:
+    if not text:
+        return set()
+    text = _NEG_CONTRACTION_RE.sub(" ", text)
+    text = _CONTRACTION_SUFFIX_RE.sub("", text)
+    return set(_tokenize(text))
+
+
+def fold_plural(word: str) -> str:
+    """cr1#764, cr1#765 - one spelling for a word and its plural, so "renewal"
+    and "renewals" are one subject. A trailing s only, and never on words
+    whose s is not a plural (`address`, `status`, `analysis`). Pure."""
+    w = str(word or "")
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
+def shared_content_words(text: Optional[str], title: Optional[str], *,
+                         names: Iterable[str] = ()) -> set[str]:
+    """cr1#468 - the words a message and a commitment title really share.
+
+    `score_match` counts every shared token, and on a short chat line the
+    only shared token can be a person's name (a message to someone always
+    "mentions" them) or the stem a contraction leaves behind. Neither says
+    anything about the promise. This answers the narrower question the chat
+    leg's ruling asks ("does this line share any word with the promise?"):
+    the tokens both sides carry once contractions are set aside, minus every
+    token of every name in `names` (whole names or single tokens; each is
+    tokenized the same way the text is).
+
+    Read-only and pure. It grades nothing; the chat leg reads an empty
+    answer as "this line cannot close that item".
+    """
+    name_toks: set[str] = set()
+    for n in names or ():
+        name_toks.update(_tokenize(str(n)))
+    return (_content_tokens(text) & _content_tokens(title)) - name_toks
+
+
+def detect_completion_signal(text: Optional[str]) -> bool:
+    """True if `text` contains a phrase suggesting the commitment was
+    fulfilled (`sent the`, `delivered`, `as promised`, etc.).
+
+    The baked `COMPLETION_PHRASES` are the deterministic floor. Phase 6 Loop 5
+    complements them: `_hq/data/extraction-hints.md` accumulates learned
+    resolution-language exemplars from documented `resolution_miss` cases, which
+    the LLM-driven CRU legs (meeting-notes Step 5e-bis, the inbound CRU pass)
+    consult alongside this scorer — a workspace teaches the matcher its own
+    "already done" phrasings without a code change here.
+    """
+    if not text:
+        return False
+    lo = text.lower()
+    return any(phrase in lo for phrase in _phrases("completion_phrases", COMPLETION_PHRASES))
+
+
+#: One sentence end. Same shape as `exit_doors._SENTENCE_SPLIT_RE` — the two
+#: doors grade the same kind of English and must not drift on where a
+#: sentence stops.
+_QUESTION_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
+
+
+def is_question_shaped(text: Optional[str]) -> bool:
+    """True when `text` ASKS and never reports.
+
+    CLOSETRUTH1 3.1 (M's ruling 2, 2026-09-13). `exit_doors.own_word_statements`
+    already drops a question — "did I send the deck?" is not a report — and
+    that `?`-rule lives HERE now so one rule covers both doors: a spoken
+    statement and an outbound mail are graded the same way.
+
+    The rule in full: a text carrying at least one question sentence is
+    question-shaped UNLESS one of its NON-question sentences reports
+    completion. So "which week do you want to start, and which day suits a
+    weekly review?" is a question; "here is the rollback process — does
+    Tuesday work?" is still a report and closes on its own merits. A text
+    with no question at all is never in this class, so every statement mail
+    behaves exactly as it did before.
+    """
+    if not text:
+        return False
+    sentences = [s.strip() for s in
+                 _QUESTION_SENTENCE_SPLIT_RE.split(str(text)) if s.strip()]
+    if not any(s.endswith("?") for s in sentences):
+        return False
+    return not any(detect_completion_signal(s)
+                   for s in sentences if not s.endswith("?"))
+
+
+def detect_schedule_shift_signal(text: Optional[str]) -> bool:
+    """True if `text` contains a phrase suggesting the deadline moved
+    (`pushed to`, `delayed`, etc.) — used to write `commitment_updated`
+    instead of `commitment_resolved`.
+    """
+    if not text:
+        return False
+    lo = text.lower()
+    return any(phrase in lo for phrase in _phrases("schedule_shift_phrases", SCHEDULE_SHIFT_PHRASES))
+
+
+def detect_new_ask_signal(text: Optional[str]) -> bool:
+    """True if `text` contains a phrase suggesting a NEW request layered on
+    top (`can you also`, `additionally please`) — used to spawn a new
+    commitment with `supersedes` link rather than resolve the existing one.
+    """
+    if not text:
+        return False
+    lo = text.lower()
+    return any(phrase in lo for phrase in _phrases("new_ask_phrases", NEW_ASK_PHRASES))
+
+
+def detect_scheduling_intent(text: Optional[str]) -> bool:
+    """True if `text` (a commitment TITLE) is about putting time on a calendar
+    with someone — `set up a call`, `lock Monday`, `propose times`, `call with`,
+    etc. Used by Path 5 (`match_calendar_to_commitments`) as the precision gate:
+    only scheduling-flavored commitments auto-resolve when a calendar event with
+    the counter-party appears. A deliverable commitment ("send the deck") returns
+    False and is never closed by a booked meeting.
+    """
+    if not text:
+        return False
+    lo = text.lower()
+    return any(phrase in lo for phrase in _phrases("scheduling_phrases", SCHEDULING_PHRASES))
+
+
+# -----------------------------------------------------------------------------
+# Open-commitment loader (Cross-references the canonical aggregator pattern in
+# build_workspace_map_input.py `_aggregate_commitments`)
+# -----------------------------------------------------------------------------
+
+
+#: Who a write the system made with nobody acting names as its author.
+try:
+    from event_types import MACHINE as _ACTOR_MACHINE
+except Exception:  # pragma: no cover - import order safety
+    _ACTOR_MACHINE = "machine"
+
+#: The question an unconfirmed reassignment raises on the projection.
+_REASSIGN_REVIEW_REASON = "reassigned — confirm the new owner before this is chased"
+
+
+def _commitment_id(ev: dict) -> str:
+    d = ev.get("data") or {}
+    return d.get("id") or ev.get("id") or f"commitment_seq_{ev.get('seq', '?')}"
+
+
+def _is_pending_review(ev: dict) -> bool:
+    """A commitment the extractor itself flagged as uncertain
+    (COMMITMENT_SCHEMA `data.pending_review`) must never be silently
+    auto-resolved — it may be surfaced for review, but never auto-closed
+    (deep-audit 2026-05-29, finding #9)."""
+    d = ev.get("data") or {}
+    return bool(d.get("pending_review") or ev.get("pending_review"))
+
+
+def _parse_ts(value):
+    """Parse an ISO-8601 timestamp to a tz-AWARE (UTC) datetime for instant
+    comparison, tolerating both `...Z` and `...+00:00` offsets (the auto-stamp
+    emits +00:00 while the build_* helpers emit Z). Returns None when the value
+    is missing or unparseable (deep-audit 2026-05-29, finding #17).
+
+    A date-only value (`2026-05-22`) parses to a NAIVE datetime, which then
+    raises "can't compare offset-naive and offset-aware" against the aware
+    `now` (real commitment dues are often date-only). So we ALWAYS attach UTC
+    when the parse came back naive — every result is aware-vs-aware safe."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+# Field aliases per commitment shape variant observed in the wild (v3.4.3+).
+# Each value is a tuple of names to try in priority order — the helper tries
+# each at the canonical (data.<>) location first, then at the flat (top-level
+# <>) location.
+#
+# Why each alias exists:
+#   - owner_id:  canonical schema field
+#   - owner_person_id:  emitted by cr-past-meetings in some fires (observed in
+#     M's events.jsonl 2026-04-30 → 2026-05-09). Same semantic as owner_id.
+#   - owner:  pre-v2.7.15 legacy field name (no _id suffix). The schema doc
+#     explicitly documents this as the legacy flat shape.
+#   - requester_person_id: parallel to owner_person_id, same writer source.
+#   - due_date:  observed in cr-past-meetings owner_person_id-variant events.
+#   - state:  observed in cr-past-meetings owner_person_id-variant events
+#     (instead of `status`).
+#   - classification_confidence:  top-level meeting confidence; some writers
+#     populate this instead of data.confidence (e.g., cr-meetings-processed,
+#     meeting-notes, scan-for-commitments per M's 2026-04 events).
+_COMMITMENT_FIELD_ALIASES = {
+    "owner_id": ("owner_id", "owner_person_id", "owner"),
+    "requester_id": ("requester_id", "requester_person_id"),
+    "due": ("due", "due_date"),
+    "status": ("status", "state"),
+    "title": ("title",),
+    "confidence": ("confidence", "classification_confidence"),
+}
+
+
+def promise_tz(workspace_root=None):
+    """The workspace's timezone for `promise_time_raw`, read once per pass
+    through the one helper. None when it cannot be read."""
+    try:
+        from tz import load_workspace_tz
+        return load_workspace_tz(workspace_root)
+    except Exception:  # noqa: BLE001 - TZResolutionError, or no helper
+        return None
+
+
+def _meeting_start_answer(d: dict, raw: str, tz=None) -> Optional[str]:
+    """cr1#1224 - the source meeting's own start, when the row carries one
+    from the projection (`MEETING_START_FIELD`), it predates the capture, and
+    it falls on the row's `meeting_date` when the row names one. Anything
+    else is None, and the caller keeps its older answer.
+
+    The start's own offset must be the workspace clock's offset at that
+    instant. A meeting time is written by whoever processed the meeting; a
+    local hour stamped with the wrong offset (10:00 written as 10:00Z) would
+    read hours early and let in evidence from before the meeting. With no
+    workspace clock to check against, nothing is trusted."""
+    if tz is None:
+        return None
+    start = _parse_ts(d.get(MEETING_START_FIELD))
+    cap = _parse_ts(raw) if raw else None
+    if start is None or cap is None or start >= cap:
+        return None
+    try:
+        if start.utcoffset() != start.astimezone(tz).utcoffset():
+            return None
+    except Exception:  # noqa: BLE001 - a clock that cannot answer trusts nothing
+        return None
+    md = str(d.get("meeting_date") or "").strip()[:10]
+    if md:
+        try:
+            day = datetime.date.fromisoformat(md)
+        except ValueError:
+            return None
+        # The meeting date is a day on the workspace's clock.
+        lo = datetime.datetime.combine(day, datetime.time.min, tzinfo=tz)
+        hi = datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time.min,
+                                       tzinfo=tz)
+        if not (lo <= start < hi):
+            return None
+    return start.astimezone(datetime.timezone.utc).isoformat()
+
+
+def promise_time_raw(ev: dict, tz=None, *, meeting_start: bool = True) -> str:
+    """cr1#744 - WHEN THE PROMISE WAS MADE, as the row itself says it. The
+    stale-evidence fence compares a send, a reply or a transcript against
+    this, not against when the row was written: after a gap, a Monday promise
+    captured on Wednesday is still a Monday promise, and Tuesday's send
+    closes it.
+
+    A captured task (cr1#752) began on its board before it reached the book:
+    its `item_created_at`, else its `item_updated_at` (a tool that names no
+    creation time), when that is earlier than the row's own time. Work done
+    in between is still evidence for it.
+
+    `data.meeting_date` is a DAY in the workspace's own calendar, with no
+    hour. It says only that the promise was made by that day's END, so the
+    end of that local day is what stands for it, and only when the row was
+    captured after that (the gap case). Anything sent on the meeting's own
+    day might have gone out before the meeting, so it stays fenced, whether
+    the row was captured that day or later. `tz` is `promise_tz`'s answer;
+    without one the day runs to its end in the last zone on earth, which
+    fences at least as much as any workspace's own clock would.
+
+    cr1#1224 - a meeting row whose source meeting is on file carries that
+    meeting's own START (`MEETING_START_FIELD`, joined by
+    `load_open_commitments` from the `meeting` event its `source_ref` names).
+    When it predates the capture it is the answer: work done after the meeting
+    began counts, however late the row was captured, and anything before it
+    still does not. Only the matching rules decide WHAT counts; this decides
+    only from WHEN. `meeting_start=False` keeps the older answer, for the
+    transcript rail, whose evidence is itself a meeting: a second recording of
+    the same meeting starts after this one's start and is not its delivery."""
+    d = ev.get("data") if isinstance(ev, dict) and isinstance(ev.get("data"), dict) else {}
+    raw = event_time(ev)
+    for key in ("item_created_at", "item_updated_at"):
+        born = d.get(key)
+        if isinstance(born, str) and born.strip():
+            a, b = _parse_ts(born), _parse_ts(raw)
+            if a is not None:
+                return born.strip() if (b is None or a < b) else raw
+    if meeting_start:
+        began = _meeting_start_answer(d, raw, tz)
+        if began:
+            return began
+    try:
+        day = datetime.date.fromisoformat(str(d.get("meeting_date") or "").strip()[:10])
+    except ValueError:
+        return raw
+    day_end = datetime.datetime.combine(
+        day + datetime.timedelta(days=1), datetime.time.min,
+        tzinfo=tz or datetime.timezone(datetime.timedelta(hours=-12)))
+    cap_dt = _parse_ts(raw) if raw else None
+    if cap_dt is not None and cap_dt <= day_end:
+        return raw
+    return day_end.astimezone(datetime.timezone.utc).isoformat()
+
+
+def _commitment_field(ev: dict, field: str) -> Any:
+    """Read a commitment field handling every shape variant observed per
+    shared/COMMITMENT_SCHEMA.md.
+
+    Searches `data.<alias>` first, then top-level `<alias>`, for each alias
+    in `_COMMITMENT_FIELD_ALIASES[field]` (defaults to `(field,)` if the
+    field has no registered aliases). First non-empty value wins. Returns
+    None if no value found at any location.
+
+    The schema explicitly permits multiple shapes — canonical for v2.7.15+
+    writers, flat for legacy events that pre-date the canonical contract or
+    that some writer paths still emit at top level. Consumers MUST handle all
+    shapes; reading only `data.<field>` silently drops flat-shape events from
+    view (Sam bug report 2026-05-17: cr-commitments was dropping ~2/3 of
+    his commitments because the filter only read `data.owner_id`). v3.4.3
+    extends coverage from {canonical, flat-new} to also include the legacy
+    `owner` field and the `owner_person_id` / `state` / `due_date` variant
+    actively produced by cr-past-meetings.
+    """
+    d = ev.get("data") or {}
+    aliases = _COMMITMENT_FIELD_ALIASES.get(field, (field,))
+    for alias in aliases:
+        v = d.get(alias)
+        if v not in (None, ""):
+            return v
+    for alias in aliases:
+        v = ev.get(alias)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+# String-confidence levels that some writers (cr-past-meetings, legacy events)
+# use instead of a 0-1 float. Maps each to a canonical float so consumers can
+# apply a single threshold (>= 0.7) across the whole corpus.
+_CONFIDENCE_LEVEL_MAP = {
+    "high": 0.85,
+    "medium": 0.50,
+    "med": 0.50,
+    "low": 0.30,
+}
+
+
+# Fields where a person_id may appear, by event type / shape variant.
+# Source: orchestrator-dont-forget.md Phase 3 (pre-v3.5.0 inline list) +
+# the v3.4.4 shape audit + the 2026-05-17 audit that found this list was
+# missing shapes 2/3/4. v3.5.0+ consolidates the full list here.
+#
+# Each entry is a dotted path. Empty path component "" means top-level.
+# A leaf path may point at a scalar (e.g., "data.owner_id") or a list
+# (e.g., "person_ids" or "data.attendees"); the helper handles both.
+_PERSON_ID_FIELDS = (
+    # Root-level person references
+    "person_ids",                  # newer events, v2.7.15+
+    "actor",                       # when actor is a person, not a skill
+    # Nested under data
+    "data.person_ids",             # older interaction/meeting events, pre-v2.7.15
+    "data.attendee_person_ids",    # meeting events — PASSIVE_CAPTURE legacy shape
+    "data.attendees",              # meeting events — canonically EMAILS (matched
+                                   # via the person_emails parameter below), kept
+                                   # in the id-probe because pre-BUG-8244
+                                   # improvised writers sometimes put person_NNN
+                                   # ids here; an email string never equals a
+                                   # person_NNN id, so no false positives.
+    "data.owner_id",               # commitment events — canonical shape
+    "data.owner_person_id",        # commitment events — owner_person_id-variant shape (cr-past-meetings)
+    "data.requester_id",           # commitment events — canonical shape
+    "data.requester_person_id",    # commitment events — owner_person_id-variant shape
+    # Flat-new shape (top-level owner fields without nesting under data)
+    "owner_id",
+    "owner_person_id",
+    "requester_id",
+    "requester_person_id",
+    # Legacy pre-v2.7.15 (top-level `owner` without _id suffix)
+    "owner",
+)
+
+
+def event_references_person(ev: dict, person_id: str, person_emails=None) -> bool:
+    """Return True iff this event references `person_id` in any known field
+    location, across all shape variants per shared/COMMITMENT_SCHEMA.md and
+    the audit-derived `_PERSON_ID_FIELDS` table above.
+
+    Used by cadence detection (v3.5.0+) so dormancy scoring
+    counts interactions across every shape — not just the 6-field inline list
+    the retired Pulse chat used pre-v3.5.0, which silently missed shape-4 events from
+    cr-past-meetings and any flat-new / legacy commitment shapes.
+
+    `person_emails` (BUG-8244, optional): the person's own email addresses.
+    When supplied, an event whose attendee-email fields (`data.attendees` /
+    `data.attendee_emails`) intersect them also counts as a reference — the
+    email-shaped meeting binding this function silently dropped for its whole
+    life. Callers with a person record in hand pass
+    `people_writer.get_person_emails(record)`.
+
+    The function is shape-agnostic — pass any event dict; it inspects every
+    known field and returns True at the first match. False positives are
+    essentially impossible (person_id strings are namespaced like `person_NNN`
+    and don't collide with other identifiers).
+    """
+    if not person_id or not isinstance(ev, dict):
+        return False
+    if person_emails:
+        try:
+            from event_refs import attendee_emails_of
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from event_refs import attendee_emails_of
+        wanted = {str(e).strip().lower() for e in person_emails if str(e or "").strip()}
+        if wanted and (wanted & attendee_emails_of(ev)):
+            return True
+    for path in _PERSON_ID_FIELDS:
+        parts = path.split(".")
+        v = ev
+        for p in parts:
+            if not isinstance(v, dict):
+                v = None
+                break
+            v = v.get(p)
+            if v is None:
+                break
+        if v is None:
+            continue
+        if isinstance(v, list):
+            if person_id in v:
+                return True
+        elif isinstance(v, str):
+            if v == person_id:
+                return True
+    return False
+
+
+def _commitment_confidence(ev: dict) -> float:
+    """Read a commitment's confidence as a normalized float in [0.0, 1.0].
+
+    Some writers store confidence as a string label (`"HIGH"`, `"medium"`)
+    instead of a 0-1 float; the comparison `data.confidence >= 0.7` crashes on
+    string values and silently drops the event. This helper coerces both shapes
+    via `_CONFIDENCE_LEVEL_MAP`. Missing confidence defaults to 0.0 — which is
+    why SURFACE filtering must go through `passes_surface_floor` below, where
+    missing means UNSCORED, not failing (BUG-8330 item 6).
+    """
+    v = _commitment_field(ev, "confidence")
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        return _CONFIDENCE_LEVEL_MAP.get(v.strip().lower(), 0.0)
+    return 0.0
+
+
+def _is_unscored(ev: dict) -> bool:
+    """THE single definition of "this row carries no usable confidence".
+
+    Missing, blank, and outside-the-vocabulary label all mean UNSCORED —
+    absence of a score is not an assertion of doubt. Factored out of
+    `passes_surface_floor` (DEDUPFLOOR1) so its sibling `surface_floor_value`
+    cannot drift from it: two copies of this test is exactly how one caller
+    starts treating an unscored row as a 0.0 one again."""
+    v = _commitment_field(ev, "confidence")
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return True
+    return isinstance(v, str) and v.strip().lower() not in _CONFIDENCE_LEVEL_MAP
+
+
+# An unscored row clears every floor (`passes_surface_floor` returns True for
+# it outright). `surface_floor_value` has to say that as a NUMBER, because its
+# caller compares maxima across a duplicate component before any floor is
+# known. The score accessors clamp to [0, 1] (`confidence.get_threshold`), so
+# the top of the scale is the honest stand-in — not a sentinel that could be
+# mistaken for a real reading of 1.0 confidence, but the same verdict.
+UNSCORED_SURFACE_VALUE = 1.0
+
+
+def surface_floor_value(ev: dict) -> float:
+    """The row's floor-comparable confidence, unscored included (DEDUPFLOOR1).
+
+    `passes_surface_floor(ev, floor=f)` and `surface_floor_value(ev) >= f`
+    agree for every f in [0, 1]; this form exists because the duplicate fold
+    must record a component's maximum member confidence BEFORE the floor is
+    resolved, and `_commitment_confidence` alone would read every unscored
+    member as 0.0 — re-creating the silent-drop class inside the component."""
+    return UNSCORED_SURFACE_VALUE if _is_unscored(ev) else _commitment_confidence(ev)
+
+
+def passes_surface_floor(ev: dict, *, floor=None, workspace_root=None) -> bool:
+    """THE code-side confidence surface filter (BUG-8330 item 6).
+
+    Before this helper the floor existed only as orchestrator PROSE (a bare
+    constant the model applied by hand), and `_commitment_confidence`'s
+    missing→0.0 default meant any faithful application of that prose silently
+    dropped every UNSCORED capture — the 70→6 collapse class. Two rules:
+
+      - missing confidence = UNSCORED → PASSES. Absence of a score is not an
+        assertion of doubt; most captures are written scoreless by design.
+      - an explicit score or label below the floor fails (a "medium" label is
+        an explicit 0.50 and answers to the same floor as a numeric 0.5 —
+        move the floor per-workspace via the calibration override, not by
+        special-casing labels).
+
+    The floor resolves through `confidence.surface_min(workspace_root)` — the
+    calibration surface — so a workspace's override file actually moves this
+    filter. Pass `floor` directly to skip the lookup (batch callers resolve
+    once)."""
+    # Missing, blank, or a label outside the known vocabulary: unparseable is
+    # not low — treating it as 0.0 re-creates the silent-drop class for one
+    # misspelling. Unscored → passes, at any floor.
+    if _is_unscored(ev):
+        return True
+    if floor is None:
+        try:
+            from confidence import surface_min
+            floor = surface_min(workspace_root)
+        except Exception:
+            floor = 0.7
+    return _commitment_confidence(ev) >= floor
+
+
+def load_events_defensively(
+    events_jsonl_path: str | Path,
+    since_ts=None,
+) -> tuple[list[dict], list[dict]]:
+    """Canonical events.jsonl reader (v3.13.8+ — Sub-bug #14b).
+
+    Reads events.jsonl line-by-line and returns (events, skipped). Handles
+    BOTH JSONDecodeError AND non-dict-shaped lines (the latter was the
+    actual crash class behind Sub-bug #14b — pre-v3.13.8 readers raised
+    `AttributeError: 'str' object has no attribute 'get'` when a line
+    parsed as a top-level string).
+
+    Returns:
+      events: list of dict rows. Each row is a parsed events.jsonl entry.
+      skipped: list of dicts shaped {"line": int, "reason": str, "value": str}
+        describing each line that could not be loaded. The CALLER is
+        expected to surface this to the user (warning banner, recovery
+        prompt, audit log) — DO NOT silently swallow.
+
+    This replaces the pre-v3.13.8 in-line silent filter pattern
+    (`try: ev = json.loads(line); except: continue`) which both lost the
+    skipped-count AND failed on non-dict cases.
+
+    Use this from every consumer of events.jsonl in shared/scripts/ and
+    skills/. The cru_match.load_open_commitments path (below) is migrated
+    inline.
+    """
+    path = Path(events_jsonl_path)
+    # SPEC A5 — shard-transparent: when handed an `events.jsonl` path, read its sibling
+    # `events-<year>.jsonl` shards too, so full-history consumers see the whole timeline
+    # after a rotation. Unsharded workspace -> identical output to the pre-A5 single read.
+    # A non-events.jsonl path is read as-is (back-compat).
+    #
+    # `since_ts` (v4.6.0 MC2 — the cheap perf half): whole year-shards below
+    # the floor year are pruned by FILENAME, never opened (events_io.
+    # shard_paths' rule). Default None = full history, byte-identical to
+    # pre-MC2 behavior. THE SAFETY CONTRACT lives with the caller: a pruned
+    # shard's events are simply invisible, so pass since_ts ONLY when
+    # everything that matters to the caller provably postdates the floor.
+    # The active events.jsonl is never pruned; a non-events.jsonl path
+    # ignores since_ts (no shards to prune).
+    #
+    # ONE LOG PER COMPUTER (cr1#1061): an `events.jsonl` path also reads every
+    # per-computer log beside it (`_hq/data/computers/<writer>/`), one stream
+    # per computer, and the streams are merged by `events_io.merge_streams`
+    # (everything from each, exact duplicates dropped). With no per-computer
+    # log -- every seat today -- there is one stream and the result is the
+    # pre-1061 read, byte for byte.
+    streams: list[tuple[str, list[Path]]]
+    if path.name == "events.jsonl":
+        try:
+            from events_io import log_streams
+            streams = log_streams(path, since_ts=since_ts)
+        except Exception:
+            streams = [("", [path] if path.exists() else [])]
+    else:
+        streams = [("", [path] if path.exists() else [])]
+    if not any(files for _name, files in streams):
+        return [], []
+
+    stream_events: list[list[dict]] = []
+    skipped: list[dict] = []
+    for stream_name, files in streams:
+        stream_events.append(
+            _load_stream_defensively(files, skipped, stream_name))
+    if len(stream_events) == 1:
+        return stream_events[0], skipped
+    from events_io import merge_streams
+    return merge_streams(stream_events), skipped
+
+
+def _load_stream_defensively(files, skipped: list, stream_name: str = "") -> list[dict]:
+    """One stream's files (shards then the active file), parsed the way
+    `load_events_defensively` always has; unreadable lines go to `skipped`.
+    A per-computer stream's `shard` label is `computers/<writer>/<file>`, so
+    a skipped line names the computer it came from; the live log's labels
+    are unchanged."""
+    events: list[dict] = []
+    for fp in files:
+        if not fp.exists():
+            continue
+        label = (f"computers/{stream_name}/{fp.name}" if stream_name
+                 else fp.name)
+        # FS-15 — when the FINAL non-blank line of a file won't parse, that's
+        # the partial-write / truncated-sync-cache signature (not historical
+        # junk mid-file): record it in the `.readalarm.json` sidecar the
+        # brief / system-health surface loudly. The skipped[] contract is
+        # unchanged — callers should still surface it — but the sidecar makes
+        # the degradation survive callers that don't.
+        last_decode_error = None
+        with open(fp, "r", encoding="utf-8") as f:
+            for i, raw in enumerate(f, 1):
+                line = raw.strip()
+                if not line:
+                    continue
+                last_decode_error = None
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError as e:
+                    last_decode_error = f"JSONDecodeError: {e.msg}"
+                    skipped.append(
+                        {
+                            "line": i,
+                            "shard": label,
+                            "reason": f"JSONDecodeError: {e.msg}",
+                            "value": line[:80],
+                        }
+                    )
+                    continue
+                if not isinstance(ev, dict):
+                    skipped.append(
+                        {
+                            "line": i,
+                            "shard": label,
+                            "reason": "non-dict",
+                            "value": repr(ev)[:80],
+                        }
+                    )
+                    continue
+                events.append(ev)
+        if last_decode_error:
+            try:
+                from read_alarm import record_read_alarm
+                record_read_alarm(
+                    fp,
+                    f"final line unparseable (truncation signature): "
+                    f"{last_decode_error}",
+                    reader="cru_match",
+                )
+            except Exception:  # pragma: no cover
+                # Best-effort: a broken read_alarm module (ImportError, or the
+                # SyntaxError a mid-update truncation leaves) must not turn a
+                # degraded read into a hard failure.
+                pass
+    return events
+
+
+# v4.5.2 R1 perf — per-fire memoization of the open-set projection.
+# The daily chase (orchestrator-commitments) calls load_open_commitments 4+
+# times per fire and once more per closure, and every call was a full-history
+# scan across all shards. Cache keyed on the stat signature (path, mtime_ns,
+# size) of the events file + every shard: any append changes size → miss →
+# fresh scan, so a close_commitment write invalidates automatically. History
+# is append-only, so an unchanged signature means unchanged content.
+# Keyed on (resolved path, since_ts) — MC2's windowed projections cache
+# separately from the full one.
+_OPEN_COMMITMENTS_CACHE: dict[tuple, tuple] = {}
+
+
+def _events_files_sig(path: Path) -> tuple:
+    """Stat signature over the events file + its sibling shards (the same file
+    set load_events_defensively reads). Any append changes st_size."""
+    if path.name == "events.jsonl":
+        try:
+            # cr1#1061: every file the merged read covers, so another
+            # computer's append invalidates the cache too.
+            from events_io import log_files
+
+            files = log_files(path)
+        except Exception:
+            files = [path] if path.exists() else []
+    else:
+        files = [path] if path.exists() else []
+    sig = []
+    for fp in files:
+        try:
+            st = fp.stat()
+            sig.append((str(fp), st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append((str(fp), None, None))
+    return tuple(sig)
+
+
+def _twin_key_id(ev: dict) -> str:
+    """The identity two appends must SHARE to be one record: the EXPLICIT
+    `data.id`, or "" when there isn't one.
+
+    Deliberately NOT `_commitment_id`, whose seq-alias fallback returns the
+    single sentinel `commitment_seq_?` for any row with neither an id nor a
+    usable seq — collapsing on that would fold unrelated rows into one, which
+    is a far worse bug than the one this fixes."""
+    d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    cid = d.get("id")
+    return cid.strip() if isinstance(cid, str) and cid.strip() else ""
+
+
+def _id_twin_key(ev: dict, index: int) -> tuple:
+    """Canonical-survivor ordering for two appends of ONE commitment id:
+    LOWEST seq wins. Mirrors `commitment_dedup._fold_sort_key` — the lowest seq
+    is the ORIGINAL record, the one whose id every closure, thread, widget and
+    sub-item already points at. Rows with no usable seq sort last (they cannot
+    be the original), then by append position, so the choice is total and
+    deterministic for any input order."""
+    seq = ev.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        return (1, 0, index)
+    return (0, seq, index)
+
+
+def collapse_id_twins(open_evs: list) -> tuple[list, dict]:
+    """One commitment id is ONE record — SPEC INGESTDUP1 §D2.
+
+    THE DEFECT. `data.id` is minted unique (`cmt_<ulid>`) and the event gate
+    does no reads, so nothing stopped a writer appending the SAME commitment id
+    again. It happened: three `commitment` events, one id, one source_ref,
+    identical titles, 23 seconds apart, from one skill. The projection returned
+    THREE open rows for one promise and every count read three — and no
+    existing seam could see it:
+
+      * the capture-time duplicate check skips a match whose `commitment_id`
+        equals the new row's own id (`flag_suspected_duplicates`' self-match
+        guard), so an identical-id re-append passed through unflagged;
+      * `fold_suspected_duplicates` keys on `data.suspected_duplicate_of`,
+        which nothing had set — its own comment even notes "never remap onto a
+        later twin" while doing nothing about the twin.
+
+    A duplicate id is not a SUSPECTED duplicate for someone to adjudicate.
+    Adjudication is the right answer when two DIFFERENT records might be one
+    ask; here they are one record, twice, and no question needs asking. The
+    reducer owns that judgement (`reducer owns truth`): the lowest-seq append
+    is the record, the rest are ledger noise.
+
+    Read-side only. History is untouched — every append stays on disk exactly
+    as it was written, the same additive-only doctrine as every other fold in
+    this loader.
+
+    Returns `(kept, twin_seqs)`: `kept` in the input's own order, and
+    `twin_seqs` mapping each survivor's id to the ABSORBED appends' seqs, so
+    the caller can stamp the survivor and the collapse is never silent. Rows
+    with no explicit `data.id` are always kept — the absence of an id is not an
+    id they share."""
+    evs = [ev for ev in (open_evs or []) if isinstance(ev, dict)]
+    best: dict = {}
+    for i, ev in enumerate(evs):
+        cid = _twin_key_id(ev)
+        if not cid:
+            continue
+        prev = best.get(cid)
+        if prev is None or _id_twin_key(ev, i) < _id_twin_key(evs[prev], prev):
+            best[cid] = i
+    twin_seqs: dict = {}
+    kept: list = []
+    for i, ev in enumerate(evs):
+        cid = _twin_key_id(ev)
+        if cid and best.get(cid) != i:
+            twin_seqs.setdefault(cid, []).append(ev.get("seq"))
+            continue
+        kept.append(ev)
+    return kept, twin_seqs
+
+
+#: cr1#740/#742. A held window offers mail again that the rails already
+#: judged, so what the owner did with the result has to survive the re-read.
+#: `commitment_reopened` and a person's Skip (`commitment_review_dismissed`
+#: without the policy's retract reason) are that word. The newest of them on a
+#: row rides the projection as `adjudicated_at`, and a message no newer than it
+#: is not evidence for that row: it is what the owner already answered. A
+#: message after it still closes or proposes (the dismissal rule's "genuinely
+#: new" sends).
+def _owner_adjudications(events) -> dict:
+    """commitment id -> the raw time of the newest reopen or Skip on it."""
+    from closure_index import reopen_target
+    try:
+        from event_types import POLICY_RETRACT_REASON as retract
+    except Exception:  # noqa: BLE001 - an older table: no reason to exempt
+        retract = None
+    newest: dict = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        et = ev.get("type") or ev.get("event") or ""
+        if et == "commitment_reopened":
+            cid = reopen_target(ev)[0]
+        elif et == "commitment_review_dismissed":
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            if retract and data.get("resolution_reason") == retract:
+                continue
+            cid = str(data.get("commitment_id") or "")
+        else:
+            continue
+        raw = event_time(ev)
+        when = _parse_ts(raw) if raw else None
+        if not cid or when is None:
+            continue
+        if cid not in newest or when > newest[cid][0]:
+            newest[cid] = (when, raw)
+    return {cid: pair[1] for cid, pair in newest.items()}
+
+
+#: cr1#1224 - the projected field that carries the source meeting's own start
+#: time on a meeting-captured row. Written ONLY by `load_open_commitments`,
+#: from the `meeting` event the row's `source_ref` names; never stored.
+MEETING_START_FIELD = "meeting_start_at"
+
+
+def _trusted_meeting_start(raw):
+    """A meeting event's time as a START the fence may lean on, or None.
+
+    Trusted only when it carries its own offset (a naive value could be read
+    hours early) and is not exactly midnight on its own clock (a day written
+    as a time says nothing about the hour)."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return None
+    if (dt.hour, dt.minute, dt.second, dt.microsecond) == (0, 0, 0, 0):
+        return None
+    return dt
+
+
+def _meeting_start_index(events) -> dict:
+    """cr1#1224 - meeting ref key -> (instant, raw) for the latest trusted
+    start of that meeting. The raw string keeps its own offset, which
+    `_meeting_start_answer` checks against the workspace's clock.
+
+    Joined through `meeting_capture.meeting_ref_keys`, the one derivation of
+    "is this the same meeting". When two records of one meeting, or a
+    meeting's `data.start_ts` and its `ts`, disagree, the LATER time stands:
+    it never lets in evidence that any record places before the meeting."""
+    try:
+        from meeting_capture import meeting_ref_keys
+    except Exception:  # noqa: BLE001 - no index: every row keeps its capture time
+        return {}
+    index: dict = {}
+    for ev in events or []:
+        if not isinstance(ev, dict) or ev.get("type") != "meeting":
+            continue
+        d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        starts = [(dt, str(raw).strip()) for raw in (d.get("start_ts"), ev.get("ts"))
+                  for dt in (_trusted_meeting_start(raw),) if dt is not None]
+        if not starts:
+            continue
+        start = max(starts, key=lambda pair: pair[0])
+        for key in meeting_ref_keys(d.get("source_ref")):
+            if key not in index or start[0] > index[key][0]:
+                index[key] = start
+    return index
+
+
+def _row_meeting_start(row, index) -> Optional[str]:
+    """The start of the meeting this row was captured from, as the meeting
+    event wrote it (offset kept), or None when its `source_ref` names no
+    meeting on file."""
+    if not index:
+        return None
+    try:
+        from meeting_capture import meeting_ref_keys
+    except Exception:  # noqa: BLE001
+        return None
+    d = row.get("data") if isinstance(row.get("data"), dict) else {}
+    hits = [index[k] for k in meeting_ref_keys(d.get("source_ref") or row.get("source_ref"))
+            if k in index]
+    if not hits:
+        return None
+    return max(hits, key=lambda pair: pair[0])[1]
+
+
+def _adjudicated_since(ev, evidence_at) -> bool:
+    """Was this row reopened or skipped at or after the evidence's own time?
+    A row with no such word is inert: the fence never invents a refusal. A
+    mark with no time at all (`evidence_at` None) cannot be shown to be newer
+    than the owner's word, so that word stands."""
+    raw = _commitment_field(ev, "adjudicated_at")
+    when = _parse_ts(raw) if raw else None
+    return when is not None and (evidence_at is None or when >= evidence_at)
+
+
+def _owed_patch(row: dict, event_data, patch_so_far=None) -> dict:
+    """cr1#1011 (owner ruling 2026-11-11, option b): the row patch an owner
+    change makes to the stored direction. The event's stored new direction,
+    or the three fields cleared (`event_data` None: nobody owns it, or an
+    event that stored none), so a value never outlives its owner. A row that
+    never carried one and gets none stays byte-identical."""
+    try:
+        from owed_direction import row_patch
+    except Exception:  # noqa: BLE001 - readers then work direction out
+        return {}
+    # The row as patched so far: two owner changes on one row must see the
+    # direction the first one stored, or a stale value survives the second.
+    current = {**((row or {}).get("data") or {}), **(patch_so_far or {})}
+    return row_patch(current, event_data)
+
+
+def load_open_commitments(
+    events_jsonl_path: str | Path,
+    since_ts=None,
+    *,
+    events: Optional[list] = None,
+    workspace_root=None,
+) -> list[dict]:
+    """Read events.jsonl and return all open commitments (status open or
+    overdue) that have NOT been closed by a subsequent `commitment_resolved`
+    or `thread_resolved` event.
+
+    PGUARD2 D2 — `events` injection: when the caller supplies `events`
+    (a list of event dicts), the projection is built from THOSE rows and no
+    file load happens (`events_jsonl_path` / `since_ts` are ignored for
+    loading; the path is still used only as documentation of intent). This is
+    the seam the EXTERNAL COMPOSERS use: they pass
+    `events_io.load_events_org_scoped(workspace_root)[0]` so personal-lane
+    rows (a `tie: "personal"` commitment, reminder-lane rows) and
+    masked-account rows never enter a draft, agenda, memo, or follow-up pack.
+    OWNER surfaces (show-my-list, the brief, close/chase flows) keep the
+    no-arg form — they legitimately project everything. The default path is
+    byte-identical to pre-PGUARD2 behavior. Supplied-events calls are NOT
+    memoized (no file signature to key on) and apply the same R5 mask pass
+    as the loaded path (idempotent on already-org-scoped rows — mask events
+    survive org scoping, so the mask set is still computable).
+
+    F-28 post-review (F-2) — `workspace_root`: with it, the MC1
+    `all_counterparties_received` stamp below is computed against the ENTITY
+    GRAPH, so a commitment whose only outstanding leg is a phantom (the same
+    person written once as a resolved id and once as that person's free-text
+    name) is stamped complete rather than left un-stamped forever. Without it
+    the stamp stays raw-union, byte-identically pre-F-28.
+
+    Why this argument rather than deriving the root from `events_jsonl_path`:
+    walking three parents up would fight `data_root.py`'s `CR_DATA_ROOT`
+    override, which exists precisely so `_hq/data` can live elsewhere. The
+    caller knows its workspace; this function must not guess one.
+
+    Why the chase surface needs it: `orchestrator-commitments.md` Phase 4.5
+    renders in two MUTUALLY EXCLUSIVE modes — step 1 fans out one row per
+    `outstanding_counterparties(...)`, step 3 renders the single
+    "everyone's received — close it?" row when the projection carries
+    `all_counterparties_received`. Fixing the fan-out (step 1) without the
+    stamp (step 3) empties both: no nudge row AND no close-proposal row, on an
+    item still sitting open. Noise became SILENCE, which is worse. Both halves
+    read the same workspace now, so the two modes stay complementary.
+
+    v4.5.2 R1 — memoized per file state: repeated calls within one fire reuse
+    the projection (the returned LIST is a fresh copy each call; the event
+    dicts inside are shared — treat them as read-only, which every consumer
+    already does). Any append to events.jsonl or a shard invalidates the
+    cache via the stat signature. The full incremental index is 4.7 scope
+    (client-scale trigger).
+
+    v4.6.0 MC2 — `since_ts` shard pruning: passed through to
+    load_events_defensively, dropping whole year-shards below the floor year
+    by FILENAME (never opened). Default None = full history, byte-identical
+    to pre-MC2 behavior — and the correct default for this function: the
+    open-set projection is inherently full-history (a 2024 capture can still
+    be open, and its closer can live in any later shard), so a pruned shard's
+    commitments and closers silently vanish from the result. PASS since_ts
+    ONLY when the window provably covers the entire commitment history —
+    e.g. the caller has checked the workspace's first commitment-family
+    event postdates the floor (fresh workspaces), or a test controls the
+    fixture. When in doubt, don't: correctness beats the shard skip.
+
+    Mirror of build_workspace_map_input.py `_aggregate_commitments`. Returns
+    full event dicts (caller pulls what it needs from `data`).
+
+    v3.13.8+ — delegates to `load_events_defensively()` which surfaces
+    skipped-line counts to callers via the helper return rather than
+    silently swallowing malformed lines (Sub-bug #14b real-world fix).
+    The skipped list is currently consumed via logging only here; new
+    callers should call `load_events_defensively()` directly when they
+    need to render a recovery prompt to the user.
+
+    Phase 2 Stage C (2026-07, F3 read-side amnesty) — the closure-id chain is
+    extended with the seq aliases `data.commitment_seq` and
+    `data.source_event_seq` (both map seq → the commitment event at that
+    seq), keeping all existing aliases. ~252 of the 289 historic dead-letter
+    closures become readable through this chain with no history rewrite.
+    `commitment_state.close_commitment`'s idempotency chain mirrors this
+    extension exactly (the two always move together).
+
+    Phase 2 Stage A (2026-07) — `commitment_updated` deferrals are folded
+    into the returned events: when a later `commitment_updated` event carries
+    a new due date (`data.new_due`, the orchestrator `push to [date]` verb's
+    field; `data.due` / `data.due_date` accepted as variants), the returned
+    commitment's `data.due` is the EFFECTIVE due (latest update wins) and
+    `data.due_updated_by_seq` records the update event's seq. Before this
+    fold those events were write-only — nothing read them — so a deferred
+    commitment rendered overdue forever off its immutable original due. The
+    fold is read-side only (in-memory copies); events.jsonl history is never
+    rewritten. Consumers keep reading due via `_commitment_field(ev, "due")`
+    and are agnostic to whether it was deferred.
+
+    v4.6.0 S4 — two more read-side folds, same append-only doctrine:
+      * WORDING: `commitment_updated` events carrying `data.new_title` /
+        `data.new_summary` (the `fix wording` verb via
+        commitment_state.edit_commitment_wording) fold into the projected
+        item's title/summary — each field independently, newest wins; the
+        mis-extracted original stays in history. `change_summary` (the CRU
+        schedule-shift prose) deliberately never folds into wording.
+      * REASSIGNMENT: `commitment_reassigned` folds PER FIELD: the latest
+        event that names an owner sets the owner, the latest that names a
+        counterparty (or restores one) sets the counterparty (+ display names
+        when carried). A writer names only what it changes, so a reassignment
+        of the owner leaves an earlier counterparty standing, and the other
+        way round (cr1#766: a board reassign and an owner-named counterparty
+        no longer overwrite each other). The latest non-restore event decides
+        `pending_review`: unconfirmed stamps it (+ review_reason) so the item
+        counts as unconfirmed and never enters chase; a confirmed one (W4b
+        Theirs→[name], or the user naming the person) clears the flag.
+
+    v4.6.1 W4b — the confirm-flow adjudication fold, same doctrine:
+      * OWNER CONFIRM ("Mine"): a `commitment_updated` carrying
+        `data.owner_confirmed: true` (commitment_state.confirm_commitment_owner)
+        folds `new_owner_id` (+ name) into the projection and clears
+        `pending_review` / `review_reason` — the item leaves the unconfirmed
+        bucket and joins its confirmed direction.
+      * REVIEW CLEAR ("Keep both"): a `commitment_updated` carrying
+        `data.review_flags_cleared: true` (commitment_state.clear_review_flags)
+        clears `pending_review`, `review_reason`, AND the C4
+        `suspected_duplicate_of` / `suspected_duplicate_score` flags —
+        confirmed distinct, both items stay open.
+      * REVIEW SET (AUTOAPPLY §4c review fix — the additive mirror of the
+        clear above): a `commitment_updated` carrying
+        `data.review_flags_set: true` (commitment_state.
+        flag_duplicate_for_review) STAMPS `pending_review`, `review_reason`
+        and the C4 `suspected_duplicate_of` / `suspected_duplicate_score`.
+        An auto-merge stamp the apply half could not honor (survivor closed,
+        stamp stale, merge reversed) lands the pair back on the flag tier as
+        a visible question instead of vanishing.
+      * WATCH (WATCHGATE §2.3 — the parked-and-still-open fold): a
+        `commitment_updated` carrying `data.watch_set: true` plus a
+        `data.watch` object (watch_gate.park_in_watch) stamps that object onto
+        the projection; one carrying `data.watch_cleared: true`
+        (watch_gate.clear_watch) removes it. Latest wins. WATCHING is
+        deliberately NOT a status value and NOT a filter: a watched item stays
+        `status: "open"`, stays in this projection, and stays in every count —
+        surfaces may badge it, but nothing may lose it. A reader written
+        before this fold existed sees exactly the open commitment it always
+        saw, which is the entire back-compat contract.
+      * OVERDUE ASK (SPEC OVERDUE1 DD-2 — the asked-once fold, the watch
+        fold's twin): a `commitment_updated` carrying `data.asked_set: true`
+        plus a `data.asked` object (commitment_state.mark_asked) stamps that
+        object onto the projection; one carrying `data.asked_cleared: true`
+        (commitment_state.clear_asked) removes it. The ONE way it differs
+        from the watch fold is the auto-clear: any update carrying a
+        SUBSTANTIVE key (`commitment_activity.SUBSTANTIVE_UPDATE_KEYS` — a
+        new due date, new wording, a re-owner, an adjudication) also removes
+        it, because that update IS the user answering the question the mark
+        records, and it arrives with no knowledge that a question was ever
+        asked. Like WATCHING, an ASKED item stays `status: "open"`, stays in
+        this projection and stays in every count; only the End of Day slipped
+        block reads the stamp.
+      Ordering is append-order-aware ACROSS the reassignment fold: a Mine
+      confirm followed by a later unconfirmed reassignment re-stamps
+      pending_review (latest adjudication wins), and vice versa.
+    Split closers (`commitment_superseded` with `data.split_into`) close the
+    original through the standard closer chain but are NOT merges — the C4
+    survivor-provenance fold is skipped for them; split children carry their
+    own `data.source_event_seq` / `data.split_from` provenance at write time.
+
+    SUB1 (2026-07) — the sub-item fold, same append-only doctrine. A child
+    commitment (data.parent_id, written only by commitment_state.add_subitems)
+    is an ordinary open commitment in this projection; the fold adds stamps
+    on the in-memory copies only:
+      * CHILD stamps: `parent_id` re-pointed through the C4 merge chain (a
+        superseded parent's children belong to the SURVIVOR read-side — no
+        history rewrite), `parent_title` (the parent's EFFECTIVE title, for
+        "part of: […]" rendering), and `parent_closed: True` for orphans
+        (live child of a closed parent — the cascade crash window; they
+        render top-level with a "was part of" note and count in the total).
+      * PARENT stamps (only when it has children): `subitem_ids` (append
+        order), `n_subitems_open`, `n_subitems_done`,
+        `all_subitems_resolved: True` when the LAST open child closed (the
+        PROPOSE-closure signal — mirror of MC1's
+        all_counterparties_received; never a closer), and
+        `next_subitem_due` (min open-child EFFECTIVE due, annotation +
+        ranking signal ONLY — never folded into the parent's own data.due;
+        a deferred parent stays deferred, D-7).
+    """
+    path = Path(events_jsonl_path)
+    injected = events is not None
+    if not injected and not path.exists():
+        return []
+
+    cache_key = None
+    if not injected:
+        # Cache key carries since_ts — a windowed projection and the full one
+        # are different results and must never serve each other's cache
+        # entries. Supplied-events calls (PGUARD2 D2) never touch the cache:
+        # there is no file signature to validate a supplied list against.
+        # `workspace_root` is IN the key: with a workspace the MC1 stamp is
+        # computed against the entity graph, so the same file legitimately
+        # yields two different projections and one must never serve the
+        # other's cache entry (the same reasoning `since_ts` is here for).
+        cache_key = (str(path.resolve()), since_ts,
+                     str(workspace_root) if workspace_root is not None else None)
+        sig = _events_files_sig(path)
+        cached = _OPEN_COMMITMENTS_CACHE.get(cache_key)
+        if cached is not None and cached[0] == sig:
+            return list(cached[1])
+
+        events, skipped = load_events_defensively(path, since_ts=since_ts)
+        if skipped:
+            # Surface a warning so consumers see a non-silent skipped count
+            # in stderr / log streams. Per the v3.13.8 contract, callers that
+            # render to user MUST display skipped to the user explicitly;
+            # this log line is the floor, not the ceiling.
+            # print to stderr, not a .write(): this reader is on the access
+            # layer's read list, whose static check names any .write() call
+            # (cr1#1005). Same text, same stream.
+            import sys as _sys
+            print(
+                f"[cru_match] load_open_commitments skipped {len(skipped)} "
+                f"malformed events.jsonl lines in {path.name}: "
+                f"{[s['line'] for s in skipped]}",
+                file=_sys.stderr,
+            )
+    else:
+        events = [ev for ev in events if isinstance(ev, dict)]
+    # R5 reader-honor (connector-agnostic-v1): the commitment projector drops
+    # rows whose account identity matches a LIVE account_scope_masked (un-
+    # masked by account_scope_restored). Read-side only; rows never move.
+    # Defensive: any failure leaves the events unfiltered.
+    try:
+        from account_scope_gate import filter_masked_events
+        events = filter_masked_events(events)
+    except Exception:
+        pass
+
+    open_evs: list[dict] = []
+    # Closure state is ORDER-AWARE since Stage D's `commitment_reopened`
+    # (S4 undo): a commitment is closed iff its latest closure comes AFTER its
+    # latest reopen in append order. F3 amnesty (Stage C): closure seqs
+    # referencing the commitment EVENT's seq — `data.commitment_seq` and
+    # `data.source_event_seq` both map seq → the commitment at that seq.
+    # BUG-8330 item 1: the fold lives in the shared `closure_index` module
+    # now, so surface builders read the SAME chain as this loader instead of
+    # rolling private weaker ones. Do not re-inline it.
+    from closure_index import build_closure_index, closer_target_id
+    closure = build_closure_index(events)
+    adjudicated = _owner_adjudications(events)  # cr1#740: see the helper
+    meeting_starts = _meeting_start_index(events)  # cr1#1224: see the helper
+    # commitment id → latest due-shifting update (Stage A fold; see docstring).
+    due_updates: dict[str, dict] = {}
+    hint_updates: dict[str, dict] = {}   # POLICY1-B DD-6
+    # commitment id → latest wording update per field (v4.6.0 S4 fold: the
+    # `fix wording` verb writes commitment_updated with data.new_title /
+    # data.new_summary; each field folds independently, newest wins; the
+    # original text stays in history — append-only, never rewritten).
+    wording_updates: dict[str, dict] = {}
+    # commitment id → {"owner", "counterparty", "flag"}: the latest
+    # reassignment naming each field, and the latest one that decides the
+    # review flag (cr1#766; was one latest event wholesale) (v4.6.0 S4: commitment_reassigned
+    # routes an item to a new owner/counterparty instead of discarding it;
+    # an UNCONFIRMED reassignment stamps pending_review on the projection so
+    # the item sits in the unconfirmed bucket and never enters chase — the
+    # W4b no-auto-email-on-a-guessed-owner guardrail).
+    reassignments: dict[str, dict] = {}
+    # commitment id → latest confirm-flow adjudication (v4.6.1 W4b): a
+    # commitment_updated carrying owner_confirmed ("Mine") or
+    # review_flags_cleared ("Keep both"). Applied in append order against
+    # the reassignment fold — the latest adjudication decides pending_review.
+    confirmations: dict[str, dict] = {}
+    # commitment id → latest flag-tier fallback (AUTOAPPLY §4c review fix): a
+    # commitment_updated carrying review_flags_set (commitment_state.
+    # flag_duplicate_for_review). The additive MIRROR of review_flags_cleared
+    # — an auto-merge stamp that could not be honored at apply time (survivor
+    # closed, stamp stale, merge reversed) puts the pair back on the flag tier
+    # as a visible question. Ordered with the other adjudications: latest
+    # wins, so a user's Keep-both after this clears it, and this after a
+    # Keep-both re-asks.
+    review_flag_sets: dict[str, dict] = {}
+    # commitment id → latest WATCHING mark (WATCHGATE §2.3): a
+    # commitment_updated carrying watch_set (watch_gate.park_in_watch) or
+    # watch_cleared (watch_gate.clear_watch). ADDITIVE — the item stays
+    # `status: "open"` and gains `data.watch`; WATCHING is deliberately NOT a
+    # status value, so every reader written before this fold existed keeps
+    # seeing the ordinary open commitment it always saw. Latest wins per
+    # target, so a park after a clear re-parks and vice versa.
+    watch_marks: dict[str, dict] = {}
+    # cr1#1463 - commitment id -> the notes the owner added to it
+    # (`commitment_state.add_commitment_note`: a `note` row with
+    # data.via "commitment_context"), and the seqs of the notes taken back
+    # (`commitment_note_retracted`). ADDITIVE: an item with no note carries no
+    # `context_notes` key at all, so every reader written before this fold
+    # sees the row it always saw.
+    ctx_notes: dict[str, list] = {}
+    ctx_gone: set = set()
+    # commitment id → latest OVERDUE-ASK mark (SPEC OVERDUE1 DD-2): a
+    # commitment_updated carrying asked_set (commitment_state.mark_asked) or
+    # asked_cleared (commitment_state.clear_asked). ADDITIVE, exactly like the
+    # watch fold above — the item stays `status: "open"` and gains
+    # `data.asked`; nothing filters on it but the nightly slipped block.
+    #
+    # It differs from the watch fold in ONE way, and that difference is the
+    # spec: the mark also clears on any SUBSTANTIVE update. A user who pushed
+    # the item to a new date, re-worded it, re-owned it or adjudicated it has
+    # ANSWERED the question the mark records, so the mark must not outlive the
+    # answer — and the answer arrives as an ordinary update with no knowledge
+    # that a question was ever asked. Latest wins per target in append order,
+    # so a re-ask after an answer re-arms and vice versa.
+    asked_marks: dict[str, dict] = {}
+    # commitment target → latest kind override (Stage D fold: the
+    # `commitment_reclassified` marker is ADDITIVE — promote/migrate never
+    # delete/recreate; the projector applies the label change read-side).
+    kind_overrides_by_id: dict[str, dict] = {}
+    kind_overrides_by_seq: dict[int, dict] = {}
+    # survivor id → accumulated merge provenance (v4.6.0 C4 fold): each
+    # `commitment_superseded` closes its target through the standard closer
+    # chain above AND names a survivor (`data.superseded_by`) that absorbed
+    # it — the survivor's in-memory copy carries the union
+    # (data.merged_source_refs / data.merged_from). Read-side only; history
+    # is never rewritten.
+    merged_onto: dict[str, dict] = {}
+    # commitment target → accumulated per-person receipts (v4.6.0 MC1): each
+    # `commitment_partial_received` records ONE counterparty delivering on a
+    # multi-counterparty commitment (id or free-text name). The loader unions
+    # them onto the projection (`data.received_from` / `received_from_names`)
+    # and stamps `data.all_counterparties_received` when the whole roster has
+    # delivered — the PROPOSE-closure signal (never a closer; the item stays
+    # open until the user closes it). Keyed by id AND seq alias (mirrors the
+    # kind-override fold), so a receipt referencing either resolves.
+    received_ids_by_id: dict[str, set] = {}
+    received_names_by_id: dict[str, set] = {}
+    received_ids_by_seq: dict[int, set] = {}
+    received_names_by_seq: dict[int, set] = {}
+    # SUB1 fold state: every commitment event by canonical id (parents may be
+    # closed — orphan children still need the parent's title), the superseded
+    # → survivor re-point map (C4 merges transfer children read-side), and
+    # the raw child links (child cid, child seq, on-disk parent_id).
+    commitment_by_id: dict[str, dict] = {}
+    superseded_onto: dict[str, str] = {}
+    child_records: list[tuple] = []
+
+    def _as_seq(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+        return None
+
+    # OVERDUE1 DD-2 — the ONE list of what makes an update a REAL change, so
+    # the fold's auto-clear and the movement filter can never disagree about
+    # whether the user answered. Imported HERE rather than at module scope
+    # because `commitment_activity` imports this module at module scope: the
+    # dependency closes at call time, when both modules are fully loaded.
+    from commitment_activity import SUBSTANTIVE_UPDATE_KEYS as _SUBSTANTIVE
+
+    for idx, ev in enumerate(events):
+        et = ev.get("type") or ev.get("event") or ""
+        d = ev.get("data") or {}
+        if et == "note" and d.get("via") == "commitment_context" and d.get("commitment_id"):
+            ctx_notes.setdefault(str(d["commitment_id"]), []).append(
+                {"text": str(d.get("summary") or ""), "seq": ev.get("seq"),
+                 "ts": str(ev.get("ts") or "")})
+        elif et == "commitment_note_retracted" and isinstance(d.get("retracts_seq"), int):
+            ctx_gone.add(d["retracts_seq"])
+        if et in ("commitment_resolved", "thread_resolved", "commitment_superseded"):
+            # Closure/reopen state itself folds in the shared closure_index
+            # pre-pass above — this branch keeps only the C4 merge fold.
+            # commitment_superseded (v3.14.5): people-crm/SKILL.md Gate 2 names
+            # it as a valid closer; the target-id chain (incl. the v3.11.4
+            # data.target_id back-compat field) lives in
+            # closure_index.CLOSURE_ID_FIELDS now.
+            cid = closer_target_id(ev) or None
+            # C4 merge fold: a supersession names the survivor that absorbed
+            # the closed item — accumulate its provenance for the patch below.
+            # S4 split closers (data.split_into present) are NOT merges: the
+            # children carry their own source_event_seq / split_from
+            # provenance at write time, so no survivor fold applies.
+            if et == "commitment_superseded" and not d.get("split_into"):
+                survivor = d.get("superseded_by") or d.get("survivor_id")
+                if survivor:
+                    entry = merged_onto.setdefault(
+                        str(survivor), {"refs": [], "from": []}
+                    )
+                    for r in d.get("merged_source_refs") or []:
+                        if not (isinstance(r, str) and r.strip()):
+                            continue
+                        # PROV2 — dedup the fold on the DERIVED identity so a
+                        # legacy lowercased ref and its case-preserved twin do
+                        # not both enter as separate provenance; each pointer
+                        # is still stored with its own bytes.
+                        if (dedup_key_of(r)
+                                in {dedup_key_of(x) for x in entry["refs"]}):
+                            continue
+                        entry["refs"].append(r)
+                    if cid and str(cid) not in entry["from"]:
+                        entry["from"].append(str(cid))
+                    # SUB1 D3b: the merged-away item's children re-point to
+                    # the survivor read-side (never rewritten on disk).
+                    if cid:
+                        superseded_onto[str(cid)] = str(survivor)
+        elif et == "commitment_reclassified":
+            # Stage D fold (S5/S6): latest kind override wins; applied to the
+            # in-memory copy only — the original event is never rewritten.
+            target = d.get("target_id") or d.get("commitment_id")
+            new_kind = d.get("new_kind") or d.get("new_type")
+            if new_kind:
+                if target:
+                    kind_overrides_by_id[str(target)] = {
+                        "kind": new_kind, "seq": ev.get("seq")}
+                sv = _as_seq(d.get("target_seq"))
+                if sv is not None:
+                    kind_overrides_by_seq[sv] = {
+                        "kind": new_kind, "seq": ev.get("seq")}
+        elif et == "commitment_updated":
+            # Stage A fold: record the latest due-shifting update per target.
+            # Id chain mirrors the closer chain's data-first priority; updates
+            # that carry no new due (scope/summary-only changes) are ignored —
+            # they must not erase an earlier deferral.
+            target = (
+                d.get("commitment_id")
+                or d.get("target_id")
+                or ev.get("commitment_id")
+            )
+            new_due = d.get("new_due") or d.get("due") or d.get("due_date")
+            # POLICY1-B DD-6 — the park hint: the NEWEST `commitment_updated`
+            # that carries the `status_hint` key at all (an explicit null is
+            # an un-park and ENDS the hint; an update without the key leaves
+            # it alone).
+            if target and "status_hint" in d:
+                hint_updates[str(target)] = {
+                    "status_hint": d.get("status_hint") or None,
+                    "park_reason": d.get("park_reason") or d.get("reason") or "",
+                    "seq": ev.get("seq"), "ts": ev.get("ts") or ""}
+            if target and new_due:
+                due_updates[str(target)] = {"due": new_due, "seq": ev.get("seq")}
+            elif target and d.get("due_cleared") is True:
+                # POLICY1-B (b) — the sanctioned CLEAR (`restore_due` back to
+                # no date): the newest update wins per target, and this one
+                # says "undated again". Only the explicit marker clears; a
+                # scope-only update still erases nothing.
+                due_updates[str(target)] = {"due": None, "seq": ev.get("seq"),
+                                            "cleared": True}  # (b): undated again
+            # S4 wording fold: explicit new_title / new_summary only — the
+            # CRU schedule-shift path's change_summary is prose describing
+            # WHAT changed, never the new wording, and must not clobber the
+            # title. Each field folds independently (newest wins per field);
+            # a due-only update never erases an earlier wording fix and vice
+            # versa.
+            if target and (d.get("new_title") or d.get("new_summary")):
+                slot = wording_updates.setdefault(str(target), {})
+                if d.get("new_title"):
+                    slot["title"] = d["new_title"]
+                    slot["title_seq"] = ev.get("seq")
+                if d.get("new_summary"):
+                    slot["summary"] = d["new_summary"]
+                    slot["summary_seq"] = ev.get("seq")
+            # W4b adjudication fold: Mine (owner_confirmed) / Keep both
+            # (review_flags_cleared). Keyed on the explicit booleans the
+            # commitment_state writers stamp — a generic update never
+            # accidentally clears a review flag. Latest wins per target.
+            if target and (d.get("owner_confirmed") or d.get("review_flags_cleared")):
+                confirmations[str(target)] = {
+                    "owner_id": d.get("new_owner_id"),
+                    "owner_name": d.get("new_owner_name"),
+                    # cr1#1011 (ruling 2026-11-11 b): the direction the gate
+                    # stored for the new owner travels with it.
+                    "owed": d,
+                    "clear_flags": bool(d.get("review_flags_cleared")),
+                    # cr1#771: whether the product, not the owner, cleared it
+                    "by_machine": d.get("actor_kind") == "machine",
+                    "seq": ev.get("seq"),
+                    "idx": idx,
+                }
+            # PLATE1 P3 — the DISOWN fold (commitment_state.disown_commitment,
+            # the `not mine` verb): owner cleared + a `whose_is_this`
+            # question with the user's provenance. Ordered with the other
+            # adjudications (latest wins): a later Mine / reassign re-owns
+            # the item and clears the question; a later disown re-asks.
+            # Keyed on the explicit `owner_cleared` boolean, so an ordinary
+            # update can never accidentally orphan an item.
+            if target and d.get("owner_cleared"):
+                confirmations[str(target)] = {
+                    "owner_id": None,
+                    "owner_name": None,
+                    "clear_flags": False,
+                    "disown": True,
+                    "question": d.get("question"),
+                    "question_by": d.get("question_by"),
+                    "seq": ev.get("seq"),
+                    "idx": idx,
+                }
+            # DISOWNUNDO1 (cr1#162) — the undo of a disown on an item that had
+            # no owner: the question is WITHDRAWN and nothing else moves.
+            # Keyed on the explicit `question_cleared` boolean. Latest wins
+            # with the other adjudications, so a later disown re-asks.
+            if target and d.get("question_cleared"):
+                confirmations[str(target)] = {
+                    "owner_id": None,
+                    "owner_name": None,
+                    "clear_flags": False,
+                    "question_cleared": True,
+                    "seq": ev.get("seq"),
+                    "idx": idx,
+                }
+            # AUTOAPPLY §4c review fix — the flag-tier fallback (the additive
+            # mirror of the Keep-both clear above). Keyed on the explicit
+            # boolean flag_duplicate_for_review stamps, so an ordinary update
+            # can never accidentally RAISE a review flag either.
+            if target and d.get("review_flags_set"):
+                review_flag_sets[str(target)] = {
+                    "reason": d.get("review_reason"),
+                    "duplicate_of": d.get("suspected_duplicate_of"),
+                    "score": d.get("suspected_duplicate_score"),
+                    "seq": ev.get("seq"),
+                    "idx": idx,
+                }
+            # WATCHGATE §2.3 watch fold. Keyed on the explicit booleans the
+            # watch_gate writers stamp, exactly like the two folds above — an
+            # ordinary update can never accidentally park or un-park an item.
+            # A watch_set with a non-dict payload is ignored rather than
+            # stamped: a malformed park must not make an item unreadable.
+            if target and d.get("watch_set") and isinstance(d.get("watch"), dict):
+                watch_marks[str(target)] = {"watch": d["watch"],
+                                            "seq": ev.get("seq"), "idx": idx}
+            elif target and d.get("watch_cleared"):
+                watch_marks[str(target)] = {"watch": None,
+                                            "seq": ev.get("seq"), "idx": idx}
+            # OVERDUE1 DD-2 overdue-ask fold. Same explicit-boolean keying as
+            # the three folds above, plus the auto-clear: any update carrying a
+            # SUBSTANTIVE key is the user answering, and an answered question
+            # stops resting the row. A malformed `asked` payload (non-dict) is
+            # ignored rather than stamped, exactly as a malformed watch is —
+            # the failure direction is "keep asking", never "rest forever".
+            if target and d.get("asked_set") and isinstance(d.get("asked"), dict):
+                asked_marks[str(target)] = {"asked": d["asked"],
+                                            "seq": ev.get("seq"), "idx": idx}
+            elif (target and str(target) in asked_marks
+                    and (d.get("asked_cleared")
+                         or any(d.get(k) not in (None, "", False)
+                                for k in _SUBSTANTIVE))):
+                # Only ever clears a mark this same pass has SEEN. Without the
+                # membership test every ordinary due-date push in the log would
+                # stamp `asked: None` onto a row that was never asked about —
+                # harmless to every reader here, and exactly the kind of key
+                # that gets mistaken for a signal by the next one.
+                asked_marks[str(target)] = {"asked": None,
+                                            "seq": ev.get("seq"), "idx": idx}
+        elif et == "commitment_partial_received":
+            # MC1 receipt fold: union the delivering counterparty (id and/or
+            # free-text name) onto the target. Accumulate — never overwrite;
+            # append-only marks pile up until the roster is complete.
+            target = (
+                d.get("commitment_id")
+                or d.get("target_id")
+                or ev.get("commitment_id")
+            )
+            rid = d.get("received_counterparty_id")
+            rnm = d.get("received_counterparty_name")
+            sv = _as_seq(d.get("commitment_seq"))
+            if target:
+                tkey = str(target)
+                if isinstance(rid, str) and rid.strip():
+                    received_ids_by_id.setdefault(tkey, set()).add(rid.strip())
+                if isinstance(rnm, str) and rnm.strip():
+                    received_names_by_id.setdefault(tkey, set()).add(rnm.strip())
+            if sv is not None:
+                if isinstance(rid, str) and rid.strip():
+                    received_ids_by_seq.setdefault(sv, set()).add(rid.strip())
+                if isinstance(rnm, str) and rnm.strip():
+                    received_names_by_seq.setdefault(sv, set()).add(rnm.strip())
+        elif et == "commitment_reassigned":
+            # S4 reassignment fold, PER FIELD (cr1#766): each field takes the
+            # latest event that names it; the review flag takes the latest
+            # event that is not a restore. A whole-event fold let a later
+            # owner change put an earlier counterparty back, and the reverse.
+            target = (
+                d.get("commitment_id")
+                or d.get("target_id")
+                or ev.get("commitment_id")
+            )
+            # POLICY1-B F-9 — a RESTORE (`counterparty_restored`) is folded
+            # too, including the cleared shape that names no id.
+            restored = d.get("counterparty_restored") is True
+            if target and (d.get("new_owner_id") or d.get("new_counterparty_id")
+                           or (restored and d.get("counterparty_cleared") is True)):
+                entry = {
+                    "new_owner_id": d.get("new_owner_id"),
+                    "owed": d,  # cr1#1011, as for a Mine
+                    "new_counterparty_id": d.get("new_counterparty_id"),
+                    "new_owner_name": d.get("new_owner_name"),
+                    "new_counterparty_name": d.get("new_counterparty_name"),
+                    "confirmed": bool(d.get("confirmed")),
+                    "restored": restored,
+                    "cleared": d.get("counterparty_cleared") is True,
+                    # cr1#766: a write the board follow made with nobody
+                    # acting. It moves fields; it answers no one's question.
+                    "by_follow": str(d.get("reassigned_by") or "") == _ACTOR_MACHINE,
+                    "seq": ev.get("seq"),
+                    "idx": idx,
+                }
+                fold = reassignments.setdefault(str(target), {})
+                if d.get("new_owner_id") and not restored:
+                    fold["owner"] = entry
+                if d.get("new_counterparty_id") or restored:
+                    fold["counterparty"] = entry
+                if not restored:
+                    fold["flag"] = entry
+                elif fold.get("flag") and not fold["flag"].get("new_owner_id"):
+                    # A restore reverses a counterparty change; the flag that
+                    # change raised goes with it, as the whole-event fold did.
+                    del fold["flag"]
+        elif et == "commitment":
+            cid_ev = _commitment_id(ev)
+            commitment_by_id[cid_ev] = ev
+            status = _commitment_field(ev, "status") or "open"
+            if status in ("open", "overdue"):
+                open_evs.append(ev)
+                pid = d.get("parent_id")
+                if isinstance(pid, str) and pid.strip():
+                    child_records.append((cid_ev, ev.get("seq"), pid.strip()))
+
+    # SPEC INGESTDUP1 §D2 — one commitment id is ONE record. Two appends of
+    # one id are the same promise written twice, not two promises, and this is
+    # where that is decided (see collapse_id_twins). The child-record filter
+    # matters as much as the row fold: a sub-item whose id was appended twice
+    # registered twice against its parent, so `n_subitems_open` counted one
+    # child as two and the parent's "all sub-items done" signal could never
+    # fire.
+    open_evs, id_twin_seqs = collapse_id_twins(open_evs)
+    if id_twin_seqs:
+        _kept_child_keys = {(_commitment_id(e), e.get("seq")) for e in open_evs}
+        child_records = [r for r in child_records
+                         if (r[0], r[1]) in _kept_child_keys]
+
+    def _closed_here(cid: str, seq) -> bool:
+        """Closed iff the LATEST closure (id chain or F3 seq alias) comes
+        after the LATEST reopen (Stage D undo) — delegated to the shared
+        closure_index fold (BUG-8330 item 1)."""
+        return closure.is_closed(cid, seq)
+
+    # SUB1 fold prep — effective parent per child (merge re-point, cycle-safe)
+    # and the per-parent child roster in append order.
+    def _eff_parent(pid: str) -> str:
+        seen: set = set()
+        while pid in superseded_onto and pid not in seen:
+            seen.add(pid)
+            pid = superseded_onto[pid]
+        return pid
+
+    child_parent_eff: dict[str, str] = {}
+    children_by_parent: dict[str, list] = {}
+    for ccid, cseq, rawpid in child_records:
+        eff = _eff_parent(rawpid)
+        child_parent_eff[ccid] = eff
+        children_by_parent.setdefault(eff, []).append((ccid, cseq))
+
+    def _parse_date_head(value):
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            import datetime as _dtm
+            return _dtm.date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            return None
+
+    # BUG-8330 item 4 — pending_review re-evaluation inputs. The workspace
+    # root (for the entity-resolve check) comes from the explicit param or
+    # from the events path's own <ws>/_hq/data/events.jsonl shape; the memo
+    # is per-load (each distinct counterparty name resolves at most once).
+    _rr_ws = workspace_root
+    if _rr_ws is None:
+        try:
+            _p = Path(events_jsonl_path)
+            if _p.name == "events.jsonl" and _p.parent.name == "data" \
+                    and _p.parent.parent.name == "_hq":
+                _rr_ws = _p.parent.parent.parent
+        except Exception:
+            _rr_ws = None
+    _rr_cache: dict = {}
+
+    out: list[dict] = []
+    for c in open_evs:
+        cid = _commitment_id(c)
+        seq = c.get("seq") if isinstance(c.get("seq"), int) else None
+        if _closed_here(cid, seq):
+            continue
+        patch: dict = {}
+        # INGESTDUP1 D2 — never silent: the surviving row says how many appends
+        # of itself it stands for, and `surface_drivers._dup_fold_note` renders
+        # it. Same contract as `duplicate_fold_count`.
+        twins = id_twin_seqs.get(cid)
+        if twins:
+            patch["id_twin_count"] = len(twins) + 1
+            patch["id_twin_seqs"] = [s for s in twins
+                                     if isinstance(s, int)
+                                     and not isinstance(s, bool)]
+        if adjudicated.get(cid):
+            patch["adjudicated_at"] = adjudicated[cid]
+        # cr1#1224: the source meeting's own start, from the meeting event
+        # alone. A stored value is never trusted: no join, no field.
+        m_start = _row_meeting_start(c, meeting_starts)
+        if m_start or MEETING_START_FIELD in (c.get("data") or {}):
+            patch[MEETING_START_FIELD] = m_start
+        upd = due_updates.get(cid)
+        if upd:
+            # In-memory copy with the EFFECTIVE due — data.due is first in
+            # the alias chain, so it wins over a variant data.due_date or a
+            # flat top-level due. History on disk is untouched. (b): a
+            # cleared due projects as None — undated, like a row that never
+            # had one.
+            patch["due"] = upd["due"]
+            patch["due_updated_by_seq"] = upd["seq"]
+        hu = hint_updates.get(cid)
+        if hu:
+            # DD-6 — the park hint on the projected row (P7 shape). None
+            # means "parked once, un-parked since": the key is set to None
+            # so a reader cannot mistake an ended hint for a standing one.
+            patch["status_hint"] = hu["status_hint"]
+            patch["park_reason"] = hu["park_reason"] if hu["status_hint"] else None
+            patch["status_hint_ts"] = hu["ts"]
+            patch["status_hint_by_seq"] = hu["seq"]
+        wu = wording_updates.get(cid)
+        if wu:
+            # S4 wording fold: EFFECTIVE title/summary from the latest `fix
+            # wording` update per field. The original wording stays in
+            # history (append-only) — this is an in-memory copy only.
+            if wu.get("title"):
+                patch["title"] = wu["title"]
+                patch["title_updated_by_seq"] = wu["title_seq"]
+            if wu.get("summary"):
+                patch["summary"] = wu["summary"]
+                patch["summary_updated_by_seq"] = wu["summary_seq"]
+        # Adjudication folds, applied in APPEND ORDER (v4.6.0 S4 reassignment
+        # + v4.6.1 W4b owner-confirm / review-clear): the latest adjudication
+        # decides pending_review; owner/counterparty folds compose, later
+        # events overriding earlier ones. data.owner_id is first in the alias
+        # chain, so the patch wins over legacy owner / owner_person_id
+        # spellings.
+        adjudications = []
+        ra = reassignments.get(cid) or {}
+        for part in ("owner", "counterparty", "flag"):
+            if ra.get(part):
+                adjudications.append(("reassign_" + part, ra[part]))
+        cf = confirmations.get(cid)
+        if cf:
+            adjudications.append(("confirm", cf))
+        fs = review_flag_sets.get(cid)
+        if fs:
+            adjudications.append(("flagset", fs))
+        # Ties (one event naming several fields) keep the order above.
+        adjudications.sort(key=lambda pair: pair[1]["idx"])
+        # cr1#766: an owner someone only guessed stays a question until an
+        # owner is confirmed, whatever a later counterparty change says.
+        owner_guessed = False
+        for kind, entry in adjudications:
+            if kind == "flagset":
+                # AUTOAPPLY §4c review fix: the auto tier could not honor a
+                # stamp, so the pair goes back to being a QUESTION. Same
+                # shape the capture-time flag tier writes — pending_review +
+                # the C4 duplicate fields — reached additively.
+                patch["pending_review"] = True
+                if entry.get("reason"):
+                    patch["review_reason"] = entry["reason"]
+                if entry.get("duplicate_of"):
+                    patch["suspected_duplicate_of"] = entry["duplicate_of"]
+                if entry.get("score") is not None:
+                    patch["suspected_duplicate_score"] = entry["score"]
+                patch["review_flagged_by_seq"] = entry["seq"]
+            elif kind == "reassign_counterparty" and entry.get("restored"):
+                # POLICY1-B F-9 — a restore puts the COUNTERPARTY back (to a
+                # person, or to none) and touches nothing else: no pending
+                # flag, no question — those are other reversers' to restore,
+                # and a restore must leave the projection exactly as it was
+                # before the write it reverses.
+                if entry.get("cleared"):
+                    patch["counterparty_id"] = None   # F-9: none again
+                    patch["counterparty_name"] = None
+                else:
+                    patch["counterparty_id"] = entry.get("new_counterparty_id")
+                    patch["counterparty_name"] = entry.get("new_counterparty_name")
+                patch["reassigned_by_seq"] = entry["seq"]
+            elif kind == "reassign_owner":
+                owner_guessed = not entry["confirmed"]
+                if owner_guessed:
+                    # Stamped here as well as by the flag entry: a restore can
+                    # retire the flag entry, never the guess.
+                    patch["pending_review"] = True
+                    patch["review_reason"] = _REASSIGN_REVIEW_REASON
+                patch["owner_id"] = entry["new_owner_id"]
+                patch.update(_owed_patch(c, entry.get("owed") or {}, patch))
+                if entry.get("new_owner_name"):
+                    patch["owner_name"] = entry["new_owner_name"]
+                patch["reassigned_by_seq"] = entry["seq"]
+            elif kind == "reassign_counterparty":
+                patch["counterparty_id"] = entry["new_counterparty_id"]
+                if entry.get("new_counterparty_name"):
+                    patch["counterparty_name"] = entry["new_counterparty_name"]
+                patch["reassigned_by_seq"] = entry["seq"]
+            elif kind == "reassign_flag":
+                # An UNCONFIRMED reassignment stamps pending_review (the item
+                # sits in the unconfirmed bucket and never enters chase — no
+                # auto-email on a guessed owner); a confirmed one clears it
+                # (the reassignment IS the adjudication).
+                # PLATE1: routing the item to a person answers an open
+                # `whose_is_this` question. Keys are touched ONLY when a
+                # question is actually there — a projection with no question
+                # stays byte-identical to the pre-PLATE1 reader.
+                if (c.get("data") or {}).get("question"):
+                    patch["question"] = None
+                    patch["question_by"] = None
+                patch["reassigned_by_seq"] = entry["seq"]
+                if entry["confirmed"] and not owner_guessed:
+                    if not entry.get("by_follow") or (
+                            patch.get("review_reason") == _REASSIGN_REVIEW_REASON):
+                        patch["pending_review"] = False
+                    # else: the board moved a field, and a question someone
+                    # else raised on this row (a suspected duplicate, a
+                    # capture to confirm) is still the owner's to answer.
+                else:
+                    patch["pending_review"] = True
+                    patch["review_reason"] = _REASSIGN_REVIEW_REASON
+            elif entry.get("question_cleared"):
+                # DISOWNUNDO1 (cr1#162): the question is withdrawn; the owner
+                # is whatever the raw capture carries (none, for the item
+                # this undo exists for), and nothing else on the row moves.
+                patch["question"] = None
+                patch["question_by"] = None
+                patch["question_seq"] = None
+            elif entry.get("disown"):
+                owner_guessed = False
+                # PLATE1 P3 — `not mine`: the owner is CLEARED (not routed),
+                # and the open question rides the projection with its
+                # provenance. pending_review is untouched: the item is not an
+                # extractor's guess, it is a real item whose owner is now an
+                # open question — the plate parks it, the drain skips it.
+                patch["owner_id"] = ""
+                patch["owner_name"] = None
+                patch.update(_owed_patch(c, None, patch))  # cr1#1011: nobody owns it
+                patch["question"] = entry.get("question")
+                patch["question_by"] = entry.get("question_by")
+                patch["question_seq"] = entry["seq"]
+            else:
+                owner_guessed = False  # the owner's own answer settles it
+                # W4b Mine / Keep both: the explicit user click IS the
+                # adjudication — pending_review clears, review_reason drops;
+                # Keep both additionally clears the C4 duplicate flags
+                # (confirmed distinct — both items stay open).
+                # PLATE1: a re-own also ANSWERS an open question (keys
+                # touched only when one is there — byte-identity otherwise).
+                if (c.get("data") or {}).get("question"):
+                    patch["question"] = None
+                    patch["question_by"] = None
+                if entry.get("owner_id"):
+                    patch["owner_id"] = entry["owner_id"]
+                    patch.update(_owed_patch(c, entry.get("owed") or {}, patch))
+                    if entry.get("owner_name"):
+                        patch["owner_name"] = entry["owner_name"]
+                # cr1#771 (owner rulings A3 and 2026-11-11): a capture kept
+                # after a refusal stays unconfirmed until the OWNER confirms,
+                # drops or edits it. A machine's clear never stands for that
+                # confirm: the row keeps its question. The kept mark itself is
+                # never cleared here; a kept row counts as kept only while it
+                # is unconfirmed, so the owner's confirm makes it ordinary and
+                # the owner's undo of that confirm makes it kept again.
+                kept_machine = bool((c.get("data") or {}).get("kept_after_refusal")
+                                    and entry.get("by_machine"))
+                if not kept_machine:
+                    patch["pending_review"] = False
+                    patch["review_reason"] = None
+                    patch["owner_confirmed_by_seq"] = entry["seq"]
+                if entry.get("clear_flags"):
+                    patch["suspected_duplicate_of"] = None
+                    patch["suspected_duplicate_score"] = None
+                    patch["review_cleared_by_seq"] = entry["seq"]
+        # BUG-8330 item 4 — pending_review RE-EVALUATION (read-side, ZERO
+        # writes). The stamp froze at capture while RRF1's render overlay
+        # already showed "'X' — contact added ✓" — the row contradicted its
+        # own gating. When the EFFECTIVE state (post-adjudication) is still
+        # pending and the reason is a SOLE clause the mechanical check says
+        # no longer holds, the projection treats it as satisfied: the item
+        # leaves the unconfirmed bucket and gates like an ordinary open
+        # commitment. Annotated `review_reason_auto_satisfied` so surfaces
+        # and the reason-scoped batch verb (needs_review_queue.
+        # confirm_satisfied_reasons — the durable formalization) can see the
+        # verdict. Conservative by construction: multi-clause and unknown
+        # clause classes keep their question (review_reasons module).
+        _d_now = c.get("data") or {}
+        _eff_pending = (patch["pending_review"] if "pending_review" in patch
+                        else _d_now.get("pending_review"))
+        if _eff_pending and _rr_ws is not None:
+            _reason = (patch["review_reason"] if "review_reason" in patch
+                       else _d_now.get("review_reason"))
+            if _reason:
+                try:
+                    from review_reasons import review_reason_still_holds
+                    # PERSONLOOP1 §0-5 — the capture event travels WITH the
+                    # clause. `no resolved owner` is stamped bare and names
+                    # its subject on the row (`data.owner_external`), so a
+                    # row-blind verdict can never drain it. Passing `c` (the
+                    # capture, pre-patch) is what makes the grandfathered
+                    # rows checkable at all.
+                    if not review_reason_still_holds(_rr_ws, _reason,
+                                                     _rr_cache, row=c):
+                        patch["pending_review"] = False
+                        patch["review_reason_auto_satisfied"] = True
+                except Exception:
+                    pass
+        # WATCHGATE §2.3 — the watch stamp, additive and last-writer-wins.
+        # `data.watch` present == parked; absent == not parked. Nothing else
+        # about the row changes, which is the whole back-compat contract.
+        # cr1#1463 - the owner's notes on the item that stand, oldest first.
+        cn = [dict(n) for n in ctx_notes.get(cid, ()) if n["seq"] not in ctx_gone]
+        if cn:
+            patch["context_notes"] = cn
+        wm = watch_marks.get(cid)
+        if wm is not None:
+            if wm["watch"] is None:
+                patch["watch"] = None
+            else:
+                patch["watch"] = dict(wm["watch"])
+                patch["watch_set_by_seq"] = wm["seq"]
+        # OVERDUE1 DD-2 — the overdue-ask stamp. `data.asked` present == this
+        # item has been asked about and has not been answered; absent == it has
+        # not, or the answer already landed. Additive and last-writer-wins,
+        # and nothing else about the row moves: a reader written before this
+        # fold sees the same open commitment it always saw.
+        am = asked_marks.get(cid)
+        if am is not None:
+            if am["asked"] is None:
+                patch["asked"] = None
+            else:
+                patch["asked"] = dict(am["asked"])
+                patch["asked_set_by_seq"] = am["seq"]
+        ko = kind_overrides_by_id.get(cid) or (
+            kind_overrides_by_seq.get(seq) if seq is not None else None
+        )
+        if ko:
+            # Stage D fold: EFFECTIVE kind from the additive reclassification
+            # marker (S6 migration / S5 promote) — label change, never
+            # delete/recreate; original event untouched on disk.
+            patch["kind"] = ko["kind"]
+            patch["kind_overridden_by_seq"] = ko["seq"]
+        merged = merged_onto.get(cid)
+        if merged:
+            # C4 fold: the survivor of a merge carries the union of absorbed
+            # provenance — every source_ref except its own primary one, plus
+            # the superseded ids. In-memory copy only.
+            own_ref = (c.get("data") or {}).get("source_ref")
+            # PROV2 — "every source_ref except its own primary one" is an
+            # identity question; compared raw, a case-variant spelling of the
+            # survivor's own ref would survive the filter and read as absorbed
+            # provenance the survivor never absorbed.
+            refs = [r for r in merged["refs"]
+                    if dedup_key_of(r) != dedup_key_of(own_ref)]
+            if refs:
+                patch["merged_source_refs"] = refs
+            if merged["from"]:
+                patch["merged_from"] = list(merged["from"])
+        # MC1 receipt fold: union the accumulated per-person receipts (id +
+        # seq keyings) onto the projection, then derive the propose-closure
+        # flag over the EFFECTIVE roster (computed on the merged copy below,
+        # so it sees any reassignment fold's counterparty change).
+        rec_ids: set = set(received_ids_by_id.get(cid, set()))
+        rec_names: set = set(received_names_by_id.get(cid, set()))
+        if seq is not None:
+            rec_ids |= received_ids_by_seq.get(seq, set())
+            rec_names |= received_names_by_seq.get(seq, set())
+        if rec_ids:
+            patch["received_from"] = sorted(rec_ids)
+        if rec_names:
+            patch["received_from_names"] = sorted(rec_names)
+        # SUB1 child stamps: effective parent (merge re-pointed), the parent's
+        # effective title for "part of: […]" rendering, and the orphan flag
+        # when the parent is closed/missing (crash-window children render
+        # top-level with a "was part of" note — never vanish, D2).
+        eff_parent = child_parent_eff.get(cid)
+        if eff_parent:
+            patch["parent_id"] = eff_parent
+            parent_ev = commitment_by_id.get(eff_parent)
+            if parent_ev is not None:
+                p_wu = wording_updates.get(eff_parent) or {}
+                patch["parent_title"] = (
+                    p_wu.get("title")
+                    or _commitment_field(parent_ev, "title") or ""
+                )
+                p_status = _commitment_field(parent_ev, "status") or "open"
+                p_seq = (parent_ev.get("seq")
+                         if isinstance(parent_ev.get("seq"), int) else None)
+                if (p_status not in ("open", "overdue")
+                        or _closed_here(eff_parent, p_seq)):
+                    patch["parent_closed"] = True
+            else:
+                patch["parent_closed"] = True
+        # SUB1 parent stamps: child roster + progress + the PROPOSE-closure
+        # signal + the annotation-only next due (D-7: never folded into the
+        # parent's own data.due — a deferred parent stays deferred).
+        kids = children_by_parent.get(cid)
+        if kids:
+            open_kids = [
+                (kcid, kseq) for kcid, kseq in kids
+                if not _closed_here(
+                    kcid, kseq if isinstance(kseq, int)
+                    and not isinstance(kseq, bool) else None)
+            ]
+            patch["subitem_ids"] = [kcid for kcid, _s in kids]
+            patch["n_subitems_open"] = len(open_kids)
+            patch["n_subitems_done"] = len(kids) - len(open_kids)
+            if not open_kids:
+                # All sub-items done — PROPOSE "close it?"; never auto-close
+                # (the parent may carry residual work the children never
+                # listed — standing doctrine, mirror of MC1).
+                patch["all_subitems_resolved"] = True
+            else:
+                best_raw = None
+                best_date = None
+                for kcid, _s in open_kids:
+                    k_upd = due_updates.get(kcid)
+                    if k_upd:
+                        raw_due = k_upd["due"]
+                    else:
+                        k_ev = commitment_by_id.get(kcid) or {}
+                        raw_due = _commitment_field(k_ev, "due")
+                    kd = _parse_date_head(raw_due)
+                    if kd is not None and (best_date is None or kd < best_date):
+                        best_date = kd
+                        best_raw = raw_due
+                if best_raw is not None:
+                    patch["next_subitem_due"] = best_raw
+        if patch:
+            c = {**c, "data": {**(c.get("data") or {}), **patch}}
+        if rec_ids or rec_names:
+            # Derived, in-memory only: PROPOSE closure when every counterparty
+            # has delivered. Never a closer — the item stays open until the
+            # user closes it (PROPOSE, never auto-close).
+            from commitment_parties import all_counterparties_received as _all_rcv
+            if _all_rcv(c, workspace_root=workspace_root):
+                c["data"]["all_counterparties_received"] = True
+        out.append(c)
+    if cache_key is not None:
+        _OPEN_COMMITMENTS_CACHE[cache_key] = (sig, out)
+    return list(out)
+
+
+def split_pending_review(open_commitments: list[dict]) -> tuple[list[dict], list[dict]]:
+    """INTAKE — partition a projected open set into (confirmed, needs_review).
+
+    `needs_review` is the UNCONFIRMED-EXTRACTION queue: items the extractor
+    itself flagged (`data.pending_review`), which `_is_pending_review`
+    already bars from auto-close and chase. They are not open commitments in
+    any user-visible number or list — they live in the needs-your-call queue
+    until the user confirms or drops one.
+
+    THE seam every user-facing reader uses. `load_open_commitments` itself
+    is deliberately NOT filtered: it is the projection primitive, and the
+    write paths (close/confirm/dedup/sent-capture) must still see pending
+    rows. Order is preserved inside both halves.
+    """
+    confirmed: list[dict] = []
+    needs_review: list[dict] = []
+    for ev in open_commitments or []:
+        (needs_review if _is_pending_review(ev) else confirmed).append(ev)
+    return confirmed, needs_review
+
+
+def load_needs_review(
+    events_jsonl_path: str | Path,
+    since_ts=None,
+    *,
+    events: Optional[list] = None,
+    workspace_root=None,
+) -> list[dict]:
+    """INTAKE — the needs-your-call queue: `load_open_commitments` filtered to
+    the UNCONFIRMED extractions. Same arguments, same projection (all the
+    adjudication folds already applied, so a confirmed item is correctly
+    absent). Returns the projected event dicts, append order preserved."""
+    opens = load_open_commitments(
+        events_jsonl_path, since_ts, events=events, workspace_root=workspace_root
+    )
+    return split_pending_review(opens)[1]
+
+
+# -----------------------------------------------------------------------------
+# Kind policy layer (Phase 2 Stage D — code-enforced per the 2026-07-01
+# ratification condition: "tasks never enter CRU" is a code-level kind
+# filter, not prose)
+# -----------------------------------------------------------------------------
+
+
+def _commitment_kind(ev: dict) -> str:
+    """Effective kind of a (projected) commitment event; missing → promise
+    (read-side default, forever). Mirrors commitment_state.commitment_kind —
+    kept local to avoid a circular import."""
+    kind = (ev.get("data") or {}).get("kind")
+    return kind if isinstance(kind, str) and kind else "promise"
+
+
+def partition_subitems(open_commitments: list[dict]) -> tuple[list[dict], list[dict]]:
+    """SUB1 D2 — partition an open set into (top_level, sub_items).
+
+    An item is a SUB-ITEM iff its `data.parent_id` (the loader has already
+    re-pointed merged-away parents to their survivor) names ANOTHER item in
+    the SAME supplied set — a live parent link. An ORPHAN child (live child
+    whose parent is closed — reachable only through the cascade crash window,
+    D3) has no live link, so it partitions TOP-LEVEL: it is real open work
+    and must never vanish from the total. Every counting/chase/brief surface
+    partitions through THIS function; none re-derives the rule."""
+    ids = {_commitment_id(c) for c in (open_commitments or [])}
+    top: list[dict] = []
+    subs: list[dict] = []
+    for c in open_commitments or []:
+        pid = (c.get("data") or {}).get("parent_id")
+        if (isinstance(pid, str) and pid and pid != _commitment_id(c)
+                and pid in ids):
+            subs.append(c)
+        else:
+            top.append(c)
+    return top, subs
+
+
+def parent_blocks_auto_resolve(ev: dict) -> bool:
+    """SUB1 D3 — THE shared programmatic-closer predicate: True when a
+    (projected) commitment has open sub-items, so an automatic closure must
+    DOWNGRADE to a propose (`pending_review` recommendation) instead of
+    auto-resolving. Programmatic closers never cascade — closing a parent
+    whose steps are still open needs the user's one-line confirm. Reads the
+    loader's `n_subitems_open` stamp (0/absent → False)."""
+    n = (ev.get("data") or {}).get("n_subitems_open")
+    return isinstance(n, int) and not isinstance(n, bool) and n > 0
+
+
+def commitment_source_refs(ev: dict) -> set[str]:
+    """Every source_ref a (projected) commitment can be attributed to.
+
+    AUTOAPPLY §6 — the circularity fence needs to know "did THIS transcript
+    create this item?", and after a C4 merge the answer is spread across two
+    fields: the survivor keeps its own `data.source_ref` while the loader
+    folds the absorbed item's refs into `data.merged_source_refs`. A fence
+    reading only `source_ref` would let a merged-away self-match back
+    through. Both shape locations (`data.<>` and flat top-level) are read,
+    per shared/COMMITMENT_SCHEMA.md's multi-shape contract.
+    """
+    out: set[str] = set()
+    if not isinstance(ev, dict):
+        return out
+    d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    for holder in (d, ev):
+        ref = holder.get("source_ref")
+        if isinstance(ref, str) and ref.strip():
+            out.add(ref.strip())
+        merged = holder.get("merged_source_refs")
+        if isinstance(merged, list):
+            for r in merged:
+                if isinstance(r, str) and r.strip():
+                    out.add(r.strip())
+    return out
+
+
+def commitment_matches_source_ref(ev: dict, own_ref: Optional[str]) -> bool:
+    """RECONFENCE — True when `ev` is attributed to `own_ref`.
+
+    Layer 1 of the circularity fence in the form the SEND paths need. The
+    transcript path can compare `granola:<id>` refs literally because one
+    connector writes them one way; a MESSAGE ref reaches us in several
+    spellings for the same artifact (legacy `gmail:<Id>` at any case, the
+    structured `data.provenance` object, the `gmail_message_id` field
+    channel), so a raw `in` test lets a self-match straight back through.
+
+    Three comparisons, cheapest first:
+      1. raw membership in `commitment_source_refs` (covers `data.source_ref`,
+         the flat variant, AND a C4 merge survivor's `merged_source_refs`);
+      2. the same set compared as CANONICAL dedup keys (R16 — two spellings
+         of one artifact must reduce to one key);
+      2b. the same set compared through `is_same_artifact` with the provider
+         taken from OUR OWN key's prefix — the back-compat tolerance, scoped
+         exactly as `commitment_matches_thread_ref` scopes it one function
+         below. See SWEEPBACK below for why this comparison was needed.
+      3. the event's own canonical key, which additionally reads
+         `data.provenance` and the gmail id-field channel that
+         `commitment_source_refs` does not.
+
+    SWEEPBACK — WHY 2b EXISTS, AND WHY IT MATTERS MOST TO A MERGE SURVIVOR.
+    Comparisons 1 and 2 are exact on the provider label, so they hold only while
+    a ref and the message being scored were written under the SAME backend. The
+    caller-side BUG-3719 guard covers the cutover case — but it reads
+    `canonical_dedup_key(event=c)`, i.e. the commitment's PRIMARY ref only, and a
+    C4 merge survivor's absorbed refs live in `merged_source_refs`. So on a
+    workspace that spans a backend switch, a survivor could be closed by the very
+    message that opened the twin it swallowed: the pre-filter never looked at that
+    ref, and layer 1 saw `gmail:<id>` against a `superhuman:<id>` key and called
+    them different. Found by building the SWEEPBACK inheritance proof the spec
+    demanded rather than assuming it (non-negotiable 5), on the exact population a
+    historical sweep meets.
+
+    The tolerance is the SAME shape and the SAME scope as the thread-ref twin: for
+    a PREFIXED ref the provider comes from the incoming key's own prefix, so
+    `is_same_artifact`'s resolved branch admits that provider's key and the legacy
+    `gmail:` anchor and nothing else — rather than `None`, which would match any
+    prefix across a candidate set spanning granola, session, meeting, gcal and
+    slack. And this consumer is the fail-SAFE one: over-matching here EXCLUDES a
+    candidate from a close, so the worst case is a real completion waiting for the
+    next fire (and matching is idempotent). That is the opposite of
+    `sent_capture.already_captured`, where over-matching suppresses a capture —
+    which is why the tolerance is applied here and not there.
+
+    A PREFIX-LESS incoming ref keeps the pre-existing permissive comparison: there
+    is no provider to derive, so `own_prov` really is `None` on that one branch and
+    the native halves are compared alone. Both live callers build their key with
+    `primary_artifact_key`, which always prefixes, so that branch is unreachable
+    from the send and inbound rails. Stated because the twin states it, and because
+    the paragraph above otherwise reads as a promise the code does not make on
+    every input (review F-1).
+
+    (3) is what makes this fence STRICTLY STRONGER than the caller-side
+    BUG-3719 self-closure guard in `reconcile_sent_commitments`, and per the
+    F-54 no-resurface-derivation rule it lives HERE so every send-scoring
+    caller inherits it — not just the one caller that happens to have its own
+    guard. `own_ref` falsy → False, so the fence is inert by default.
+
+    ON THE FAIL-OPEN AT THE IMPORT (review F-2): if provenance cannot be
+    imported this degrades to comparison (1) ALONE — raw exact-spelling
+    membership, which has already run above — plus layer 2. It is not
+    unfenced, and it is not layer-2-only. What makes the fail-open SAFE
+    rather than merely tolerable is non-obvious and worth naming: the only
+    wired caller, `reconcile_sent_commitments`, imports `canonical_dedup_key`
+    at MODULE level (line 47), so a broken provenance module fails that import
+    closed and loud long before this branch could be reached. `cru_match`
+    imports it lazily, which is what creates the latent branch — so a FUTURE
+    caller that passes `send_source_ref` without a hard provenance dependency
+    would silently get the weaker comparison. Fix the import, not this line.
+    """
+    ref = (own_ref or "").strip()
+    if not ref or not isinstance(ev, dict):
+        return False
+    refs = commitment_source_refs(ev)
+    if ref in refs:
+        return True
+    try:
+        from connector_adapters.provenance import (canonical_dedup_key,
+                                                   is_same_artifact)
+    except Exception:
+        # No provenance module → raw compare above is the whole fence. Fail
+        # OPEN rather than crash the matcher: the caller-side BUG-3719 guard
+        # and the same-fire layer still stand.
+        return False
+    own_key = canonical_dedup_key(source_ref=ref)
+    if not own_key:
+        return False
+    # Our own key's two halves — the provider half is what SCOPES the
+    # back-compat tolerance to this provider plus the legacy anchor; the native
+    # half keeps every remaining segment, so a `slack:<chan>:<ts>` ref never
+    # collapses onto a bare id. Identical derivation to the thread-ref twin.
+    own_prov = own_key.split(":", 1)[0] if ":" in own_key else None
+    native = own_key.split(":", 1)[-1]
+    for r in refs:
+        cand = canonical_dedup_key(source_ref=r)
+        if cand == own_key or is_same_artifact(cand, own_prov, native):
+            return True
+    return canonical_dedup_key(event=ev) == own_key
+
+
+# RECONFENCE F-4 — the "fence itself is unusable" sentinel. Comparing every
+# candidate against the earliest representable instant excludes ALL of them,
+# because layer 2 drops anything captured at-or-after the fire start. That is
+# the maximally-fenced reading, and it is the SAFE one: the run closes and
+# proposes nothing (no writes, and the pass is idempotent so the next fire with
+# a good value does the work), rather than scoring on unfenced.
+_FIRE_START_UNUSABLE = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def _normalize_fire_start(value, param="exclude_captured_since"):
+    """RECONFENCE — normalize a fence's OWN timestamp input.
+
+    Review F-3/F-4. The first cut of this block did two things wrong, and both
+    were failures of the fence rather than of the data it fences:
+
+      F-3 — it type-checked with `hasattr(value, "tzinfo")`, which is True for
+      a NAIVE datetime. The naive value passed through untouched and then hit
+      `captured >= fire_start` against the AWARE datetime `_parse_ts` returns,
+      raising TypeError from inside the candidate loop and taking down the
+      whole matcher. A naive datetime is a legitimate input shape, so it is
+      NORMALIZED here (UTC attached, mirroring `_parse_ts`'s own defensive
+      handling) and can no longer take matching down.
+
+      F-4 — a malformed ISO string or an off-type value (an epoch int) left
+      `fire_start = None`, which SILENTLY disabled layer 2 entirely. That is
+      the AUTOAPPLY F-5 dead-rail shape: a fence present, tested, and inert.
+      It matters here because `fire_start` is LLM-produced at the SKILL.md
+      call site. Such a value now fails SAFE — the same posture layer 2 already
+      documents for an unparseable CANDIDATE ts (exclude, never admit) — and
+      says so loudly on stderr. The fence's own parameter must not fail open
+      when the data it fences fails closed.
+
+    None → None, the documented inert default, which is NOT an error: it is how
+    every pre-RECONFENCE caller asks for no layer 2 at all. An empty string is
+    deliberately NOT treated as None here — a blank where a timestamp belongs
+    is an unfilled template, which is exactly the silent fence-off F-4 is about.
+
+    SHARED BY BOTH FENCED RAILS as of F-10 (SENTMATCH): `match_send_to_commitments`
+    and `match_transcript_to_commitments` both route their layer-2 input through
+    here. The two blocks were byte-identical duplicates and the transcript one
+    still carried the defective variant; editing this function now moves both
+    rails, which is the point.
+
+    EVORDER — also the normalizer for `send_ts` / `inbound_ts` (layer 3), which
+    is why the loud message takes the parameter NAME rather than hardcoding it.
+    Before that, a malformed `send_ts` printed `exclude_captured_since=<value>`
+    and sent whoever grepped for it at the wrong knob entirely.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:                      # F-3
+            return value.replace(tzinfo=datetime.timezone.utc)
+        return value
+    if isinstance(value, str):
+        parsed = _parse_ts(value)
+        if parsed is not None:
+            return parsed
+    # F-4: unparseable string, or a type this fence cannot read at all.
+    import sys as _sys
+    print(
+        f"RECONFENCE: {param}={value!r} is not a usable "
+        f"timestamp — failing SAFE (excluding every candidate) rather than "
+        f"scoring unfenced. Pass an ISO-8601 string or a datetime.",
+        file=_sys.stderr,
+    )
+    return _FIRE_START_UNUSABLE
+
+
+def cru_eligible(open_commitments: list[dict]) -> list[dict]:
+    """Stage D policy: TASK-kind commitments NEVER enter CRU matching. The
+    matchers only make sense with a counterparty — a self-owed task can't be
+    closed by an outbound email, an inbound delivery, a transcript mention,
+    or a calendar invite; scoring them produces false auto-closes and chase
+    noise. Every match_* path filters through this ONE function; a surface
+    that hands the matchers a raw event list still gets the filter because
+    the filter lives here, not at the call sites.
+
+    SUB1 D5 — live SUB-ITEMS never enter CRU either (same mechanism): the
+    parent is the commitment of record; the counterparty cares about the
+    deliverable, not the user's step list. This also blocks the Path-1
+    failure mode where an outbound send about the deliverable auto-closes
+    one STEP on title overlap. Orphan children partition top-level and stay
+    eligible — they are real open work."""
+    top_level, _subs = partition_subitems(open_commitments or [])
+    return [c for c in top_level if _commitment_kind(c) != "task"]
+
+
+# -----------------------------------------------------------------------------
+# SENTMATCH — Path 1 closes on evidence of DELIVERY, not on title echo
+# -----------------------------------------------------------------------------
+#
+# `_overlap_coefficient`'s denominator is `min(|a|, |b|)` and an email body is
+# always the longer side, so the Path-1 score measures exactly one thing: what
+# fraction of the commitment TITLE's own words reappear in the email. Against
+# the title "Send Sam Sample the Q3 pricing deck":
+#
+#   "Hi Sam, here you go. Let me know what you think."  → 0.17, no candidate
+#   "Attaching the Q3 pricing deck as promised."        → 0.60, closes
+#
+# The email that IS the deliverable never closes; the email that merely quotes
+# the title does. Measured on the operator's real substrate (the same shape,
+# scoring 0.20 there): 73 runs scanned 1,372 sent messages and auto-closed 21
+# (1.53%); the median owned title is 8 content words, so five of them must
+# literally reappear before anything closes.
+#
+# THE FIX IS NOT A LOWER THRESHOLD. 0.333 is the measured noise floor and the
+# miss class sits at 0.20 and below, where no threshold reaches without
+# admitting noise with it. The fix is a SECOND basis for closing that does not
+# read the title as evidence at all:
+#
+#   A. DELIVERY EVIDENCE — an attachment rode along, the recipient is a
+#      counterparty of an item this user owes, and the body says it is done.
+#      Promotes only the `no_action` band (score < pending), which IS the
+#      measured miss class; the 0.30-0.55 band keeps FS-11's ambiguity-aware
+#      caller-side promotion and the >= 0.55 title path is byte-unchanged.
+#   B. THREAD PRIOR — the send happened inside the conversation the commitment
+#      was captured from. That is a connector-provided identity link, so a weak
+#      title score on THAT thread is corroboration rather than the evidence.
+#      Promotes `no_action` to `pending_review` only — the close itself still
+#      goes through FS-11's unambiguous-1:1 rule at the caller, so the existing
+#      ambiguity posture is reused rather than re-invented.
+#
+# Both bases run INSIDE the existing candidate loop, AFTER both RECONFENCE
+# layers have already dropped self-referential and same-fire candidates, so
+# fence inheritance is structural rather than re-derived (the F-54 rule).
+
+DELIVERY_BASIS = "delivery_evidence"
+THREAD_BASIS = "thread_prior"
+AMBIGUOUS_DELIVERY_BASIS = "delivery_evidence_ambiguous"
+
+
+def commitment_thread_refs(ev: dict) -> set[str]:
+    """Every THREAD-level ref a (projected) commitment can be attributed to.
+
+    SENTMATCH signal B asks "did this send happen in the conversation this
+    commitment came from?". A commitment's `source_ref` names a MESSAGE
+    (`gmail:<message_id>`, COMMITMENT_SCHEMA § source_ref) — not a thread — so
+    the thread has to come from the id channels that actually carry one:
+
+      - `thread_ref` — the canonical thread key stamped at capture by
+        `sent_capture.build_sent_commitment_event` (SENTMATCH). The
+        provider-neutral channel; the only one a non-Gmail backend fills.
+      - `provenance.thread_native_id` / `gmail_thread_id` — the two spellings
+        `connector_adapters.provenance` already owns for a thread id. Read
+        here so a commitment written by any future call site that uses the
+        shared provenance builder is covered without a second edit.
+
+    Both shape locations (`data.<>` and flat top-level) are read, per
+    COMMITMENT_SCHEMA's multi-shape contract. Values are returned RAW; the
+    caller canonicalizes, so one spelling of a thread never masquerades as a
+    different thread.
+    """
+    out: set[str] = set()
+    if not isinstance(ev, dict):
+        return out
+    d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    for holder in (d, ev):
+        if not isinstance(holder, dict):
+            continue
+        for key in ("thread_ref", "gmail_thread_id"):
+            v = holder.get(key)
+            if isinstance(v, str) and v.strip():
+                out.add(v.strip())
+        prov = holder.get("provenance")
+        if isinstance(prov, dict):
+            v = prov.get("thread_native_id")
+            if isinstance(v, str) and v.strip():
+                provider = prov.get("provider")
+                out.add(f"{provider}:{v.strip()}" if provider else v.strip())
+    return out
+
+
+def commitment_matches_thread_ref(ev: dict, thread_ref: Optional[str]) -> bool:
+    """True when `ev` was captured inside the conversation `thread_ref` names.
+
+    Two channels, both compared as CANONICAL dedup keys (R16 — two spellings
+    of one artifact must reduce to one key, and a raw `in` test lets a
+    differently-cased thread id read as a different thread):
+
+      1. the commitment's own thread refs (`commitment_thread_refs`);
+      2. the commitment's SOURCE refs. This fires when the item was captured
+         from the message that OPENED the thread — on Gmail a thread's id is
+         the id of its first message, so `gmail:<thread>` and the capture's
+         `gmail:<first message>` reduce to the same key. It is a no-op on a
+         backend where the two id spaces are disjoint, which is the correct
+         behavior there: no claim is made, so nothing matches.
+
+    A thread hit is a PRIOR, never a closure on its own — the caller still
+    requires a non-zero title score before the candidate leaves `no_action`.
+    `thread_ref` falsy → False, so signal B is inert by default.
+
+    TRAINFIX (MAILSEAM residual 3): the compare is PROVIDER-LABEL TOLERANT.
+    Both callers now build their key with `primary_artifact_key(provider, …)`
+    rather than a `gmail` literal, so on a Superhuman workspace the key reads
+    `superhuman:<thread>` — while `thread_ref` rows stamped before the backend
+    was declared (and every row `sent_capture` wrote pre-MAILSEAM) carry the
+    legacy `gmail:` anchor. One thread, two labels. A single-key compare would
+    silently stop matching the moment a workspace declares a backend, which is
+    the same shape as the guard MAILSEAM just fixed one function over.
+
+    THE TOLERANCE IS SCOPED TO THE BACK-COMPAT CASE, AND ONLY THAT (review
+    F-1). The provider is taken from the INCOMING key's own prefix, never left
+    unresolved: `is_same_artifact`'s resolved branch matches `{provider}:{id}`
+    OR the legacy `gmail:` anchor, which is precisely and only the population
+    this tolerance exists for. The first cut passed `None`, which matches ANY
+    prefix — and the candidate set is `commitment_thread_refs(ev) |
+    commitment_source_refs(ev)`, whose source-ref half spans granola, session,
+    meeting, gcal, slack and a dozen more. So a `granola:<uuid>` ref would have
+    anchored a mail reply carrying the same native id. That matters HERE more
+    than on the send rail: Path 4's R1 turns a thread hit into `auto_resolve`
+    with no title floor, while Path 1's signal B only ever reaches
+    `pending_review` and additionally requires `score > 0.0`. Measured exposure
+    on the reference substrate was zero (0 cross-provider thread-id collisions;
+    the 4 cross-source native-id collisions were all granola/meeting UUID
+    pairs, none involving a mail id) — so this is a tightening, not a repair,
+    and it closes the class by construction rather than by id-namespace luck.
+
+    THE RESIDUAL TRADE, NAMED (see `is_same_artifact`'s own per-consumer note):
+    within one provider label plus the legacy anchor this is still the
+    OVER-matching direction, and unlike the self-ref fence this consumer can
+    CLOSE rather than merely decline to. What bounds it now: a false positive
+    needs the SAME provider (or the legacy `gmail:` anchor) to mint the
+    identical id under two different threads, and the thread hit is one
+    conjunct among several — the reply must also come from the item's owner,
+    carry completion language or the artifact the item asked for, not be a
+    reschedule, and survive the one-reply-one-delivery ambiguity guard.
+
+    A prefix-less incoming ref keeps the pre-existing permissive comparison
+    (there is no provider to derive). Both live callers build their key with
+    `primary_artifact_key`, which always prefixes, so that branch is
+    unreachable from the send and inbound rails.
+    """
+    ref = (thread_ref or "").strip()
+    if not ref or not isinstance(ev, dict):
+        return False
+    try:
+        from connector_adapters.provenance import (canonical_dedup_key,
+                                                   is_same_artifact)
+    except Exception:
+        # No provenance module → the thread prior cannot be established
+        # honestly, so it does not fire. Fail CLOSED: signal B only ever ADDS
+        # closure power, so its unavailable state must add none.
+        return False
+    own_key = canonical_dedup_key(source_ref=ref)
+    if not own_key:
+        return False
+    # Our own key's two halves. The PROVIDER half is what scopes the
+    # tolerance: handing it to `is_same_artifact` admits that provider's key
+    # and the legacy `gmail:` anchor and nothing else. The NATIVE half — a
+    # bare key is its own native id; a multi-segment key keeps its remaining
+    # segments, so a `slack:<chan>:<ts>` ref never collapses onto a bare id.
+    own_prov = own_key.split(":", 1)[0] if ":" in own_key else None
+    native = own_key.split(":", 1)[-1]
+    for r in commitment_thread_refs(ev) | commitment_source_refs(ev):
+        cand = canonical_dedup_key(source_ref=r)
+        if cand == own_key or is_same_artifact(cand, own_prov, native):
+            return True
+    return False
+
+
+def _delivery_counterparty_hit(d: dict, recipient_set: set,
+                               recipient_name_tokens: set,
+                               party_ids: set, owner_id: str) -> bool:
+    """SENTMATCH signal A's counterparty conjunct — is this send going to the
+    person the item is owed TO?
+
+    DELIBERATELY NARROWER than the candidacy gate that admitted the candidate.
+    That gate has three routes and one of them is the Bug #103 recall
+    fallback: a recipient NAME TOKEN appearing in the commitment TITLE. That
+    route is right for candidacy (it only opens the door; the score still
+    decides) and wrong here, because signal A closes without reading the
+    title — "Send Sam the deck" plus any attachment to any Sam would close it.
+    A name in a title is not a statement about who is owed.
+
+    The two routes that ARE statements about who is owed:
+      - a RESOLVED recipient who is a party to the item and is not its owner.
+        Covers the Stage-E `counterparty_id(s)` receipt (already unioned into
+        `party_ids` by the caller) AND every pre-Stage-E commitment, which
+        carry the counterparty in `person_ids` and nothing else — excluding
+        those would leave the new basis dead on all historic items.
+      - a recipient name token matching a free-text `counterparty_name(s)`
+        receipt — the extractor naming a counterparty it could not resolve.
+        Still an explicit counterparty assertion, unlike the title route.
+    """
+    from commitment_parties import counterparty_names as _cp_names_local
+    if recipient_set & (set(party_ids) - {owner_id}):
+        return True
+    if recipient_name_tokens:
+        for nm in _cp_names_local(d):
+            if recipient_name_tokens & set(_tokenize(nm)):
+                return True
+    return False
+
+
+def addressed_to_counterparty(d: dict, recipient_set: set,
+                              recipient_name_tokens: set, party_ids: set,
+                              owner_id: str, title: str,
+                              sender_name_tokens: set = frozenset()) -> bool:
+    """SELFMAIL1 — did this send actually go TO the person the row is owed to?
+
+    THE RULING (M, 2026-09-07, after a note he mailed to himself closed two
+    real promises): a fact-proved close happens wherever the product notices
+    it, and on the mail rail a fact means THE MESSAGE WENT TO THE
+    COUNTERPARTY. Anything not addressed to the counterparty is neither a
+    close nor a proposal.
+
+    The candidacy gate below is deliberately wide — its job is only to open the
+    door, and the score decides. What it could not see is that one of its three
+    routes is satisfiable BY THE SENDER: a commitment's `person_ids` carries
+    its owner, so a message addressed to the user matched every row the user
+    owns, and the title score alone then closed the two that echoed loudest.
+    This is the same question `_delivery_counterparty_hit` already asks of
+    signal A, asked of the title-graded closes too — GRADING, not candidacy,
+    so the diagnostic row still exists and says `no_action`.
+
+    The routes, all of them requiring SOMEBODY OTHER THAN THE USER:
+      1 + 2. `_delivery_counterparty_hit` — a resolved recipient who is a
+        party to the item and is not its owner, or a recipient name matching a
+        free-text `counterparty_name` receipt. Reused verbatim, not restated.
+      3. the Bug #103 recall fallback — a recipient name token in the row's
+        TITLE ("Send Bowie Stone the recap" mailed to Bowie Stone). RIGHT here
+        and wrong for signal A: signal A closes without reading the title, so
+        a name in a title is not a statement about who is owed; a title-graded
+        close IS the title being read, and M's ruling names it — "moderate =
+        to the counterparty by title". The sender's OWN name tokens are
+        subtracted from THIS route only, so your own name in your own title
+        can never make a note to yourself read as a delivery.
+
+    WHERE THE SENDER'S TOKENS ARE SUBTRACTED, AND WHERE THEY ARE NOT (review
+    F-4). The first cut handed the SUBTRACTED set to route 2 as well, and that
+    quietly REVOKED closes the strong route had already earned: a row whose
+    free-text `counterparty_name` shares its only long-enough token with the
+    sender ("Bowie Stone" against a sender called "Sample Stone") lost a
+    delivery-evidence close on a send that really did carry the deliverable to
+    the person the row was owed to — and M's ruling names that exact route as
+    the strong one. Handing route 2 the RAW set instead is the other half of
+    the same mistake: on a note to yourself every recipient name IS the
+    sender, and "Sample Creations" then matches "Operator Sample" on the token
+    they share, which is layer 2 letting through the very class layer 1 exists
+    to stop (the builder's own fixture caught that).
+
+    So the question is asked of the message, once, before either name route:
+    IS EVERY RECIPIENT NAME ON THIS MESSAGE THE SENDER'S OWN? If it is, the
+    name channel is looking at the sender and may not speak for anybody — both
+    name routes go quiet and only the resolved-id route (which already
+    excludes the owner) can answer. If it is NOT, there is a real other
+    recipient on the message, the shared token is as likely theirs as the
+    sender's, and route 2 gets the raw set — which is `_delivery_counterparty_hit`
+    exactly, so on every message that went to somebody this predicate is a
+    genuine superset of the conjunct signal A already carries and the gate
+    below can only take away title- and thread-graded rows. Route 3 keeps the
+    subtraction either way: a name in a title the sender wrote himself is
+    never a statement about who is owed.
+
+    A row with no counterparty on record and no recipient named in its title
+    can no longer be closed by sent mail at all. That is the intended
+    narrowing: nothing anyone mails can prove such a row done (EXIT1 routes 2
+    and 3 — your own word, and silence — are what close those)."""
+    all_names = set(recipient_name_tokens or ())
+    sender = set(sender_name_tokens or ())
+    # The name channel can only speak for a recipient who is not the sender.
+    names = set() if (all_names and sender and all_names <= sender) else all_names
+    if _delivery_counterparty_hit(d, recipient_set, names,
+                                  party_ids, owner_id):
+        return True
+    # Route 3 keeps the subtraction: your own name in your own title is not a
+    # statement about who the row is owed to.
+    others = names - sender
+    if others and others & set(_tokenize(title)):
+        return True
+    return False
+
+
+# -----------------------------------------------------------------------------
+# Path 1 — match an outbound send to open commitments
+# -----------------------------------------------------------------------------
+
+
+def _sender_tokens_from_workspace(workspace_root, sender_person_id) -> set:
+    """SELFMAIL1 fix round 2 — THE CALLER CANNOT FORGET THIS ARGUMENT.
+
+    `addressed_to_counterparty` subtracts the sender's own name tokens from
+    the title route, so "Operator Sample to send the pricing deck" mailed by
+    Operator Sample cannot read as a delivery to Operator Sample. The
+    reviewer measured what happens when a caller passes `recipient_names`
+    and omits the tokens: the title route opens back up to the user's own
+    name and the row grades `auto_resolve` — the whole 2026-09-07 regression,
+    reachable by any future caller who simply did not know the keyword
+    existed. A fence that depends on every caller remembering it is not a
+    fence.
+
+    Making the argument REQUIRED would break the two shipped prose call sites
+    (`apply-choices` and `orchestrator-commitments` Phase 2.5) that pass
+    recipient ids and no names, and displacing a shipped signature is not
+    something this lane does. So the function fills it in instead: when a
+    caller hands over recipient NAMES, a workspace, and no tokens, the tokens
+    are read from the workspace — the same `own_name_tokens` the sent rail
+    resolves for itself.
+
+    ONLY WHEN THE SENDER IS THE WORKSPACE'S OWN USER. `own_name_tokens`
+    answers for the primary user and nobody else, so on a send from anyone
+    else it would subtract the wrong person's name and cost a real close.
+    Both reads happen only on the omitted-argument path, so the sent rail —
+    which passes the tokens it already resolved once per run — reads nothing
+    extra and review F-7 stands. Read-only, never raises into a caller: a
+    workspace that cannot answer returns the empty set, which is exactly the
+    behaviour every pre-SELFMAIL1 caller already had.
+    """
+    if not workspace_root or not sender_person_id:
+        return set()
+    try:
+        from primary_user import resolve_primary_user
+
+        if resolve_primary_user(workspace_root) != sender_person_id:
+            return set()
+        from contact_capture import own_name_tokens
+
+        toks = {str(t).strip().lower()
+                for t in (own_name_tokens(workspace_root) or set())}
+        toks.discard("")
+        return toks
+    except Exception:  # pragma: no cover — both reads are optional
+        return set()
+
+
+def _file_is_item(open_commitments, body, attachment_names, sender_person_id,
+                  recipient_set, recipient_name_tokens, workspace_root=None):
+    """cr1#980 — the id of the one open row a sent message's FILE delivers,
+    else None. Pure, never raises.
+
+    Graded by `delivery_evidence.delivery_strength` over the message's own
+    words and its file names (the inbound rule of cr1#764; the subject is
+    left out there because a reply echoes it, and is left out here for the
+    same reason). Only rows the sender owes these recipients compete, by the
+    same three tests the matcher's candidacy gate uses. The best grade wins
+    only when it is above zero and above every other row's: no names, no fit,
+    or a tie (two rows the file fits equally, or names that differ by one
+    letter, which the grader does not tell apart) all answer None, so the
+    title path proposes instead of closing (owner ruling 2026-11-19)."""
+    names = [str(n) for n in (attachment_names or ()) if str(n or "").strip()]
+    if not names:
+        return None
+    try:
+        from commitment_parties import (counterparty_ids as _cp_ids,
+                                        counterparty_names as _cp_names)
+        from delivery_evidence import asks_for_delivery, delivery_strength
+        grades: dict = {}
+        for ev in cru_eligible(open_commitments):
+            if _commitment_field(ev, "owner_id") != sender_person_id:
+                continue
+            d = ev.get("data") or {}
+            pids = set(ev.get("person_ids") or []) | set(d.get("person_ids") or [])
+            pids.update(_cp_ids(d))
+            title = _commitment_field(ev, "title") or ""
+            # RAW on purpose (F-28 sanctioned): the same spelling the Path 1
+            # candidacy gate reads, so every row the matcher can score also
+            # competes for the file. Widening only adds rivals, which can only
+            # turn a close into a proposal (review of cr1#980).
+            cp_names = list(_cp_names(d))
+            if not (recipient_set & pids
+                    or recipient_name_tokens & set(_tokenize(title))
+                    or recipient_name_tokens & set(_tokenize(" ".join(cp_names)))):
+                continue
+            parties = cp_names + sorted(recipient_name_tokens)
+            grade = (delivery_strength(str(body or ""), names, title, parties)
+                     if asks_for_delivery(title, parties) else 0)
+            cid = _commitment_id(ev)
+            grades[cid] = max(grade, grades.get(cid, 0))
+        if not grades:
+            return None
+        best = max(grades.values())
+        winners = [cid for cid, g in grades.items() if g == best]
+        return winners[0] if best > 0 and len(winners) == 1 else None
+    except Exception:  # noqa: BLE001 - what cannot be graded proves nothing
+        return None
+
+
+def match_send_to_commitments(
+    *,
+    open_commitments: list[dict],
+    sender_person_id: str,
+    recipient_person_ids: Iterable[str],
+    subject: Optional[str],
+    body: Optional[str],
+    recipient_names: Optional[Iterable[str]] = None,
+    sender_name_tokens: Optional[Iterable[str]] = None,
+    workspace_root=None,
+    send_source_ref: Optional[str] = None,
+    exclude_captured_since=None,
+    has_attachment: bool = False,
+    require_title_proof: bool = True,
+    send_thread_ref: Optional[str] = None,
+    send_ts=None,
+    diagnostics: Optional[dict] = None,
+    attachment_names: Optional[Iterable[str]] = None,
+) -> list[dict]:
+    """Path 1 — score an outbound send against open commitments.
+
+    THE CIRCULARITY FENCE (RECONFENCE — the AUTOAPPLY §6 fence, mirrored onto
+    the send-scoring path; both layers here so every caller inherits them per
+    the F-54 no-resurface-derivation rule):
+
+      1. `send_source_ref` — the ref of the message being scored (e.g.
+         `gmail:<id>`). Any candidate attributed to that same ref is dropped
+         BEFORE scoring, via `commitment_matches_source_ref`, which compares
+         raw refs, canonical dedup keys, AND `merged_source_refs` (a C4 merge
+         survivor keeps its own `source_ref` while the absorbed item's refs
+         move to `merged_source_refs` — so the survivor of a merge that
+         swallowed THIS message's capture resolves to a different key and
+         sails past a single-key check). Self-evidence is not evidence.
+
+      2. `exclude_captured_since` — an ISO timestamp (or datetime) marking
+         the START of this fire. Candidates captured at or after it are
+         same-fire siblings: one orchestrator fire captures in an early phase
+         and scores sent mail in a later one, so the two share an extraction
+         context and are ONE source, not two (AUTOAPPLY §2's independence
+         rule). No ref relationship exists between them, so layer 1 is blind
+         to this case by construction.
+
+    WHY A CAPTURE-TIME FENCE IS SOUND ON A PATH WITH NO COMPLETION GATE:
+    unlike Path 3, sending IS the fulfillment here, so a send genuinely can
+    complete a commitment captured minutes earlier. Layer 2 does not touch
+    that — it excludes only what THIS FIRE wrote; anything predating the fire
+    stays fully matchable. An unparseable capture ts fails SAFE (excluded): a
+    candidate whose age we cannot establish is not independent evidence.
+
+    Both default to None = pre-RECONFENCE behavior, byte-identical, so every
+    existing caller and test is unaffected. Measured basis: the v5.4.0
+    attended dogfood (2026-07-28) saw 3 self-referential proposals on this
+    path, worst case a commitment written at 14:38 questioned at 14:40; on
+    the regression fixture the unfenced path AUTO-CLOSES both self-matches at
+    score 0.8 rather than merely proposing them.
+
+    Filters open_commitments to those where:
+      - `data.owner_id` == sender_person_id (the user owes this)
+      - the recipient is involved — EITHER a resolved recipient person_id is in
+        the commitment's `person_ids`, OR a recipient name token appears in the
+        commitment title (the recall fallback, Bug #103).
+
+    Then scores subject+body against each candidate's title.
+
+    `recipient_names` (Bug #103 — real-data recall fix): display names and/or
+    email local-parts of the recipients (e.g. "Sam" plus the local-part "sam"
+    taken from an address like sam@<domain>; or "Bowie Stone" plus "bstone"). Commitment extraction frequently fails to LINK the
+    counterparty into `person_ids` (some commitments were stored with only the
+    user) or the counterparty person has no email on file, so the resolved-
+    person_id gate alone misses real completions. Titles almost always name the
+    recipient ("Send Sam a recap", "Send Bowie Stone a product summary"), so a
+    recipient-name token appearing in the title opens the candidacy gate. The
+    score_match threshold still decides the recommendation, which keeps false
+    positives down — a name in the title only makes the commitment a candidate;
+    the subject/body must still overlap it.
+
+    SENTMATCH — THE TWO NON-TITLE CLOSURE BASES (see the block above this
+    function for the measurement they come from):
+
+    `has_attachment` (signal A) — the connector's attachment flag for THIS
+    message. Absent/False means "no evidence", never "unknown but probably" —
+    a missing signal must not manufacture a closure, so the default leaves
+    signal A dead. Combined with a counterparty receipt and completion
+    language, it promotes a `no_action` candidate straight to auto_resolve:
+    the send IS the fulfillment on this path, and the deliverable rode along.
+
+    `attachment_names` (cr1#980) — the file names the connector reported for
+    THIS message. On the title path a file proves a close only when it IS the
+    item: `delivery_evidence` grades it above zero for this row and above
+    every other open row owed to the same recipients (the inbound rule of
+    cr1#764). No names, or a tie, proves nothing, so the row is a proposal.
+    Each result carries the finding as `attachment_is_item`, which the
+    caller's moderate promotion reads as well (owner ruling 2026-11-19).
+
+    `send_thread_ref` (signal B) — the ref of the CONVERSATION this message
+    sits in (`gmail:<thread_id>`, canonicalized by the caller, exactly like
+    `send_source_ref`). A commitment captured inside that thread gets its
+    candidacy floor lowered to "any non-zero title overlap" — the thread id is
+    the evidence, the score is corroboration. It promotes to pending_review
+    only; the close still runs through FS-11's unambiguous-1:1 rule at the
+    caller, so a thread carrying several open items produces confirms, not a
+    burst of closures. None → inert.
+
+    NEITHER basis widens the candidacy gate above (owner + recipient), and
+    NEITHER lowers `_hi` / `_pend`. Both run after both RECONFENCE layers.
+
+    SELFMAIL1 — THE SEND MUST HAVE GONE TO THE COUNTERPARTY. After the grade is
+    settled, `addressed_to_counterparty` has the last word: a row the message
+    was not addressed to drops to `no_action`, so it is neither closed nor
+    proposed. `sender_name_tokens` (the caller's own name and mail local-parts)
+    is subtracted from that predicate's title route, so the SENDER's own name
+    in a title can never stand in for the counterparty. OMIT IT AND IT IS
+    FILLED IN: a caller that passes `recipient_names` with a `workspace_root`
+    and no tokens has them read from the workspace, because a fence every
+    caller has to remember is not a fence (fix round 2). Pass an explicit
+    empty iterable to say there are none. With no workspace to read, or a
+    sender who is not the workspace's own user, the route behaves exactly as
+    it did before.
+
+    Returns a list of `{commitment_id, score, recommendation, title}` dicts,
+    sorted by score descending. recommendation is one of:
+      - "auto_resolve" (score >= HIGH_CONFIDENCE_THRESHOLD, or SENTMATCH
+        signal A on a sub-pending candidate)
+      - "pending_review" (PENDING_REVIEW_THRESHOLD <= score < HIGH, or
+        SENTMATCH signal B on a sub-pending candidate)
+      - "no_action" (filtered out — caller can ignore these but they're
+        included for diagnostic logging)
+    Rows also carry `close_basis`: "" for the title path, `DELIVERY_BASIS`,
+    `THREAD_BASIS`, or `AMBIGUOUS_DELIVERY_BASIS` (signal A that matched more
+    than one item on one send — downgraded to a confirm).
+    """
+    if not sender_person_id:
+        return []
+    _hi, _pend = _match_thresholds(workspace_root)
+    recipient_set = {r for r in recipient_person_ids if r}
+    # Recipient-name tokens (>=3 chars) for the title fallback (Bug #103).
+    recipient_name_tokens: set[str] = set()
+    for n in (recipient_names or []):
+        for tok in _tokenize(n):
+            if len(tok) >= 3:
+                recipient_name_tokens.add(tok)
+    # SELFMAIL1 — the tokens that mean "the sender". Subtracted from the title
+    # route in `addressed_to_counterparty` so a send whose only recipient name
+    # is the user's own can never satisfy it. None/absent → empty → the route
+    # behaves exactly as it did before for every caller that does not pass it.
+    sender_tokens: set[str] = {str(t).strip().lower()
+                               for t in (sender_name_tokens or [])}
+    sender_tokens.discard("")
+    # SELFMAIL1 fix round 2 — a caller that hands over NAMES and forgets the
+    # tokens gets them read from the workspace rather than getting the title
+    # route back. `None` is "I did not say"; an explicit empty iterable is "I
+    # said, and there are none", and is left alone.
+    if sender_name_tokens is None and recipient_name_tokens and workspace_root:
+        sender_tokens = _sender_tokens_from_workspace(
+            workspace_root, sender_person_id)
+    # Need SOME recipient signal — either resolved ids or names — or we can't
+    # attribute the send to anyone.
+    if not recipient_set and not recipient_name_tokens:
+        return []
+
+    query = (subject or "") + " " + (body or "")
+    results: list[dict] = []
+
+    # SENTMATCH signal A — the two body-level conjuncts, computed once. A
+    # schedule shift is the explicit NEGATIVE: "attaching the old deck, the
+    # updated one is pushed to Friday" carries an attachment AND completion
+    # language AND is not a delivery. It only blocks the new basis; the title
+    # path is graded by its own gate below (CLOSETRUTH1 3.1).
+    has_completion = detect_completion_signal(query)
+    has_schedule_shift = detect_schedule_shift_signal(query)
+    delivery_body_ok = bool(has_attachment) and has_completion and not has_schedule_shift
+    # CLOSETRUTH1 3.1 — computed ONCE per message, beside the other body-level
+    # signals, and read by the title-path gate below.
+    question_shaped = is_question_shaped(query)
+
+    # RECONFENCE fence prep. `own_ref` empty / `fire_start` None → the fence
+    # is inert and every pre-RECONFENCE call behaves byte-identically.
+    own_ref = (send_source_ref or "").strip()
+    # F-3/F-4: a naive datetime is normalized (never crashes the loop); an
+    # unusable value fails SAFE and loud instead of silently fencing nothing.
+    fire_start = _normalize_fire_start(exclude_captured_since)
+    # EVORDER — the SEND's own time. Layer 2 fences against the start of this
+    # FIRE, which is a different question: a commitment captured before the
+    # fire but AFTER the message sails past it. `None` → inert.
+    evidence_at = _normalize_fire_start(send_ts, "send_ts")
+    _promise_tz = promise_tz(workspace_root)  # cr1#744: once per pass
+    # cr1#980 — which open row, if any, the FILE is. Graded once per message,
+    # over every open row owed to these recipients (fenced rows included: a
+    # row the fences drop still competes for the file, the cautious side).
+    file_is = _file_is_item(open_commitments, body, attachment_names,
+                            sender_person_id, recipient_set,
+                            recipient_name_tokens, workspace_root,
+                            ) if has_attachment else None
+
+    for ev in cru_eligible(open_commitments):  # Stage D: tasks never enter CRU
+        # Layer 1 — a send can never corroborate a conclusion about an item
+        # it created. Dropped before scoring, so the row is NEVER CREATED
+        # rather than created-then-suppressed.
+        if own_ref and commitment_matches_source_ref(ev, own_ref):
+            continue
+        # Layer 2 — same-fire captures share one extraction context, so they
+        # are one source. An unparseable capture ts fails SAFE (excluded). The
+        # promise's own time decides (`promise_time_raw`): a task row came off
+        # its board, not out of this fire's reading, so its item's own day
+        # counts (cr1#752), and a meeting row captured late stands at the end
+        # of its meeting's local day (cr1#744). Neither is a sibling of this
+        # mail.
+        if fire_start is not None:
+            captured = _parse_ts(promise_time_raw(ev, _promise_tz))
+            if captured is None or captured >= fire_start:
+                continue
+        if _commitment_field(ev, "owner_id") != sender_person_id:
+            continue
+        _d = ev.get("data") or {}
+        person_ids = set(ev.get("person_ids") or []) | set(_d.get("person_ids") or [])
+        # Stage E (F5) extraction receipts: the counterparty the extractor
+        # linked at capture feeds the candidacy gate DIRECTLY — the structural
+        # fix for the Bug #103 recall class (the title-token fallback below
+        # stays for historic events that never got a receipt). MC1: union the
+        # FULL counterparty roster (legacy single + counterparty_ids list) so a
+        # send to ANY of a multi-counterparty commitment's people is a
+        # candidate.
+        from commitment_parties import (
+            counterparty_ids as _cp_ids,
+            counterparty_names as _cp_names,
+            has_multiple_counterparties as _multi_cp,
+        )
+        person_ids.update(_cp_ids(_d))
+        title = _commitment_field(ev, "title") or ""
+        counterparty_name = " ".join(_cp_names(_d))
+        # Recipient is involved if a resolved id is in person_ids (incl. the
+        # Stage E counterparty receipt) OR a recipient name token appears in
+        # the title (the #103 recall fallback) OR matches the free-text
+        # counterparty_name receipt (Stage E — named-but-unresolved people).
+        recipient_in_pids = bool(recipient_set & person_ids)
+        recipient_in_title = bool(recipient_name_tokens & set(_tokenize(title)))
+        recipient_in_cp_name = bool(
+            counterparty_name
+            and recipient_name_tokens & set(_tokenize(counterparty_name))
+        )
+        if not (recipient_in_pids or recipient_in_title or recipient_in_cp_name):
+            continue
+        # Layer 3 (EVORDER) — a send cannot be evidence for a promise that did
+        # not exist when it was sent. Path 5 has carried this guard since
+        # SENTMATCH (`match_calendar_to_commitments`); Paths 1 and 4 never did,
+        # and F-11 measured four false closes on the operator's real substrate
+        # from the gap — including one item still open and overdue days after
+        # it was "closed". Dropped before scoring, like the other two layers.
+        #
+        # PLACEMENT: below the owner and recipient gates, unlike layers 1 and 2
+        # which sit at the top of the loop. Two reasons, and the review that
+        # caught this was right on both. (a) The COUNT has to mean something: up
+        # top it fired once per (message x every open commitment newer than that
+        # message) regardless of owner or recipient, so a single 24h-old send
+        # against the operator's substrate reported ~46 "drops" and a 20-message
+        # fire reported high hundreds — a number that cannot serve as the
+        # negative-control signal the spec asked it to be. (b) It saves a
+        # `fromisoformat` per irrelevant candidate. Fencing power is unchanged:
+        # a candidate the owner or recipient gate already dropped never produced
+        # a row for layer 3 to prevent.
+        #
+        # Asymmetric on purpose, and the absent-vs-malformed split matters on
+        # BOTH sides — this module's own presence-test doctrine ("`False` is the
+        # connector answering, an absent key is the connector never being
+        # asked"):
+        #   * `send_ts` ABSENT (None) → `evidence_at is None` → INERT. A fence
+        #     that cannot judge ordering must not exclude, and a provider that
+        #     carries no send times must not lose closure entirely.
+        #   * `send_ts` PRESENT but unusable → `_normalize_fire_start` fails SAFE
+        #     and LOUD (warns, excludes everything). Someone handed us a value
+        #     and it is junk; for a CLOSURE engine "close nothing" is the
+        #     conservative direction, and silently switching the guard off is the
+        #     exact failure class this release exists to eliminate.
+        #   * strict `>`, not `>=`: capture == send is the "captured from this
+        #     very message" case, which layer 1 already owns by ref.
+        #   * capture time ABSENT → inert for that candidate, NOT excluded. A
+        #     commitment with no capture time cannot exhibit this defect (it
+        #     needs a capture NEWER than the send), and excluding it would
+        #     silently stop closing every ts-less item — a behavior change far
+        #     wider than the bug. Measured: 683/683 real commitment events carry
+        #     a parseable `ts`, so this branch is belt-and-braces, and 10 shipped
+        #     tests assert the ts-less item still closes.
+        #   * capture time PRESENT but unparseable → exclude, mirroring layer 2.
+        if evidence_at is not None:
+            _raw_captured = promise_time_raw(ev, _promise_tz)  # cr1#744: the promise's own time
+            if _raw_captured:
+                captured = _parse_ts(_raw_captured)
+                if captured is None or captured > evidence_at:
+                    if isinstance(diagnostics, dict):
+                        diagnostics["stale_evidence_dropped"] = (
+                            diagnostics.get("stale_evidence_dropped", 0) + 1)
+                    continue
+            if _adjudicated_since(ev, evidence_at):  # cr1#740: already answered
+                if isinstance(diagnostics, dict):
+                    diagnostics["stale_evidence_dropped"] = (
+                        diagnostics.get("stale_evidence_dropped", 0) + 1)
+                continue
+        score = score_match(query, title)
+        if score >= _hi:
+            rec = "auto_resolve"
+        elif score >= _pend:
+            rec = "pending_review"
+        else:
+            rec = "no_action"
+        # SENTMATCH — the two non-title bases, applied ONLY to the `no_action`
+        # band. That band is the measured miss class (the deliverable email
+        # lands at 0.20 and below); everything at or above `_pend` keeps the
+        # behavior it has today, including FS-11's ambiguity-aware promotion
+        # at the caller, so neither basis can silently re-grade an existing
+        # match.
+        basis = ""
+        if rec == "no_action":
+            if delivery_body_ok and _delivery_counterparty_hit(
+                    _d, recipient_set, recipient_name_tokens,
+                    person_ids, sender_person_id):
+                # A deliverable was delivered. A SCHEDULING commitment ("set
+                # up a call with <name>") is not deliverable by attachment —
+                # a booked calendar event closes those (Path 5), so they are
+                # ineligible here rather than closable by any file at all.
+                if not detect_scheduling_intent(title):
+                    rec = "auto_resolve"
+                    basis = DELIVERY_BASIS
+            elif (send_thread_ref and score > 0.0
+                    and commitment_matches_thread_ref(ev, send_thread_ref)):
+                rec = "pending_review"
+                basis = THREAD_BASIS
+        # CLOSETRUTH1 3.1 (M's ruling 2, 2026-09-13) — THE TITLE PATH IS A
+        # GUESS. M's 09-03 ruling 1 closes a guess that carries a COMPLETION
+        # SIGNAL; a bare title echo is not one, and a mail that ASKS proves
+        # nothing at all. So a title-graded auto_resolve (`basis == ""`) now
+        # needs one of the two things that make a send evidence — completion
+        # language or an attachment — and a question-shaped mail never gets
+        # there however well its words overlap a title. It is a DOWNGRADE to
+        # `pending_review`, never a drop: the match still reaches the person
+        # as a confirm, which is what "closes neither and proposes both" means
+        # one layer up. The two SENTMATCH bases are untouched: a delivery
+        # already proves itself (attachment AND completion AND addressed), and
+        # a thread match is a confirm already.
+        #
+        # The 19:53 PT 2026-09-13 "Agreement" mail is the measured case: it
+        # asked which week to start and which day suited a weekly review, and
+        # two open rows closed off it, neither kept.
+        #
+        # TWO HALVES, TWO SCOPES. The QUESTION half applies to every caller:
+        # a message that only asks proves nothing, whatever door it came
+        # through. The PROOF half — completion language or an attachment — is
+        # M's SENT-MAIL ruling, and `require_title_proof=False` is how a
+        # caller whose messages are not mail says so. The chat rail is the
+        # one: a person typing "just sent the deck" in a channel is reporting
+        # in their own words, which is a different kind of evidence from a
+        # mail whose subject happens to echo a row, and no ruling has been
+        # made about that door. Widening this bar to cover it would move a
+        # number nobody agreed to move; it is written into the record instead.
+        # cr1#980 (owner ruling 2026-11-19): the attachment half of the proof
+        # is "the file is THIS item", never "a file rode along" — a shared
+        # word plus any file closed the wrong row.
+        attachment_is_item = bool(file_is) and file_is == _commitment_id(ev)
+        if rec == "auto_resolve" and not basis and (
+                question_shaped
+                or (require_title_proof
+                    and not (has_completion or attachment_is_item))):
+            rec = "pending_review"
+            if isinstance(diagnostics, dict):
+                key = ("title_question_downgraded" if question_shaped
+                       else "title_unproven_downgraded")
+                diagnostics[key] = diagnostics.get(key, 0) + 1
+        # SELFMAIL1 layer 2 — the send has to have gone TO the person the row
+        # is owed to. Applied AFTER both SENTMATCH bases and BEFORE every
+        # downgrade below, so it is the last word on whether this message may
+        # say anything at all about this row: no close, and no proposal.
+        # (On any message that went to somebody other than the sender,
+        # `addressed_to_counterparty` runs `_delivery_counterparty_hit` on the
+        # RAW recipient names, so it is a genuine superset of the conjunct
+        # signal A already carries: a delivery-graded row that reaches here has
+        # already passed it, and the gate can only take away title- and
+        # thread-graded rows, which is exactly M's ruling. On a message whose
+        # every recipient name is the sender's own it is deliberately NOT a
+        # superset — a note to yourself is not a delivery. Review F-4: the
+        # first cut passed the subtracted set unconditionally, which revoked a
+        # delivery close that had been earned.)
+        if rec in ("auto_resolve", "pending_review"):
+            _addressed = addressed_to_counterparty(
+                _d, recipient_set, recipient_name_tokens, person_ids,
+                sender_person_id, title, sender_tokens)
+        else:
+            _addressed = True
+        if not _addressed:
+            rec = "no_action"
+            basis = ""
+            if isinstance(diagnostics, dict):
+                diagnostics["not_addressed_dropped"] = (
+                    diagnostics.get("not_addressed_dropped", 0) + 1)
+        if rec == "auto_resolve" and _is_pending_review(ev):
+            rec = "pending_review"
+        # MC1: a send to ONE counterparty of a MULTI-counterparty commitment
+        # fulfills only THAT person's portion — it must NOT whole-close the
+        # item (the "send the deck to the board" bug: chasing/closing one
+        # board member for all). Downgrade auto_resolve → partial_received and
+        # name the matched counterparties so the caller records a per-person
+        # receipt instead of a full closure. Single-counterparty items are
+        # untouched (guard only fires on multi), so all pre-MC1 behavior and
+        # tests hold byte-identically.
+        #
+        # F-28 — `workspace_root` is what lets this predicate see that ONE
+        # person written as an id AND that person's name is one counterparty,
+        # not two. Without it, such an item was downgraded to per-leg receipts
+        # and the phantom name leg could never receive one, so the item never
+        # closed at all. The workspace is what the roster reader needs to
+        # resolve the name against the entity graph; `None` (no workspace on
+        # hand) keeps the raw union, i.e. pre-F-28 behavior.
+        matched_cp_ids: list = []
+        matched_cp_names: list = []
+        if rec == "auto_resolve" and _multi_cp(_d, workspace_root=workspace_root):
+            roster_ids = set(_cp_ids(_d))
+            matched_cp_ids = [i for i in _cp_ids(_d) if i in recipient_set]
+            matched_cp_names = [
+                nm for nm in _cp_names(_d, workspace_root=workspace_root)
+                if recipient_name_tokens & set(_tokenize(nm))
+            ]
+            rec = "partial_received"
+        # SUB1 D3: a parent with OPEN sub-items is never auto-closed by a
+        # matcher — programmatic closers propose, the user confirms (the
+        # cascade needs their one-line confirm; parent_blocks_auto_resolve
+        # is THE shared predicate).
+        if rec == "auto_resolve" and parent_blocks_auto_resolve(ev):
+            rec = "pending_review"
+        results.append({
+            "commitment_id": _commitment_id(ev),
+            "score": score,
+            "recommendation": rec,
+            "title": title,
+            "owner_id": sender_person_id,
+            "primary_thread_id": ev.get("primary_thread_id") or "",
+            "matched_counterparty_ids": matched_cp_ids,
+            "matched_counterparty_names": matched_cp_names,
+            "close_basis": basis,
+            "attachment_is_item": attachment_is_item,
+        })
+
+    # SENTMATCH — ONE send, ONE delivery. A single attachment cannot be the
+    # evidence for two different deliverables at once, so when signal A puts a
+    # second auto-grade row on the same message the delivery-evidence rows
+    # step down to a confirm. This is FS-11's ruling applied to the new basis
+    # ("only multi-candidate AMBIGUITY stays a confirm proposal"), and it is
+    # the guard that makes signal A's thin conjunction safe. (The title path
+    # has its own proof gate since CLOSETRUTH1 3.1 and the caller applies the
+    # one-send-one-item rule across BOTH bands.)
+    _delivery_rows = [r for r in results if r["close_basis"] == DELIVERY_BASIS]
+    if _delivery_rows and sum(
+            1 for r in results if r["recommendation"] == "auto_resolve") > 1:
+        for r in _delivery_rows:
+            if r["recommendation"] == "auto_resolve":
+                r["recommendation"] = "pending_review"
+                r["close_basis"] = AMBIGUOUS_DELIVERY_BASIS
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
+# -----------------------------------------------------------------------------
+# Path 3 — match a meeting transcript to open commitments
+# -----------------------------------------------------------------------------
+
+
+def match_transcript_to_commitments(
+    *,
+    open_commitments: list[dict],
+    attendee_person_ids: Iterable[str],
+    transcript_text: str,
+    workspace_root=None,
+    transcript_source_ref: Optional[str] = None,
+    exclude_captured_since=None,
+    transcript_ts=None,
+    diagnostics: Optional[dict] = None,
+) -> list[dict]:
+    """Path 3 — score a meeting transcript against open commitments where any
+    meeting attendee is the owner.
+
+    THE CIRCULARITY FENCE (AUTOAPPLY §6 — two layers, both here so every
+    caller inherits them per the F-54 no-resurface-derivation rule):
+
+      1. `transcript_source_ref` — the ref of the transcript being scored
+         (e.g. `granola:<id>`). Any candidate attributed to that same ref
+         (`commitment_source_refs`, which covers `data.source_ref` AND a
+         merged survivor's `merged_source_refs`) is dropped BEFORE scoring.
+         A commitment extracted from transcript T title-matches T at ~1.0
+         and carries no completion language — the meeting that CREATED an
+         ask rarely also completes it — so Path 3's own conservative branch
+         emitted `pending_review`: a confirm row born of evidence that
+         corroborates nothing. Self-evidence is not evidence.
+
+      2. `exclude_captured_since` — an ISO timestamp (or datetime) marking
+         the START of this fire. Candidates captured at or after it are
+         same-fire SIBLINGS: meeting A's asks scored against meeting B's
+         transcript five minutes later, in one batch. They share the
+         extraction context, so they are one source, not two (§2's
+         independence rule), and the ref check alone cannot see them.
+
+    Both default to None = pre-AUTOAPPLY behavior, byte-identical, so every
+    existing caller and test is unaffected. Measured basis: 10 of the 14
+    review proposals written in the 2026-07-26 04:25 fire on the reference
+    substrate targeted commitments captured 04:20–04:21 in that same fire.
+
+      3. `transcript_ts` (EVORDER's third rail, F-27) — the MEETING's own
+         time, i.e. WHEN THE STATEMENTS WERE MADE. Layer 2 fences against the
+         start of THIS FIRE, which is a different question entirely: a
+         commitment captured before the fire but AFTER the meeting ended sails
+         straight through it. Demonstrated by execution before this guard
+         existed: a commitment captured 20:00, a transcript from an 18:00
+         meeting saying "I sent the revised pricing sheet already, it is
+         done", `exclude_captured_since` at 23:00 → `auto_resolve` at 0.75. A
+         meeting cannot be evidence that a promise made two hours later was
+         already kept. `diagnostics` is the optional dict layer 3 counts its
+         refusals into (`stale_evidence_dropped`), which the past-meetings
+         orchestrator folds onto its receipt as `n_stale_evidence_skipped` —
+         the same key both mail rails already report.
+
+         This is the highest-volume rail of the three: past-meetings wrote 295
+         of 683 commitment events on the reference substrate — more than any
+         other closer — and it runs daily.
+
+    For each candidate commitment, compute:
+      - title-match score against the transcript (Jaccard, see score_match)
+      - completion-signal flag (True if transcript contains "sent the" etc.)
+      - schedule-shift flag (True if transcript contains "pushed to" etc.)
+      - new-ask flag (True if transcript contains "can you also" etc.)
+
+    Recommendation logic (conservative — order matters; first match wins):
+      - score >= HIGH AND completion AND NOT schedule_shift AND NOT new_ask
+        → "auto_resolve"
+      - score >= HIGH AND schedule_shift
+        → "commitment_updated" (deadline shifted; commitment stays open)
+      - score >= HIGH AND new_ask
+        → "supersede" (spawn new commitment, link via supersedes; old stays
+          open until separately resolved)
+      - PENDING_REVIEW_THRESHOLD <= score < HIGH AND any signal present
+        → "pending_review"
+      - else "no_action"
+
+    Returns list of dicts sorted by score descending.
+    """
+    if not transcript_text:
+        return []
+    attendee_set = {a for a in attendee_person_ids if a}
+    if not attendee_set:
+        return []
+    _hi, _pend = _match_thresholds(workspace_root)
+
+    has_completion = detect_completion_signal(transcript_text)
+    has_schedule_shift = detect_schedule_shift_signal(transcript_text)
+    has_new_ask = detect_new_ask_signal(transcript_text)
+
+    # §6 fence prep. `own_ref` empty / `fire_start` None → the fence is inert
+    # and every pre-AUTOAPPLY call behaves byte-identically.
+    own_ref = (transcript_source_ref or "").strip()
+    # RECONFENCE F-10 (due once this file was next touched): this rail carried
+    # the raw `hasattr(fire_start, "tzinfo")` variant that RECONFENCE's review
+    # proved defective on the send rail — F-3, a NAIVE datetime passes the type
+    # check untouched and then raises TypeError from inside the candidate loop;
+    # F-4, a malformed string or an off-type value leaves fire_start=None and
+    # SILENTLY disables layer 2. The two blocks were byte-identical, so the
+    # hardening is PORTED here rather than re-derived: one normalizer, one
+    # behavior, both rails.
+    fire_start = _normalize_fire_start(exclude_captured_since)
+    # EVORDER (F-27) — the MEETING's own time; the exact twin of Path 1's
+    # `send_ts` and Path 4's `inbound_ts`, and it routes through the SAME
+    # normalizer rather than a third copy of the same six lines. `None` →
+    # inert; present-but-junk → fails SAFE and LOUD (warns on stderr naming
+    # `transcript_ts`, then excludes every candidate).
+    evidence_at = _normalize_fire_start(transcript_ts, "transcript_ts")
+    _promise_tz = promise_tz(workspace_root)  # cr1#744: once per pass
+
+    results: list[dict] = []
+    for ev in cru_eligible(open_commitments):  # Stage D: tasks never enter CRU
+        # §6 layer 1 — a transcript can never corroborate a conclusion about
+        # an item it created. Dropped before scoring, so the row is NEVER
+        # CREATED rather than created-then-suppressed.
+        #
+        # PROV2: this was a RAW `in` against the candidate's stored refs, and a
+        # raw membership test stops seeing a self-match the moment one side is
+        # a legacy lowercased ref and the other a case-preserved pointer. It
+        # now asks the same question Paths 1 and 4 ask — through
+        # `commitment_matches_source_ref`, which compares derived keys — so the
+        # derivation has one home and every send-scoring path inherits it
+        # (the F-54 no-resurface-derivation rule). Over-matching here EXCLUDES a
+        # candidate, which is the fail-SAFE direction this consumer documents.
+        if own_ref and commitment_matches_source_ref(ev, own_ref):
+            continue
+        # §6 layer 2 — same-fire siblings share one extraction context, so
+        # they are one source. An unparseable capture ts fails SAFE (the item
+        # is excluded): a candidate whose age we cannot establish must not be
+        # treated as independent evidence. Age is the promise's own time
+        # (`promise_time_raw`: a task's board day, cr1#752; a late meeting
+        # row's end of local day, cr1#744).
+        if fire_start is not None:
+            captured = _parse_ts(promise_time_raw(ev, _promise_tz, meeting_start=False))
+            if captured is None or captured >= fire_start:
+                continue
+        owner_id = _commitment_field(ev, "owner_id") or ""
+        if owner_id not in attendee_set:
+            continue
+        # Layer 3 (EVORDER, F-27) — a meeting cannot be evidence that a promise
+        # captured AFTER the meeting was already kept. Third rail of the same
+        # guard Paths 1 and 4 carry and Path 5 has carried since SENTMATCH;
+        # this one is the highest-volume closer in the log, and it was the last
+        # one running unfenced.
+        #
+        # PLACEMENT: below the attendee/owner gate, not at the top of the loop
+        # with layers 1 and 2. That is EVORDER review B-3's lesson, and it is
+        # about the COUNT rather than the fencing: up top the guard fired once
+        # per (transcript x every open commitment newer than the meeting)
+        # regardless of whether anyone in the room owned the item, which on the
+        # reference substrate turned a single day-old message into ~46 reported
+        # "drops" and made the number useless as a signal. Fencing power is
+        # unchanged — a candidate the owner gate already dropped never produced
+        # a row for layer 3 to prevent — and it saves a `fromisoformat` per
+        # irrelevant candidate.
+        #
+        # The asymmetry is deliberate and identical on all three rails:
+        #   * `transcript_ts` ABSENT (None) → inert. A fence that cannot judge
+        #     ordering must not exclude, and a caller that carries no meeting
+        #     times must not lose closure entirely.
+        #   * `transcript_ts` PRESENT but unusable → `_normalize_fire_start`
+        #     fails SAFE and LOUD (warns, excludes everything). Someone handed
+        #     us a value and it is junk; for a closure engine "close nothing" is
+        #     the conservative direction, and a fence that silently switches
+        #     itself off is the failure class this line of work exists to end.
+        #   * strict `>`, not `>=`: capture == meeting is the "captured from
+        #     this very transcript" case, which layer 1 already owns by ref.
+        #   * capture time ABSENT → inert for that candidate, NOT excluded. An
+        #     item with no capture time cannot exhibit this defect (it needs a
+        #     capture NEWER than the meeting), and excluding it would silently
+        #     stop closing every ts-less item — far wider than the bug.
+        #   * capture time PRESENT but unparseable → exclude, mirroring layer 2.
+        if evidence_at is not None:
+            # cr1#744: the promise's own time; cr1#1224: not the meeting's start here
+            _raw_captured = promise_time_raw(ev, _promise_tz, meeting_start=False)
+            if _raw_captured:
+                captured = _parse_ts(_raw_captured)
+                if captured is None or captured > evidence_at:
+                    if isinstance(diagnostics, dict):
+                        diagnostics["stale_evidence_dropped"] = (
+                            diagnostics.get("stale_evidence_dropped", 0) + 1)
+                    continue
+        title = _commitment_field(ev, "title") or ""
+        score = score_match(transcript_text, title)
+
+        if score < _pend:
+            recommendation = "no_action"
+        elif score >= _hi:
+            if has_schedule_shift and not has_completion:
+                recommendation = "commitment_updated"
+            elif has_new_ask and not has_completion:
+                recommendation = "supersede"
+            elif has_completion:
+                recommendation = "auto_resolve"
+            else:
+                # High title match but no fulfillment language. Could be just
+                # discussion of the topic. Stay conservative — pending_review.
+                recommendation = "pending_review"
+        else:
+            # MEDIUM range. Only flag if we saw at least one signal.
+            if has_completion or has_schedule_shift or has_new_ask:
+                recommendation = "pending_review"
+            else:
+                recommendation = "no_action"
+
+        # POLICY1-A — record WHY the ladder demoted, before it demotes. The
+        # pending flag is no longer a refusal in itself (M ruling 2026-09-03:
+        # a guess with completion evidence closes as done); the STRUCTURAL
+        # fences below still are, and the caller must be able to tell them
+        # apart from one `recommendation` string.
+        demoted_pending = recommendation == "auto_resolve" and _is_pending_review(ev)
+        if demoted_pending:
+            recommendation = "pending_review"
+        # MC1: never whole-close a multi-counterparty commitment on a single
+        # transcript match — a mention that the deliverable was "sent" doesn't
+        # prove every counterparty received it. Downgrade to a per-person
+        # receipt (the caller can't tell WHICH from a transcript, so it leaves
+        # the item open for explicit per-person marking — safe by default).
+        # F-28: `workspace_root` lets the roster reader collapse one person
+        # written as an id AND that person's name into ONE counterparty, so a
+        # single-counterparty item is not downgraded into a state it can never
+        # leave. See the Path 1 twin for the full reasoning.
+        from commitment_parties import has_multiple_counterparties as _multi_cp
+        if recommendation == "auto_resolve" and _multi_cp(
+                ev, workspace_root=workspace_root):
+            recommendation = "partial_received"
+        # SUB1 D3: never auto-close a parent with open sub-items — propose.
+        # POLICY1-A: computed for EVERY row (the result carries it), and it
+        # also holds a row the pending flag already demoted — the structural
+        # fence outranks the ruling that lifted the flag.
+        parent_blocks = parent_blocks_auto_resolve(ev)
+        if recommendation in ("auto_resolve", "pending_review") and parent_blocks:
+            recommendation = "pending_review"
+        # POLICY1-A DD-3 — the matcher carries the QUOTE: the completion
+        # turn it scored (speaker marker stripped, verbatim, <= 240 chars)
+        # and the turn's index, plus the four-word signal the orchestrator's
+        # fixed f-string used to carry, as a field. Every proposal and every
+        # transcript close downstream writes THIS, never a fixed string
+        # (`build_pending_review_event` / `close_commitment` refuse it).
+        _q = _policy.completion_quote(transcript_text, title)
+        results.append({
+            "commitment_id": _commitment_id(ev),
+            "score": score,
+            "recommendation": recommendation,
+            "title": title,
+            "owner_id": owner_id,
+            "primary_thread_id": ev.get("primary_thread_id") or "",
+            "has_completion_signal": has_completion,
+            "has_schedule_shift_signal": has_schedule_shift,
+            "has_new_ask_signal": has_new_ask,
+            "evidence_quote": _q["quote"],
+            "evidence_turn_index": _q["turn_index"],
+            # POLICY1-A — the two demotion causes, named (see above).
+            "parent_blocks": bool(parent_blocks),
+            "demoted_pending": bool(demoted_pending),
+            "signal": _policy.signal_value(has_completion=has_completion,
+                                          has_schedule_shift=has_schedule_shift,
+                                          has_new_ask=has_new_ask),
+            "pending_review": _is_pending_review(ev),
+        })
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
+# -----------------------------------------------------------------------------
+# REPLYCLOSE — a counterparty's reply closes a WAITING-ON item
+# -----------------------------------------------------------------------------
+#
+# M ruled 2026-07-29: yes, a client's reply should close a "waiting on X" item.
+# Before this, nothing on any mail path could. Path 1 is owner-gated to items
+# the USER owes (97 of 351 eligible open items on the reference substrate — 28%
+# — are structurally unreachable from sent mail), and Path 4 below could only
+# reach a waiting-on item through TITLE ECHO: the counterparty's message had to
+# restate the commitment's own words at >= 0.55 before the completion gate even
+# applied. The reply that IS the delivery ("here you go", file attached) scores
+# 0.20 and closes nothing — SENTMATCH's measured defect, pointed the other way.
+#
+# THE TWO BASES ADDED HERE, both applied ONLY to the `no_action` band so the
+# existing title path is byte-unchanged:
+#
+#   R1. THREAD-ANCHORED REPLY -> auto_resolve. The inbound message sits in the
+#       conversation the commitment was captured from, it comes from the person
+#       who OWES the item, and it either says the work is done or carries the
+#       artifact the item asked for. Three independent conjuncts, none of them
+#       the title.
+#   R2. OFF-THREAD REPLY -> pending_review, never more (spec §2.2). The same
+#       evidence without the connector-provided thread link is a proposal: a
+#       title-similarity close on inbound mail is the title-echo trap with the
+#       counterparty holding the pen. A non-zero title overlap is required so a
+#       chatty counterparty does not surface every item they have ever owed.
+#
+# DIRECTION IS LOAD-BEARING (spec §2.3) AND IT IS DERIVED, NEVER STORED.
+# `shared/COMMITMENT_SCHEMA.md` § "Direction": *derived from `owner_id` vs the
+# primary user; storing it would create a second source of truth*, and
+# `surface_split.classify_surface` is THE projector — Waiting On is exactly
+# "owner present AND owner != user". So a reply can only close an item whose
+# OWNER is the person who sent it, and the user's own message is refused at the
+# top of the function rather than filtered per-candidate: on a thread the user
+# replied to last, "the latest message" is the user's, and the pre-REPLYCLOSE
+# owner gate (`owner_id == sender`) matches the user's OWN open items happily.
+# That is the sent path's job, on the sent path's evidence.
+
+REPLY_BASIS = "reply_evidence"
+REPLY_PROPOSED_BASIS = "reply_proposed"
+AMBIGUOUS_REPLY_BASIS = "reply_evidence_ambiguous"
+
+
+# -----------------------------------------------------------------------------
+# THE EVIDENCE AUTO-BAR (SWEEPBACK, M ruling 2026-07-29)
+# -----------------------------------------------------------------------------
+#
+# The two bases below are the ones where a close stands on something OTHER than
+# how much the message's words overlap the commitment's title:
+#
+#   * DELIVERY_BASIS — the user's own outbound carried the artifact to a person
+#     who is a counterparty of the item (Path 1, SENTMATCH signal A);
+#   * REPLY_BASIS — the counterparty replied INSIDE the conversation the item was
+#     captured from, and either said it was done or attached what was asked for
+#     (Path 4, REPLYCLOSE R1).
+#
+# WHY THIS PREDICATE EXISTS, AND WHY IT LIVES HERE. A historical backlog sweep
+# re-reads months of mail. Over that span the TITLE path is not the rare, specific
+# signal the v5.6.0 rationale assumed: the dogfood measured a bare reply subject
+# ("Re: q4 vendor list") scoring 0.750 against "Q4 vendor list to <name>" all by
+# itself, because `_overlap_coefficient`'s denominator is `min(|a|,|b|)` and a
+# short subject that echoes the deliverable's name saturates it (F-19). On one
+# live rail, in real time, that is acceptable — the window is a day and the user
+# is watching. Applied automatically across 180 days of mail it is noise at scale.
+#
+# So the sweep's AUTO tier is exactly `auto_resolve` on one of these two bases,
+# and it is defined ONCE, HERE, beside the matchers that mint the bases — not
+# restated in the sweep. Two properties follow that a copy could not give:
+#
+#   1. the sweep can never be MORE permissive than the rails, because the
+#      `recommendation` it reads is the rails' own verdict, produced by the rails'
+#      own conjunctions (owner gate, direction stop, both circularity layers,
+#      EVORDER layer 3, the MC1 downgrade, the pending-review floor, the
+#      one-send-one-delivery and one-reply-one-delivery ambiguity guards);
+#   2. if the rails' bar ever moves, the sweep's moves with it in the same commit,
+#      because there is one object.
+#
+# The live rails do NOT call this: on the daily fires FS-11's unambiguous-moderate
+# title match is a legitimate auto-close and M has ruled twice that it should be.
+# This predicate is the HISTORICAL narrowing, and its one consumer is the sweep.
+AUTO_CLOSE_EVIDENCE_BASES = frozenset({DELIVERY_BASIS, REPLY_BASIS})
+
+
+def closes_on_evidence(row) -> bool:
+    """True when a matcher/driver row is an auto-close standing on EVIDENCE.
+
+    `row` is a row from `match_send_to_commitments` / `match_inbound_to_commitments`
+    or a proposal from `reconcile_sent` / `reconcile_inbound` (both carry
+    `recommendation` and `close_basis` unchanged). Both conditions are required:
+
+      * `recommendation == "auto_resolve"` — the rails' own verdict, after every
+        downgrade they apply. A `partial_received`, a `pending_review`, or a
+        `commitment_updated` is not an auto-close and never becomes one here.
+      * `close_basis` in `AUTO_CLOSE_EVIDENCE_BASES` — delivery evidence or a
+        thread-anchored reply. The empty basis (the TITLE path) is excluded, and
+        so are both AMBIGUOUS bases, which the rails already stepped down to a
+        confirm.
+
+    Anything else is a PROPOSAL. Non-dict input is False — a fence that cannot
+    read its input must not admit.
+    """
+    if not isinstance(row, dict):
+        return False
+    return (row.get("recommendation") == "auto_resolve"
+            and (row.get("close_basis") or "") in AUTO_CLOSE_EVIDENCE_BASES)
+
+
+# Artifact nouns that make a commitment title an ASK FOR A DOCUMENT, so an
+# inbound message carrying an attachment is itself the fulfillment shape (spec
+# §2.1) even when the words never reach `COMPLETION_PHRASES`.
+#
+# WHY THIS EXISTS RATHER THAN A WIDER PHRASE LIST. SENTMATCH's review measured
+# the recall ceiling on `COMPLETION_PHRASES` — "Please find attached." is False,
+# and it is plausibly the most common delivery sentence in business email. The
+# ruling was to DEFER widening that list, because it is shared with Path 3's
+# completion gate and reached by Path 4, so one edit changes another rail's
+# auto-close behavior — the one-rail mistake this train exists to kill, run in
+# reverse. This predicate answers the same recall problem on THIS rail only: it
+# reads the COMMITMENT TITLE (a fixed, already-captured string), never the
+# message, so no other path's behavior moves by a byte.
+DELIVERABLE_ARTIFACT_NOUNS = (
+    "deck", "slides", "presentation", "report", "doc", "docs", "document",
+    "contract", "agreement", "invoice", "proposal", "spreadsheet", "statement",
+    "memo", "summary", "draft", "pdf", "file", "files", "budget", "forecast",
+    "quote", "estimate", "scope", "sow", "brief", "roster", "spec",
+    "breakdown", "analysis", "worksheet", "deliverable", "attachment",
+)
+
+
+def detect_deliverable_artifact(title: Optional[str]) -> bool:
+    """True when a commitment TITLE names a document-shaped artifact.
+
+    Token-level, not substring: a substring test would fire `doc` inside
+    `docket` and `spec` inside `specific`. `_tokenize` already lowercases,
+    strips punctuation, and drops stop-words, so this reads the same tokens the
+    scorer does.
+    """
+    if not title:
+        return False
+    nouns = set(_phrases("deliverable_artifact_nouns", DELIVERABLE_ARTIFACT_NOUNS))
+    return bool(nouns & set(_tokenize(title)))
+
+
+def commitment_is_waiting_on(ev: dict, *, user_person_id: Optional[str],
+                             sender_person_id: Optional[str]) -> bool:
+    """REPLYCLOSE's direction predicate — is `ev` a WAITING-ON item that the
+    inbound sender is the OWNER of?
+
+    Re-derived from the underlying commitment fields through the ONE canonical
+    projector (`surface_split.classify_surface`, CTS1 §2.4), never from a
+    rendered row — the dogfood found surface rows carrying no direction at all.
+    That classifier reads `owner_id` through `_commitment_field`'s full alias
+    chain (`owner_id` / `owner_person_id` / `owner`, `data.<>` then flat), so a
+    legacy-shaped commitment is judged by the same rule as a canonical one.
+
+    Two conditions, both required:
+      1. a resolved primary user exists — direction is a COMPARISON, and with
+         no user there is nothing to compare against (`classify_surface`
+         documents its own None degrade as "every owned item lands waiting_on",
+         which is right for a count and catastrophic for a closure);
+      2. the item classifies WAITING ON — owner present, owner != user — and
+         its owner IS the sender.
+
+    Together those imply `sender != user`, so this predicate deliberately does
+    NOT restate that comparison: a check that can never change an answer is not
+    a fence, it is decoration that a mutation test cannot distinguish from a
+    working one. The direction STOP that IS load-bearing lives at the top of
+    `match_inbound_to_commitments`, where it refuses the message outright.
+
+    An UNOWNED item (no resolvable owner) classifies out here, which is the
+    honest answer: no counterparty id means no sender can ever be its owner, so
+    those items cannot participate in reply-matching at all. An UNCONFIRMED one
+    (pending_review) classifies out too — the user has not adjudicated who owns
+    it, and delivery evidence must not answer the second question before the
+    first.
+    """
+    if not user_person_id or not sender_person_id:
+        return False
+    try:
+        from surface_split import SURFACE_WAITING_ON, classify_surface
+    except Exception:
+        # The projector is core-owned and always present; if it somehow is not,
+        # fail CLOSED. This predicate only ever ADDS closure power, so its
+        # unavailable state must add none.
+        return False
+    if classify_surface(ev, user_person_id) != SURFACE_WAITING_ON:
+        return False
+    return (_commitment_field(ev, "owner_id") or "") == sender_person_id
+
+
+# -----------------------------------------------------------------------------
+# Path 4 — match an inbound email to open commitments
+# -----------------------------------------------------------------------------
+
+
+def match_inbound_to_commitments(
+    *,
+    open_commitments: list[dict],
+    sender_person_id: str,
+    subject: Optional[str],
+    body: Optional[str],
+    workspace_root=None,
+    user_person_id: Optional[str] = None,
+    inbound_source_ref: Optional[str] = None,
+    exclude_captured_since=None,
+    inbound_thread_ref: Optional[str] = None,
+    has_attachment: bool = False,
+    inbound_ts=None,
+    diagnostics: Optional[dict] = None,
+) -> list[dict]:
+    """Path 4 — score an inbound email against open commitments where the
+    SENDER is the owner.
+
+    Mirror image of Path 1 (`match_send_to_commitments`): on outbound, the USER
+    is the owner and we resolve commitments the user owed. On inbound, the
+    COUNTER-PARTY who sent the email is the owner — their message is evidence
+    they delivered on something they owed the user. So we pre-filter to
+    commitments where `data.owner_id == sender_person_id`.
+
+    Completion-gated like Path 3 (transcript): a high title match alone is not
+    enough — counter-parties routinely email ABOUT a topic without delivering
+    it ("still working on the deck"). We require fulfillment language before
+    auto-resolving. This is the key difference from Path 1, where the act of
+    SENDING is itself the fulfillment so no completion gate is needed.
+
+    Recommendation logic (conservative — order matters; first match wins):
+      - score >= HIGH AND schedule_shift AND NOT completion
+        → "commitment_updated" (they pushed their own deadline; stays open)
+      - score >= HIGH AND completion AND NOT schedule_shift
+        → "auto_resolve" (they delivered)
+      - score >= HIGH (no actionable signal, or conflicting signals)
+        → "pending_review" (topic matches but no clear fulfillment)
+      - PENDING_REVIEW_THRESHOLD <= score < HIGH AND any signal present
+        → "pending_review"
+      - else "no_action"
+
+    New-ask language is intentionally NOT acted on here. On inbound, "can you
+    also send X" is the counter-party asking the USER for something new — that
+    creates a commitment the user owes, which is inbox-triage's job, not a
+    resolution of the sender's own commitment. We compute the flag for
+    diagnostics but never resolve/supersede on it.
+
+    THE CIRCULARITY FENCE (REPLYCLOSE — RECONFENCE's two layers, ported onto
+    this rail; both here so every caller inherits them per the F-54
+    no-resurface-derivation rule):
+
+      1. `inbound_source_ref` — the ref of the message being scored (e.g.
+         `gmail:<id>`). Any candidate attributed to that same ref is dropped
+         BEFORE scoring, via `commitment_matches_source_ref` (raw refs,
+         canonical dedup keys, `merged_source_refs`, and the structured
+         provenance / gmail-id channels). This rail needed it MOST: inbox-triage
+         stamps `data.source_ref: gmail:<message_id>` on the commitments it
+         extracts from inbound mail, so the counterparty's own promise
+         ("I'll send the deck Friday") becomes an open item attributed to that
+         message — and a later re-scan of the SAME message title-matches its own
+         capture at ~1.0. The reply that CREATED an item is not the reply that
+         completed it. Self-evidence is not evidence.
+
+      2. `exclude_captured_since` — an ISO timestamp (or datetime) marking the
+         START of this fire. Candidates captured at or after it are same-fire
+         siblings: one inbox fire that extracts commitments in an early phase
+         and scores inbound mail in a later one shares an extraction context, so
+         the two are ONE source, not two (AUTOAPPLY §2's independence rule). No
+         ref relationship exists between them, so layer 1 is blind to this case
+         by construction. An unparseable capture ts fails SAFE (excluded).
+
+    Both default to None = pre-REPLYCLOSE behavior, byte-identical.
+
+    REPLYCLOSE — THE TWO REPLY BASES (see the block above this function):
+
+    `user_person_id` — the primary user. Passing it turns on the DIRECTION
+    check, and the check is a hard stop, not a filter: a message whose sender IS
+    the user returns `[]` immediately. Without it the pre-existing owner gate
+    (`owner_id == sender`) happily matches the user's OWN open items against the
+    user's OWN message, closing a promise the user made as though a counterparty
+    had delivered it. None → the check is inert (pre-REPLYCLOSE behavior) and
+    both new bases stay dead, because direction cannot be established without a
+    user to compare against.
+
+    `inbound_thread_ref` — the ref of the CONVERSATION this message sits in
+    (`gmail:<thread_id>`, canonicalized by the caller exactly like
+    `inbound_source_ref`). A commitment captured inside that thread, replied to
+    by its own owner with completion language or the artifact it asked for,
+    closes outright (basis `REPLY_BASIS`). None → R1 is inert.
+
+    `has_attachment` — the connector's attachment flag for THIS message. Absent
+    / False means "no evidence", never "unknown but probably". Combined with a
+    title that names a document (`detect_deliverable_artifact`), it is the
+    FULFILLMENT SHAPE: the answer to a request for a document is the document.
+
+    NEITHER basis widens the candidacy gate (owner == sender), NEITHER lowers
+    `_hi` / `_pend`, and both run AFTER both fence layers.
+
+    Returns list of `{commitment_id, score, recommendation, title, owner_id,
+    primary_thread_id, has_completion_signal, has_schedule_shift_signal,
+    has_new_ask_signal}` dicts sorted by score descending. `owner_id` is the
+    sender (the counter-party) — the caller uses it as `resolved_by` when
+    writing the `commitment_resolved` event. Rows also carry `close_basis`: ""
+    for the unchanged title path, `REPLY_BASIS`, `REPLY_PROPOSED_BASIS`, or
+    `AMBIGUOUS_REPLY_BASIS` (one reply that closed more than one item —
+    downgraded to a confirm).
+    """
+    if not sender_person_id:
+        return []
+
+    # REPLYCLOSE direction check (spec §2.3) — a hard stop BEFORE any scoring.
+    # Only a COUNTERPARTY's reply closes a waiting-on item; the user's own
+    # message on that thread must not. Loud, because a caller that feeds this
+    # path the user's own mail has a bug worth seeing.
+    if user_person_id and sender_person_id == user_person_id:
+        import sys as _sys
+        print(
+            "REPLYCLOSE: match_inbound_to_commitments was handed the primary "
+            "user as the SENDER — an inbound reply path cannot score the "
+            "user's own message. Scoring nothing. (The outbound equivalent is "
+            "match_send_to_commitments.)",
+            file=_sys.stderr,
+        )
+        return []
+
+    query = (subject or "") + " " + (body or "")
+    if not query.strip():
+        return []
+
+    _hi, _pend = _match_thresholds(workspace_root)
+    has_completion = detect_completion_signal(query)
+    has_schedule_shift = detect_schedule_shift_signal(query)
+    has_new_ask = detect_new_ask_signal(query)
+
+    # REPLYCLOSE — the message-level half of both bases, computed once. A
+    # schedule shift is the explicit NEGATIVE: "here you go on the interim
+    # numbers, the final set slips to Friday" carries completion language and is
+    # not a completion. It only ever blocks the NEW bases; the existing
+    # `commitment_updated` branch below still fires on it exactly as before.
+    reply_says_done = has_completion and not has_schedule_shift
+    reply_carries_artifact = bool(has_attachment) and not has_schedule_shift
+
+    # Fence prep. `own_ref` empty / `fire_start` None → the fence is inert and
+    # every pre-REPLYCLOSE call behaves byte-identically. `_normalize_fire_start`
+    # is the shared normalizer both other fenced rails already use (RECONFENCE
+    # F-3/F-4 + F-10): a naive datetime is normalized rather than crashing the
+    # loop, and an unusable value fails SAFE and loud rather than silently
+    # fencing nothing.
+    own_ref = (inbound_source_ref or "").strip()
+    fire_start = _normalize_fire_start(exclude_captured_since)
+    # EVORDER — the REPLY's own time; see the Path 1 twin. `None` → inert.
+    evidence_at = _normalize_fire_start(inbound_ts, "inbound_ts")
+    _promise_tz = promise_tz(workspace_root)  # cr1#744: once per pass
+
+    results: list[dict] = []
+    for ev in cru_eligible(open_commitments):  # Stage D: tasks never enter CRU
+        # Layer 1 — a reply can never corroborate a conclusion about an item it
+        # created. Dropped before scoring, so the row is NEVER CREATED rather
+        # than created-then-suppressed.
+        if own_ref and commitment_matches_source_ref(ev, own_ref):
+            continue
+        # Layer 2 — same-fire captures share one extraction context, so they are
+        # one source. An unparseable capture ts fails SAFE (excluded). Age is
+        # the promise's own time (`promise_time_raw`: a task's board day,
+        # cr1#752; a late meeting row's end of local day, cr1#744).
+        if fire_start is not None:
+            captured = _parse_ts(promise_time_raw(ev, _promise_tz))
+            if captured is None or captured >= fire_start:
+                continue
+        owner_id = _commitment_field(ev, "owner_id") or ""
+        if owner_id != sender_person_id:
+            continue
+        # Layer 3 (EVORDER) — a reply cannot be evidence for a promise that did
+        # not exist when the reply was sent. Exact twin of the Path 1 guard,
+        # same asymmetry: unknown reply time → inert; unknown capture time with
+        # a known reply time → exclude; strict `>` so capture == reply still
+        # closes. No live instance was observed on this rail, but the hole is
+        # structurally identical and leaving one rail unguarded is what let
+        # F-11 hide for a week behind Path 5 already having an ordering check.
+        # Placed below the owner gate for the same two reasons as the Path 1
+        # twin: a meaningful count, and no wasted parse per irrelevant candidate.
+        # Absent capture time → inert, not excluded; see the Path 1 twin for the
+        # full reasoning and the 683/683 measurement behind it.
+        if evidence_at is not None:
+            _raw_captured = promise_time_raw(ev, _promise_tz)  # cr1#744: the promise's own time
+            if _raw_captured:
+                captured = _parse_ts(_raw_captured)
+                if captured is None or captured > evidence_at:
+                    if isinstance(diagnostics, dict):
+                        diagnostics["stale_evidence_dropped"] = (
+                            diagnostics.get("stale_evidence_dropped", 0) + 1)
+                    continue
+            if _adjudicated_since(ev, evidence_at):  # cr1#740: already answered
+                if isinstance(diagnostics, dict):
+                    diagnostics["stale_evidence_dropped"] = (
+                        diagnostics.get("stale_evidence_dropped", 0) + 1)
+                continue
+        title = _commitment_field(ev, "title") or ""
+        score = score_match(query, title)
+
+        if score < _pend:
+            recommendation = "no_action"
+        elif score >= _hi:
+            if has_schedule_shift and not has_completion:
+                recommendation = "commitment_updated"
+            elif has_completion and not has_schedule_shift:
+                recommendation = "auto_resolve"
+            else:
+                # High title match but no clear fulfillment language, or
+                # conflicting signals. Stay conservative — pending_review.
+                recommendation = "pending_review"
+        else:
+            # MEDIUM range. Only flag if we saw at least one signal.
+            if has_completion or has_schedule_shift:
+                recommendation = "pending_review"
+            else:
+                recommendation = "no_action"
+
+        # REPLYCLOSE — the two reply bases, applied ONLY to the `no_action`
+        # band. That band is the measured miss class (the reply that IS the
+        # delivery lands at 0.20 and below); everything at or above `_pend`
+        # keeps the grade it has today, so neither basis can silently re-grade
+        # an existing match or move a threshold.
+        basis = ""
+        if recommendation == "no_action" and (reply_says_done
+                                              or reply_carries_artifact):
+            # The fulfillment shape is narrower than "an attachment arrived": an
+            # attachment answers an ask for a DOCUMENT. It does not answer
+            # "set up a call" — a booked calendar event does (Path 5) — and it
+            # does not answer an ask that names no artifact at all.
+            evidence_ok = reply_says_done or (
+                reply_carries_artifact and detect_deliverable_artifact(title))
+            if (evidence_ok
+                    and not detect_scheduling_intent(title)
+                    and commitment_is_waiting_on(
+                        ev, user_person_id=user_person_id,
+                        sender_person_id=sender_person_id)):
+                if inbound_thread_ref and commitment_matches_thread_ref(
+                        ev, inbound_thread_ref):
+                    # R1 — the connector says this reply is IN the conversation
+                    # the item came from. That link is not a similarity score,
+                    # so no title floor applies: requiring one would put the
+                    # title back in the evidence chain, which is the whole
+                    # defect. The one-reply-one-delivery guard below is what
+                    # keeps a busy thread from closing several items at once.
+                    recommendation = "auto_resolve"
+                    basis = REPLY_BASIS
+                elif score > 0.0:
+                    # R2 (spec §2.2) — same evidence, no thread link: PROPOSE,
+                    # never close. Off-thread, all that ties this message to
+                    # this item is title similarity, and closing on that is the
+                    # title-echo trap with the counterparty holding the pen.
+                    # The non-zero floor keeps a chatty counterparty from
+                    # surfacing every item they have ever owed.
+                    recommendation = "pending_review"
+                    basis = REPLY_PROPOSED_BASIS
+
+        if recommendation == "auto_resolve" and _is_pending_review(ev):
+            recommendation = "pending_review"
+        # MC1: an inbound delivery from ONE counterparty of a multi-
+        # counterparty owed-to-you item closes only that person's leg —
+        # downgrade the whole close to a per-person receipt (the sender is the
+        # matched counterparty). Single-counterparty items unchanged.
+        # F-28: `workspace_root` collapses one person written as an id AND that
+        # person's name into ONE counterparty — see the Path 1 twin.
+        from commitment_parties import has_multiple_counterparties as _multi_cp
+        matched_cp_ids: list = []
+        if recommendation == "auto_resolve" and _multi_cp(
+                ev, workspace_root=workspace_root):
+            from commitment_parties import counterparty_ids as _cp_ids
+            if sender_person_id in _cp_ids(ev):
+                matched_cp_ids = [sender_person_id]
+            recommendation = "partial_received"
+        # SUB1 D3: never auto-close a parent with open sub-items — propose.
+        if recommendation == "auto_resolve" and parent_blocks_auto_resolve(ev):
+            recommendation = "pending_review"
+        results.append({
+            "commitment_id": _commitment_id(ev),
+            "score": score,
+            "recommendation": recommendation,
+            "title": title,
+            "owner_id": owner_id,
+            "primary_thread_id": ev.get("primary_thread_id") or "",
+            "has_completion_signal": has_completion,
+            "has_schedule_shift_signal": has_schedule_shift,
+            "has_new_ask_signal": has_new_ask,
+            "matched_counterparty_ids": matched_cp_ids,
+            "matched_counterparty_names": [],
+            "close_basis": basis,
+        })
+
+    # REPLYCLOSE — ONE reply, ONE delivery. A single "here you go" cannot be the
+    # evidence for two different deliverables at once, so when R1 puts a second
+    # auto-grade row on the same message every reply-evidence row steps down to
+    # a confirm. This is FS-11's own ruling ("only multi-candidate AMBIGUITY
+    # stays a confirm proposal") applied to the new basis, and it is what makes
+    # R1 safe without a title floor: a thread carrying three open items owed by
+    # the same person produces three questions, not three closures. The title
+    # path is never touched by it — a >= 0.55 match with completion language
+    # keeps closing exactly as it did.
+    _reply_rows = [r for r in results if r["close_basis"] == REPLY_BASIS]
+    if _reply_rows and sum(
+            1 for r in results if r["recommendation"] == "auto_resolve") > 1:
+        for r in _reply_rows:
+            if r["recommendation"] == "auto_resolve":
+                r["recommendation"] = "pending_review"
+                r["close_basis"] = AMBIGUOUS_REPLY_BASIS
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
+# -----------------------------------------------------------------------------
+# Path 5 — match a calendar event to open scheduling commitments
+# -----------------------------------------------------------------------------
+
+
+def _commitment_counterparties(ev: dict, user_person_id: str) -> set[str]:
+    """All non-user person_ids attached to a commitment — the people the
+    commitment is *with*. Pulls from `person_ids` (root + nested) and the
+    `requester_id` alias, drops the owner/user. Used by Path 5 to decide
+    whether a calendar event's attendees match a commitment's counter-party.
+    """
+    ids: set[str] = set()
+    for src in (ev.get("person_ids"), (ev.get("data") or {}).get("person_ids")):
+        if isinstance(src, list):
+            ids.update(x for x in src if x)
+    req = _commitment_field(ev, "requester_id")
+    if req:
+        ids.add(req)
+    # MC1: the explicit counterparty roster (legacy single + counterparty_ids
+    # list, unioned by the one helper) — so "send the deck to the board" sees
+    # every board member, not just the first.
+    from commitment_parties import counterparty_ids as _cp_ids
+    ids.update(_cp_ids(ev))
+    ids.discard(user_person_id)
+    return ids
+
+
+def _calendar_event_tentative(cev: dict) -> bool:
+    """True when a calendar event says it was cancelled, declined or a prep
+    meeting (cr1#1121): `calendar_subject.meeting_is_tentative` over the
+    event's own title and status fields."""
+    try:
+        from calendar_subject import meeting_is_tentative
+    except Exception:  # noqa: BLE001 - unreadable reads as a real meeting
+        return False
+    return meeting_is_tentative({
+        "title": cev.get("summary") or cev.get("title") or "",
+        "status": cev.get("status"), "response_status": cev.get("response_status"),
+        "self_response": cev.get("self_response"), "my_response": cev.get("my_response")})
+
+
+def match_calendar_to_commitments(
+    *,
+    open_commitments: list[dict],
+    user_person_id: str,
+    calendar_events: Iterable[dict],
+    workspace_root=None,
+) -> list[dict]:
+    """Path 5 — resolve scheduling commitments OWED BY THE USER when a calendar
+    event with the counter-party now exists.
+
+    This is the calendar twin of Path 1 (`match_send_to_commitments`). On Path 1
+    the act of *sending* fulfills the commitment; here the existence of a
+    calendar *event* with the named person fulfills it. The user is the owner of
+    these commitments ("set up the call with X") so we pre-filter to
+    `owner_id == user_person_id`.
+
+    `calendar_events` is an iterable of dicts the CALLER builds from Calendar MCP
+    (the helper does no I/O). Recognized keys per event:
+      - `attendee_person_ids` (list[str], REQUIRED): person_ids on the event,
+        resolved from attendee emails via aliases.json/entities.json. The user's
+        own id may be present; it's ignored for matching.
+      - `summary` (str, optional): event title, scored against the commitment
+        title only to break ties / feed pending_review evidence.
+      - `created_ts` (str ISO, optional): when the event was created/updated. If
+        present AND it clearly predates the commitment, the event can't have
+        fulfilled it → skipped. Absent → treated as eligible (lenient).
+        cr1#1224: made after the row's source meeting began but before the
+        capture, it still counts when `start_ts` says the event starts after
+        it was made (a booking for later).
+      - `start_ts` (str ISO, optional): when the event itself starts.
+      - `accepted_by` (list[str], optional): person_ids who have `accepted` the
+        invite. Pure bonus confidence; never required.
+      - `calendar_event_id` (str, optional): echoed back as evidence.
+
+    Precision is structural, not threshold-based: a commitment auto-resolves only
+    when ALL of these hold — (1) the user owns it, (2) its title carries
+    scheduling intent (`detect_scheduling_intent`), (3) a calendar event exists
+    whose attendees include one of the commitment's counter-parties, (4) the
+    event doesn't predate the commitment. This combination is high-precision;
+    we do NOT also require title↔summary overlap, because a scheduling
+    commitment's title ("set up the build call with Bo") shares almost
+    no tokens with an event summary ("Bo Sample / Sam Sample") — the
+    *attendee* IS the topic match.
+
+    Recommendation per (commitment, best-matching event):
+      - scheduling-intent title + attendee match + not-predating
+        → "auto_resolve"
+      - NO scheduling intent, but attendee match AND title↔summary overlap
+        >= HIGH → "pending_review" (topic lines up but it isn't obviously a
+        scheduling commitment — let a human confirm rather than silently close
+        a deliverable)
+      - else → "no_action"
+
+    Counter-party acceptance promotes nothing on its own — it only raises the
+    `counterparty_accepted` flag and the recorded score — because an unaccepted
+    invite the user sent is already fulfillment of "set up the call" (the user
+    did their part). This is what subsumes the discarded "counter-party accepted
+    my invite" inbox signal: acceptance is captured here as confirmation, not in
+    the inbox as noise.
+
+    Returns a list of `{commitment_id, score, recommendation, title, owner_id,
+    primary_thread_id, evidence, calendar_event_id, has_scheduling_intent,
+    counterparty_accepted}` dicts, one per matched commitment (best event per
+    commitment), sorted by score descending. `owner_id` is the user — the caller
+    uses it as `resolved_by` when writing `commitment_resolved`.
+    """
+    if not user_person_id:
+        return []
+
+    events = [e for e in calendar_events if isinstance(e, dict)]
+    if not events:
+        return []
+
+    results: list[dict] = []
+    _promise_tz = promise_tz(workspace_root)  # cr1#744: once per pass
+    for ev in cru_eligible(open_commitments):  # Stage D: tasks never enter CRU
+        if _commitment_field(ev, "owner_id") != user_person_id:
+            continue
+        counterparties = _commitment_counterparties(ev, user_person_id)
+        if not counterparties:
+            continue
+        title = _commitment_field(ev, "title") or ""
+        has_sched = detect_scheduling_intent(title)
+        commit_ts = promise_time_raw(ev, _promise_tz, meeting_start=False)
+        # cr1#1224: the meeting's own start, earlier than `commit_ts` only on
+        # a row whose source meeting is on file. It admits an event only as a
+        # FORWARD booking (see the skip below).
+        _began_dt = _parse_ts(promise_time_raw(ev, _promise_tz))
+
+        best: Optional[dict] = None
+        best_score = -1.0
+        for cev in events:
+            attendees = {a for a in (cev.get("attendee_person_ids") or []) if a}
+            attendees.discard(user_person_id)
+            if not (attendees & counterparties):
+                continue
+            created_ts = cev.get("created_ts") or ""
+            # If the event clearly predates the commitment it can't have
+            # fulfilled it. Compare instants (not raw strings — ts may mix
+            # Z / +00:00 offsets); only skip when BOTH parse and are ordered
+            # that way, lenient on missing/unparseable data.
+            _c_dt, _e_dt = _parse_ts(commit_ts), _parse_ts(created_ts)
+            if _c_dt and _e_dt and _e_dt < _c_dt:
+                # cr1#1224: made after the meeting began, before the capture,
+                # counts only when the event STARTS after it was made: a
+                # booking made for later. The source meeting's own event,
+                # touched during or after the meeting, starts before that
+                # touch and stays fenced; so does an event whose start the
+                # caller did not pass.
+                _s_dt = _parse_ts(cev.get("start_ts") or cev.get("start") or "")
+                if not (_began_dt and _e_dt >= _began_dt and _s_dt and _s_dt > _e_dt):
+                    continue
+            summary = cev.get("summary") or ""
+            accepted = bool(
+                {a for a in (cev.get("accepted_by") or []) if a} & counterparties
+            )
+            overlap = score_match(summary, title)
+            # Acceptance + title overlap only break ties between candidate
+            # events; eligibility is the attendee match itself.
+            cand_score = max(overlap, 0.6 if accepted else 0.0)
+            if cand_score > best_score:
+                best_score = cand_score
+                best = {
+                    "summary": summary,
+                    "accepted": accepted,
+                    "overlap": overlap,
+                    "calendar_event_id": cev.get("calendar_event_id") or "",
+                    "matched_cp": sorted(attendees & counterparties),
+                    "event": cev,
+                }
+
+        if best is None:
+            continue
+
+        if has_sched:
+            recommendation = "auto_resolve"
+            # Report a high score for auto-resolves so they sort first; nudge
+            # higher when the counter-party has accepted.
+            score = 0.9 if best["accepted"] else 0.8
+        elif best["overlap"] >= _match_thresholds(workspace_root)[0]:
+            recommendation = "pending_review"
+            score = best["overlap"]
+        else:
+            recommendation = "no_action"
+            score = best["overlap"]
+
+        if recommendation == "auto_resolve" and _is_pending_review(ev):
+            recommendation = "pending_review"
+        # cr1#1121 (#903 case 10): a meeting that was cancelled, declined or a
+        # prep is not the meeting the item asked for. It proposes; this path
+        # still reads no subject.
+        if recommendation == "auto_resolve" and _calendar_event_tentative(best["event"]):
+            recommendation = "pending_review"
+
+        # MC1: a calendar event with ONE counterparty of a multi-counterparty
+        # commitment fulfills only that person's leg — downgrade the whole
+        # close to a per-person receipt (matched attendees only). Single-
+        # counterparty items unchanged.
+        # F-28: `workspace_root` collapses one person written as an id AND that
+        # person's name into ONE counterparty — see the Path 1 twin.
+        from commitment_parties import has_multiple_counterparties as _multi_cp
+        matched_cp_ids: list = []
+        if recommendation == "auto_resolve" and _multi_cp(
+                ev, workspace_root=workspace_root):
+            matched_cp_ids = list(best.get("matched_cp") or [])
+            recommendation = "partial_received"
+        # SUB1 D3: never auto-close a parent with open sub-items — propose.
+        if recommendation == "auto_resolve" and parent_blocks_auto_resolve(ev):
+            recommendation = "pending_review"
+
+        evidence = (
+            f"Calendar event "
+            f"{'(accepted) ' if best['accepted'] else ''}"
+            f"with counter-party: {best['summary'] or best['calendar_event_id'] or 'scheduled'}"
+        )
+        results.append({
+            "commitment_id": _commitment_id(ev),
+            "score": score,
+            "recommendation": recommendation,
+            "title": title,
+            "owner_id": user_person_id,
+            "primary_thread_id": ev.get("primary_thread_id") or "",
+            "evidence": evidence,
+            "calendar_event_id": best["calendar_event_id"],
+            "has_scheduling_intent": has_sched,
+            "counterparty_accepted": best["accepted"],
+            "matched_counterparty_ids": matched_cp_ids,
+            "matched_counterparty_names": [],
+        })
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
+# -----------------------------------------------------------------------------
+# Event-builder helpers (do NOT write — caller chooses to write or queue)
+# -----------------------------------------------------------------------------
+
+
+def _now_iso() -> str:
+    return _clock_now().replace(tzinfo=None).isoformat() + "Z"
+
+
+def _close_pointer_fields(source_ref=None) -> dict:
+    """PROV1 — the pointer fragment for the close-family SHAPE HELPERS below.
+
+    Delegates to the Layer A4 writer contract
+    (`connector_adapters.provenance.close_provenance_fields`), so a dict built
+    here and a dict written by `commitment_state` carry the identical field —
+    a shape helper that produced a DIFFERENT provenance spelling from the real
+    writer would be a second, silently-diverging contract.
+    """
+    from connector_adapters.provenance import close_provenance_fields
+    return close_provenance_fields(source_ref)
+
+
+def build_commitment_resolved_event(
+    *,
+    commitment_id: str,
+    resolved_by: str,
+    primary_thread_id: str,
+    source_skill: str,
+    evidence: str,
+    next_seq: int,
+    source_ref=None,
+) -> dict:
+    """LEGACY shape helper (pre-Stage-B). Build a `commitment_resolved` event
+    dict per shared/COMMITMENT_SCHEMA.md.
+
+    Phase 2 Stage B (F2): closures are WRITTEN through
+    `commitment_state.close_commitment` — the single closure path (legacy-id
+    normalization, loud no-match refusal, full-set idempotency, pending_review
+    floor, gated append). Do not build-and-append with this helper in new
+    code; it remains only for shape reference and pre-Stage-B callers/tests.
+
+    PROV1 — it still carries `source_ref`, and still stamps
+    `provenance_missing` without one. A close-family SHAPE that cannot express
+    a pointer is a hole in the contract even when nothing in production calls
+    it: the next caller copies the shape, not the docstring.
+    """
+    return {
+        "seq": next_seq,
+        "ts": _now_iso(),
+        "type": "commitment_resolved",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "data": {
+            "commitment_id": commitment_id,
+            "resolved_by": resolved_by,
+            "evidence": clip(evidence) if evidence else "",
+            **_close_pointer_fields(source_ref),
+        },
+    }
+
+
+def build_commitment_updated_event(
+    *,
+    commitment_id: str,
+    primary_thread_id: str,
+    source_skill: str,
+    change_summary: str,
+    evidence: str,
+    next_seq: int,
+    source_ref=None,
+) -> dict:
+    """Build a `commitment_updated` event for schedule-shift cases. The
+    underlying commitment stays OPEN; this event records that the deadline
+    or scope changed.
+
+    PROV1 §3.1 — this is THE `commitment_updated` that asserts an EXTERNAL
+    FACT ("they pushed the deadline to the 14th", read off an email or a
+    transcript), so it carries the same pointer contract as the closers.
+    `source_ref` names the message or meeting the new date came from; without
+    one the event lands stamped `provenance_missing: true` — this LEGACY
+    shape-builder is not one of PROVMINT1's three floor writers and genuinely
+    still stamps the marker. The park/un-park updates (`watch_gate`) and the
+    record-keeping ones (wording edits, owner confirmations) assert nothing
+    external and are deliberately outside the contract.
+
+    REVIEW-FLAG CLEARS ARE NO LONGER IN THAT LIST (PROVMINT1 §0-2, which
+    changed this answer). A Keep-both adjudication asserts an EXTERNAL fact —
+    "these two really are different things" — so
+    `commitment_state.clear_review_flags` is INSIDE the pointer contract: it
+    takes a `source_ref`, and mints `session:<source_skill>:<now>` with
+    `ref_grain: "surface_minted"` when nothing reaches it. Read that
+    docstring, not this sentence, for what a review-flag clear writes.
+    """
+    return {
+        "seq": next_seq,
+        "ts": _now_iso(),
+        "type": "commitment_updated",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "data": {
+            "commitment_id": commitment_id,
+            "change_summary": clip(change_summary) if change_summary else "",
+            "evidence": clip(evidence) if evidence else "",
+            **_close_pointer_fields(source_ref),
+        },
+    }
+
+
+def build_pending_review_event(
+    *,
+    commitment_id: str,
+    primary_thread_id: str,
+    source_skill: str,
+    proposed_resolution: str,
+    score: float,
+    evidence: str,
+    next_seq: int,
+    title: str,
+    has_completion_signal: Optional[bool] = None,
+    evidence_ts: Optional[str] = None,
+    source_ref: Optional[str] = None,
+    supersedes_seq: Optional[int] = None,
+    signal: Optional[str] = None,
+) -> dict:
+    """Build a `commitment_review_proposed` event — the confirm queue
+    surfaces these as one-click `confirm / skip` items. Used for MEDIUM-
+    confidence matches where auto-resolve is too aggressive.
+
+    `title` (FB-19) is the commitment's own name, carried so the card row can
+    say WHAT it is asking about. Without it the row renders as a bare shape
+    label ("Housekeeping") — the live 2026-07-16 defect.
+
+    **TITLEMINT1 — `title` is REQUIRED and an empty or whitespace-only value
+    RAISES `ReviewProposalTitleError`; no event is built.** It carried a `""`
+    default until 2026-08-24, which made "the caller forgot" indistinguishable
+    from "the caller meant to omit it", and on 2026-08-19 one fire wrote 70
+    subject-less rows onto every review surface because two call sites on the
+    title-match leg never passed the argument. The builder stays
+    substrate-blind — it does NOT look the title up from `commitment_id`; the
+    caller holds the matched record and every matcher result row on this rail
+    already carries `title`.
+
+    `has_completion_signal` (WATCHGATE R-2) is the matcher's own fulfillment
+    flag — the SAME boolean the rails compute and then, until now, threw
+    away. The accept surface needs it: without it the only thing standing
+    between a bare guess and a bulk-confirm is whether the evidence string
+    happens to contain the words "title match", which is a fragile place for
+    a safety property to live. Carrying the flag makes the weakness screen
+    read the matcher's actual finding instead of inferring it from prose.
+    `None` = the caller did not assess (legacy rows, and any caller that has
+    no signal to report); it never weakens a row on its own.
+
+    `evidence_ts` (WATCHGATE §2.5) is WHEN the evidence was observed — the
+    meeting's own time on the transcript rail, the send time on the mail rail
+    — so the accept surface can check at apply time that the evidence does
+    not predate the promise. Optional for the same reason.
+
+    Both are OMITTED from `data` when None, so a caller that passes neither
+    writes the byte-identical event it wrote before.
+
+    POLICY1-A (D4 / D5 / D15):
+      * `evidence` that begins with the retired fixed f-string
+        (`Past meeting transcript (`) RAISES `FixedEvidenceError` — a
+        proposal carries the words that triggered it or it is not built.
+      * `source_ref` — the evidence's own pointer (`granola:<id>`, a message
+        key). It is the second half of the proposal ledger's key: ONE
+        proposal per (commitment, source_ref), ever.
+      * `supersedes_seq` — a RE-SCORE of the same (commitment, source_ref):
+        the prior proposal's seq, stamped TOP-LEVEL (the SUPERSEQ vocabulary
+        event_types registers). `match_score` is never edited; readers take
+        the newest and treat the superseded seq as closed.
+      * `signal` — one of commitment_policy.SIGNAL_VALUES, the four words the
+        f-string used to carry, as a field.
+    All three are OMITTED when None (legacy shape byte-identical).
+    """
+    _policy.refuse_fixed_evidence(evidence, where="build_pending_review_event")
+    if signal is not None and signal not in _policy.SIGNAL_VALUES:
+        raise ValueError(
+            f"build_pending_review_event: signal {signal!r} is not one of "
+            f"{_policy.SIGNAL_VALUES}")
+    if not str(title or "").strip():
+        raise ReviewProposalTitleError(
+            "refusing to propose a review with no title for commitment "
+            f"{commitment_id!r}: a proposal is a question, and a question "
+            "with no subject cannot be answered. Pass the matched "
+            "commitment's own title — every matcher result row carries it."
+        )
+    data = {
+        "commitment_id": commitment_id,
+        "proposed_resolution": proposed_resolution,
+        "match_score": round(score, 3),
+        "evidence": clip(evidence) if evidence else "",
+        "title": title,
+    }
+    if isinstance(has_completion_signal, bool):
+        # Three-state key, written by IDENTITY (POLICY1-B guard). None is not
+        # written at all ("never assessed"). F-7: a NON-BOOL is not an
+        # assessment either — it is left unwritten (unassessed), never
+        # coerced to True or False (the base wrote `bool(1)`; the first cut
+        # of this branch wrote `1 is True` = False — both invent a finding).
+        data["has_completion_signal"] = has_completion_signal
+    if evidence_ts:
+        data["evidence_ts"] = str(evidence_ts)
+    if source_ref:
+        data["source_ref"] = str(source_ref)
+    if signal is not None:
+        data["signal"] = signal
+    ev = {
+        "seq": next_seq,
+        "ts": _now_iso(),
+        "type": "commitment_review_proposed",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "data": data,
+    }
+    if supersedes_seq is not None:
+        if isinstance(supersedes_seq, bool) or not isinstance(supersedes_seq, int):
+            raise ValueError("build_pending_review_event: supersedes_seq must be an int seq")
+        ev["supersedes_seq"] = supersedes_seq
+    return ev
+
+
+def build_commitment_review_dismissed_event(
+    *,
+    commitment_id: str,
+    primary_thread_id: str,
+    source_skill: str,
+    next_seq: int,
+    proposal_seq: Optional[int] = None,
+    resolution_reason: Optional[str] = None,
+    brain_batch_id: Optional[str] = None,
+) -> dict:
+    """Build a `commitment_review_dismissed` event (v2.14.7+). Written when
+    the user clicks Skip on a CRU review item — the underlying commitment
+    stays open, but this specific review-proposed event is closed and won't
+    re-surface for 30 days.
+
+    POLICY1-A D15 — the RETRACT shape: `proposal_seq` names exactly WHICH
+    proposal is withdrawn (a legacy dismissal with no seq closes every open
+    proposal on the commitment — the pre-POLICY1 reading, kept for the rows
+    on disk); `resolution_reason` = commitment_policy.RETRACT_REASON under the
+    shared lapse key, so the calibration reader (`is_non_dismissal_closure`
+    family) can tell a system retract from a human's Skip; `brain_batch_id`
+    = the run it rode in. All three OMITTED when None (legacy shape).
+    """
+    data: dict = {"commitment_id": commitment_id}
+    if proposal_seq is not None:
+        if isinstance(proposal_seq, bool) or not isinstance(proposal_seq, int):
+            raise ValueError("build_commitment_review_dismissed_event: proposal_seq must be an int seq")
+        data["proposal_seq"] = proposal_seq
+    if resolution_reason:
+        data["resolution_reason"] = str(resolution_reason)
+    if brain_batch_id:
+        data["brain_batch_id"] = str(brain_batch_id)
+    return {
+        "seq": next_seq,
+        "ts": _now_iso(),
+        "type": "commitment_review_dismissed",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "data": data,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Open-review-proposal loader (v2.14.7+) — used by the confirm-queue adapter
+# (`brain_proposals._adapt_commitment_reviews`; the retired Pulse chat's Phase 4g
+# was the original caller)
+# -----------------------------------------------------------------------------
+
+
+def load_open_review_proposals(
+    events_jsonl_path: str | Path,
+    *,
+    window_days: int = 7,
+    now_iso: Optional[str] = None,
+) -> list[dict]:
+    """Read events.jsonl and return all `commitment_review_proposed` events from
+    the last `window_days` days that have NOT been closed by a subsequent
+    `commitment_resolved` (HIGH path subsequently fired) or
+    `commitment_review_dismissed` (user already skipped) event for the same
+    commitment_id. Also filters out reviews whose underlying commitment has
+    been resolved by any other path (`thread_resolved` etc.).
+
+    Returns full event dicts sorted by ts descending (newest first). Caller
+    extracts `data.commitment_id`, `data.match_score`, etc. as needed.
+    """
+    path = Path(events_jsonl_path)
+    if not path.exists():
+        return []
+
+    # `now_iso` (WATCHGATE) — the window's anchor, injectable. It defaulted to
+    # the wall clock with no override, which made this reader untestable at a
+    # fixed clock: a fixture anchored anywhere but "the last seven real days"
+    # returned nothing, and a suite written against it read as a clean pass on
+    # an empty set. That is the falsely-clean shape the sweep-methodology
+    # lesson is about, arriving in a reader. Default is unchanged behavior.
+    _anchor = None
+    if now_iso:
+        _anchor = _parse_ts(now_iso)
+    if _anchor is None:
+        _anchor = _clock_now(_workspace_from_events_path(events_jsonl_path))
+    cutoff_iso = (
+        _anchor.replace(tzinfo=None) - datetime.timedelta(days=window_days)
+    ).isoformat() + "Z"
+
+    review_proposed: list[dict] = []
+    review_closed_for_commitment: set[str] = set()
+
+    # EVGUARD — the hand-rolled loop that used to live here caught only
+    # JSONDecodeError, so a top-level bare-string line (`"seq"`) parsed fine
+    # and the next `ev.get()` raised AttributeError, taking the whole
+    # staff-meeting surface down with it (Sub-bug #14b, second half). The
+    # canonical loader handles BOTH shapes. `since_ts=None` = full history.
+    events, _skipped = load_events_defensively(path, since_ts=None)
+    # cr1#1478 — closes are read IN ORDER, the way the open-commitment loader
+    # reads them (`closure_index`): a close is the reason a proposal is moot
+    # only when it landed after the proposal, or when the item is closed now.
+    # The order-blind set this replaced kept every item ever closed, so a
+    # proposal on an item the owner had reopened never read as open, and each
+    # new piece of evidence wrote another one.
+    from closure_index import build_closure_index
+    closure = build_closure_index(events)
+    proposal_at: dict = {}  # id(proposal event) -> its file index
+    for idx, ev in enumerate(events):
+        et = ev.get("type") or ev.get("event") or ""
+        d = ev.get("data") or {}
+        if et == "commitment_review_proposed":
+            if event_time(ev) >= cutoff_iso:
+                review_proposed.append(ev)
+                proposal_at[id(ev)] = idx
+        elif et == "commitment_review_dismissed":
+            cid = d.get("commitment_id") or ev.get("commitment_id")
+            if cid:
+                review_closed_for_commitment.add(cid)
+
+    # POLICY1-A D4/D15 — a proposal a later RE-SCORE superseded
+    # (`supersedes_seq`), a seq-addressed dismissal named, or a legacy
+    # (seq-less) dismissal written AFTER it is closed. Read through the
+    # policy ledger (order-aware), so this reader and the plate's P7 fold
+    # cannot fork on what "open" means. cr1#1499: this reader used to close
+    # every proposal on an item with a legacy dismissal, before or after it,
+    # so no later question on that item ever read as open and every dedup
+    # wrote another. The order-blind set now speaks only for a proposal the
+    # ledger cannot see (one with no seq of its own).
+    _closed_seqs = _policy.closed_proposal_seqs(events)
+
+    out: list[dict] = []
+    for ev in review_proposed:
+        cid = (ev.get("data") or {}).get("commitment_id")
+        if not cid:
+            continue
+        cseq = (ev.get("data") or {}).get("commitment_seq")
+        at = proposal_at.get(id(ev), -1)
+        if (closure.is_closed(cid, cseq)
+                or closure.last_close_at(cid, cseq) > at
+                or closure.last_reopen_at(cid, cseq) > at):
+            # The item is closed now, a close landed after this proposal, or
+            # the proposal belongs to a closed spell the owner has since
+            # reopened: the question is moot. Only a proposal written after
+            # the latest reopen asks about the item as it is now (cr1#1478).
+            continue
+        # cr1#1499 review: the seq as the ledger reads it (a seq written as
+        # text is the same proposal).
+        pseq = _policy._seq_of(ev)
+        if pseq in _closed_seqs:
+            continue
+        if pseq is None and cid in review_closed_for_commitment:
+            # A proposal with no seq is not on the ledger: the old reading
+            # (the owner skipped this item's question) still answers it.
+            continue
+        out.append(ev)
+
+    out.sort(key=lambda e: event_time(e), reverse=True)
+    return out
+
+
+def open_review_proposal_ids(
+    events_jsonl_path: str | Path,
+    *,
+    window_days: int = 7,
+) -> set:
+    """The commitment_ids that ALREADY carry an open review proposal — the
+    disk-side seed for `filter_duplicate_review_targets` (AUTOAPPLY §6).
+
+    Thin projection over `load_open_review_proposals` so the two can never
+    fork on what "open" means (resolved / dismissed / out-of-window all drop
+    in one place)."""
+    return {
+        (ev.get("data") or {}).get("commitment_id")
+        for ev in load_open_review_proposals(
+            events_jsonl_path, window_days=window_days)
+        if (ev.get("data") or {}).get("commitment_id")
+    }
+
+
+def filter_duplicate_review_targets(results: list, *, already_proposed: set) -> list:
+    """ONE open review proposal per commitment (AUTOAPPLY §6 fold-in).
+
+    The reference substrate shows the same commitment proposed TWICE inside a
+    single fire — scores 1.0 and 0.571 — because two transcripts in one batch
+    each matched it and nothing checked. Two rows asking the identical
+    question is precisely the "duplicates asking to confirm" complaint.
+
+    `already_proposed` is MUTATED as targets are accepted, so one set threaded
+    across a fire's transcripts dedups within the fire; seed it from
+    `open_review_proposal_ids()` and the same set also dedups against disk.
+    Order is preserved and the highest-scoring row wins per commitment when
+    the caller passes score-sorted results (every match_* path does).
+    """
+    out: list = []
+    for r in results or []:
+        cid = (r or {}).get("commitment_id")
+        if not cid or cid in already_proposed:
+            continue
+        already_proposed.add(cid)
+        out.append(r)
+    return out
+
+
+def cap_review_proposals(results: list, *, budget: dict,
+                         cap: int = REVIEW_PROPOSAL_FIRE_CAP) -> list:
+    """TITLEMINT1 D1 — bound how many review proposals ONE FIRE writes.
+
+    On 2026-08-19 a single past-meetings fire wrote 70
+    `commitment_review_proposed` events in about 35 seconds. Nothing anywhere
+    on this rail asked how many was too many: the dedup filter above bounds
+    proposals PER COMMITMENT and the match floors bound them PER CANDIDATE,
+    and neither is a statement about the size of the pile a person opens in
+    the morning.
+
+    **This is a volume bound and it is NOT a threshold.** The match floors are
+    untouched by this build and must stay untouched (standing ruling): a
+    suppressed candidate scored exactly what it always scored, and would be
+    proposed on a quieter fire. Highest `score` first, so the ones that survive
+    are the ones most worth a person's attention.
+
+    `budget` is MUTATED — thread ONE dict across every transcript in the fire,
+    exactly as `already_proposed` is threaded through the dedup filter above,
+    or the cap becomes per-transcript and bounds nothing a busy fire does. It
+    accumulates two keys, both of which the caller puts on the fire receipt:
+
+      * `proposals_written` — how many this fire has written so far
+      * `proposals_suppressed` — how many did not fit
+
+    A cap without a count is a SILENCE, which is the thing this codebase keeps
+    ruling against; the suppressed number is why the receipt line exists and it
+    is written even when it is zero.
+
+    Because the budget is spent in call order, an early transcript's rows can
+    take headroom a later transcript would have outscored. That is inherent to
+    bounding a stream rather than a batch, and it is the honest trade: the
+    alternative is holding every transcript's results until the fire ends, at
+    which point nothing has been written and a crash mid-fire loses all of it.
+    """
+    rows = [r for r in (results or []) if r]
+    try:
+        limit = max(0, int(cap))
+    except (TypeError, ValueError):
+        limit = REVIEW_PROPOSAL_FIRE_CAP
+    if not isinstance(budget, dict):
+        raise TypeError(
+            "cap_review_proposals needs a mutable budget dict threaded across "
+            "the whole fire — a per-call budget bounds nothing")
+    written = int(budget.get("proposals_written") or 0)
+    headroom = max(0, limit - written)
+    # sorted() is stable, so equal scores keep the caller's order — which on
+    # every match_* path is already score-descending.
+    ranked = sorted(rows, key=lambda r: (r or {}).get("score") or 0.0,
+                    reverse=True)
+    kept = ranked[:headroom]
+    budget["proposals_written"] = written + len(kept)
+    budget["proposals_suppressed"] = (
+        int(budget.get("proposals_suppressed") or 0) + len(rows) - len(kept))
+    return kept
+
+
+__all__ = [
+    "HIGH_CONFIDENCE_THRESHOLD",
+    "PENDING_REVIEW_THRESHOLD",
+    "score_match",
+    "extract_snippet",
+    "detect_completion_signal",
+    "is_question_shaped",
+    "detect_schedule_shift_signal",
+    "detect_new_ask_signal",
+    "detect_scheduling_intent",
+    "load_open_commitments",
+    "collapse_id_twins",
+    "split_pending_review",
+    "load_needs_review",
+    "load_open_review_proposals",
+    "open_review_proposal_ids",
+    "filter_duplicate_review_targets",
+    "cap_review_proposals",
+    "REVIEW_PROPOSAL_FIRE_CAP",
+    "ReviewProposalTitleError",
+    "commitment_source_refs",
+    "commitment_matches_source_ref",
+    "commitment_thread_refs",
+    "commitment_matches_thread_ref",
+    "addressed_to_counterparty",
+    "DELIVERY_BASIS",
+    "THREAD_BASIS",
+    "AMBIGUOUS_DELIVERY_BASIS",
+    "REPLY_BASIS",
+    "REPLY_PROPOSED_BASIS",
+    "AMBIGUOUS_REPLY_BASIS",
+    "AUTO_CLOSE_EVIDENCE_BASES",
+    "closes_on_evidence",
+    "detect_deliverable_artifact",
+    "commitment_is_waiting_on",
+    "partition_subitems",
+    "parent_blocks_auto_resolve",
+    "cru_eligible",
+    "match_send_to_commitments",
+    "match_transcript_to_commitments",
+    "match_inbound_to_commitments",
+    "match_calendar_to_commitments",
+    "build_commitment_resolved_event",
+    "build_commitment_updated_event",
+    "build_pending_review_event",
+    "build_commitment_review_dismissed_event",
+    "_commitment_field",
+    "_commitment_confidence",
+    "event_references_person",
+]

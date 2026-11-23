@@ -1,0 +1,659 @@
+---
+name: decision-log
+surfaces: both
+description: "Turn every decision the CEO makes — in meetings, Slack threads, or ad-hoc thinking — into a searchable log with who decided, when, why, and what changed. Fires on: 'we decided [X]' / 'we decided to go with [X]' / 'let's go with option [X]' (logging), 'log decision', 'what did we decide' / 'what did we decide about [topic]' (retrieval), 'decision history', 'why did we choose [X]', 'show me the decision log', 'pull in my past rulings' (one-time pull of past rulings to confirm), plus 'tune decision-log'. Revisit mode (formerly decision-revisit): 'revisit the [topic] decision', 'what decisions should I revisit', 'decisions to revisit', 'decision audit', 'is the [topic] decision still right'. Writes decision events and regenerates the decision-log view; tags extraction misses when a manual log follows a processed meeting. Does NOT fire on 'decision memo on [topic]' (decision-memo-composer — multi-option tradeoff) or 'what should I decide' (advisory, not logging)."
+---
+
+## Skill Boundary (v2.1)
+
+- **Use decision-log for:** capturing decisions that were MADE — the historical record. Also for searching the record.
+- **Use `decision-memo-composer` for:** the structured multi-option tradeoff BEFORE a decision is made ("decision memo on", "choose between", A-vs-B analysis) — v3.8.0+ split.
+- **Revisit mode** (`## Mode: revisit`, formerly `decision-revisit` — folded in SKILLMERGE1 2026-09-03): backward-looking re-examination of a PAST decision ("revisit the hiring decision", "what decisions should I revisit").
+- **Use `memo-writer` for:** single-decision narrative capture as a shareable document (decision doc), plus scope docs / strategy memos.
+- **Invoked automatically by:** meeting-notes (extracts decisions from transcripts), follow-up-ritual (captures decisions from meetings). This skill also runs standalone when the CEO wants to log an ad-hoc decision.
+
+## Writer Contract
+
+- **Writes:** `decision` events to `_hq/data/events.jsonl` (append-only) with v2.2 shape (`primary_thread_id` + optional `related_thread_ids[]` + `org_ids[]`). **v3.13.0+ MANDATORY: stamp `data.project_id` on every new decision event** by inferring from the active project context (the most-recently-loaded project per session, or the project matching `primary_thread_id`). Without `project_id`, the decision can't be surfaced when the CEO opens that specific project — pre-v3.13.0, ~95% of decisions in M's substrate carried no project_id, breaking project-scoped recall.
+- **Regenerates:** `_hq/views/DECISION_LOG.md` view after every write via `shared/scripts/render_decision_log.py` (v3.13.0+ — script created in this release). Also regenerated when a `decision_resolved`, `decision_superseded`, `decision_reaffirmed`, or `decision_revisit_scheduled` event is appended — those overlays update the status badge ([SUPERSEDED] / [RESOLVED] / [REAFFIRMED] / [SNOOZED]) on the referenced decision in the view. Pre-v3.13.0 the SKILL prose claimed auto-regeneration but no script existed; the view fell ~57 decisions stale.
+
+**Event append recipe (MANDATORY — SPEC GATE1 / A1).** The `decision` event MUST be written through the append door (`plan append_jsonl`, whose gate runs the locked writer `atomic_append_jsonl`), NOT a hand-rolled `next_seq`+`open('a')` append or a raw `>>`. The helper reserves the seq and writes inside the cross-process writer lock (`_hq/data/.writer.lock`), so a concurrent append can't lose your decision or duplicate a seq. Omit `seq`/`ts` — the helper auto-stamps both atomically. This recipe is the A1 lock contract; see `shared/WORKSPACE_API.md` → Append Protocol §3.
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan append_jsonl --json '{"holder": "decision-log", "rel": "_hq/data/events.jsonl", "rows": [{"data": {"decision": "<what was decided>", "impact": "<what changes>", "made_by": "<who made the call>", "project_id": "<project_NNN, MANDATORY per v3.13.0+>", "rationale": "<why, alternatives considered>"}, "person_ids": ["<canonical decider id>"], "primary_thread_id": "<project_NNN, or null>", "source_skill": "decision-log", "type": "decision"}]}'
+```
+
+Paste what it prints and run that: the append door lands the `decision` row through the gate's locked append (DECDOOR1, cr1#315), which reserves the `seq` and stamps the `ts`. Its answer is `{ok, n, stamped}`. `ok` false is a stop, never a hand retry. On a seat whose files are local the same append runs in this shell.
+
+**Extraction-miss tag (Phase 6 Loop 5).** When the CEO logs a decision by hand shortly after a meeting was processed, that's a signal meeting-notes missed the extraction. Before appending, check for a recent processed meeting sharing an attendee: `from extraction_hints import find_recent_meeting` → if `find_recent_meeting(event, <recent meeting_processed/meeting events>)` returns a ref, add `data.extraction_miss = True` and `data.source_meeting_ref = <ref["meeting_id"]>` to the event. The decision still logs normally; the tag is additive telemetry that insight-generator's Loop 5 pass clusters into extraction hints (never surfaced to the CEO). Best-effort — on any error, append the decision untagged.
+
+After the append, regenerate the view:
+
+**Renderer invocation pattern (after appending any decision-lifecycle event):**
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_writer --json '{"args": {"workspace_root": "<WS>"}, "name": "render_decision_log:regenerate"}'
+```
+
+Paste what it prints and run that: the write door runs `render_decision_log:regenerate` beside the data (DECDOOR1, cr1#315). Its `result` is the counts by status (`total`, `active`, `reaffirmed`, `snoozed`, `resolved`, `superseded`) and the view's `view_path`. `ok` false is a stop: say its `line` when it carries one. On a seat whose files are local the same writer runs in this shell.
+
+Per `shared/CONTRACT.md` Rule 4: the regeneration is silent — the user sees the updated view at `_hq/views/DECISION_LOG.md`, not a "regenerated X decisions" narration in chat.
+- **Does not write to:** `entities.json` (decisions are events, not entities), `aliases.json`, `classifier_feedback.jsonl`.
+- **Read-only consumer of:** `entities.json` (for person/project/org lookup), `events.jsonl` (for search/retrieval).
+- **Conflict boundary:** primary writer for `decision` events. If meeting-notes or follow-up-ritual extract a decision, they emit the event via decision-log's write protocol (not directly) so the regeneration hook fires consistently.
+
+**Closure events (v3.4.5+ — read-only here).** Two new event types close decisions in the log:
+- `decision_resolved` — the decision was executed / acted on. Written by the decision-CRU layer (`shared/scripts/decision_match.py`) when a meeting transcript shows completion language matching an open decision (HIGH-confidence auto-write only).
+- `decision_superseded` — a newer decision overrides this one. Same auto-write path, triggered by reversal language in a transcript.
+
+Closed decisions stay in the log — they're marked with a status badge ([RESOLVED] for a ruling that was carried out, [SUPERSEDED] for one a later ruling replaced) and moved to their own section, but never deleted. The renderer's five buckets are `active` / `reaffirmed` / `snoozed` / `resolved` / `superseded`; the two closed ones are `render_decision_log.CLOSED_DECISION_STATUSES` — read that set rather than spelling the statuses out, so a later bucket cannot slip past a filter. Per `shared/CONTRACT.md` Rule 24, the CRU layer is silent: closure events never appear in chat. The DECISION_LOG view is where users discover them.
+
+---
+
+# Decision Log
+
+**For:** CEOs making 50+ decisions a day who need to remember what was decided, why, and what changed.
+
+## First-Run Personalization (SPEC FRP1)
+
+This skill adopts the First-Run Personalization Protocol (`shared/FIRST_RUN_PROTOCOL.md`). Both
+decisions are **show-then-tune (STT)** — the decision is logged first, then one-tap changes are
+offered. Read config through `get_config` — never the raw file.
+
+```python
+# Run the Access preamble first (CONTRACT Rule 22 v6, the block in shared/WORKSPACE_ACCESS.md): it resolves $PLUGIN_ROOT, exports CR_ENV, and cds there.
+import sys; sys.path.insert(0, "shared/scripts")  # valid because cwd == $PLUGIN_ROOT per the preamble above
+from skill_config_writer import get_config, save_skill_config, wipe_skill_config, is_configured
+
+DEFAULTS = {
+    "auto_log": "auto",                # auto (log decisions from meetings silently) | confirm_first
+    "revisit_reminders": "strategic",  # strategic (remind on strategic decisions) | off
+}
+cfg = get_config(workspace_root, "decision-log", DEFAULTS)
+```
+
+`auto_log=auto` (default) logs decisions extracted from meetings/threads without a confirm step;
+`confirm_first` surfaces a one-tap confirm before writing the `decision` event. `revisit_reminders`
+controls whether `decision_revisit_scheduled` reminders are set on strategic decisions.
+
+**Mode dispatch (4 modes):**
+
+| Mode | Trigger | Behavior |
+|---|---|---|
+| **Detect** (default) | "log decision", "we decided…" | log the decision with `cfg`. On the FIRST fire only (`not is_configured(...)`): `save_skill_config(workspace_root, "decision-log", DEFAULTS)` BEFORE confirming, then append the first-run footer. |
+| **Show settings** | "show decision-log settings" | render current config in plain English; no logging. |
+| **Tune** | "tune decision-log" | pre-filled re-questionnaire OR freeform (table below) → `save_skill_config(..., is_reconfigure=True)` → confirm. |
+| **Reset** | "reset decision-log to defaults" | `plan run_writer` naming `skill_config_writer:reset_skill_config` with `{"skill_name": "decision-log", "workspace_root": "<WS>"}` as its args (in-shell on a seat whose files are local: `reset_skill_config(workspace_root, "decision-log")`); say its `line` → next fire is a first-fire again. |
+
+**The first-run block (footer — decision-log confirms in chat, no widget):**
+
+> *First time logging a decision for you. I set 2 defaults: **I log decisions from meetings
+> automatically** · **I'll remind you to revisit the strategic ones**. Say "tune my decision log"
+> to change either, or just tell me ("ask me before logging" / "no revisit reminders").*
+
+The footer renders exactly once ever (`is_configured` gate).
+
+**Freeform tune (natural language → config):**
+
+| User says | Config change |
+|---|---|
+| "ask me before logging decisions" / "confirm first" | `auto_log = confirm_first` |
+| "just log decisions automatically" | `auto_log = auto` |
+| "no revisit reminders" / "stop reminding me to revisit" | `revisit_reminders = off` |
+| "remind me to revisit strategic decisions" | `revisit_reminders = strategic` |
+
+After applying: `save_skill_config(..., is_reconfigure=True)` + confirm in one line.
+
+## What It Does
+
+Maintains a searchable, comprehensive record of every decision made across your entire business. Decisions are captured in real-time and organized by project, date, and status so you can instantly find "what did we decide about X?" without digging through emails or meeting notes.
+
+The log lives at `[WORKSPACE_ROOT]/_hq/views/DECISION_LOG.md` (v3.13.0+ canonical path — consolidated from the pre-v3.13.0 dual paths at `_hq/DECISION_LOG.md` AND `_hq/views/DECISION_LOG.md`). The view is regenerated by `shared/scripts/render_decision_log.py` after every decision-event write. The view is automatically updated when:
+- You explicitly log a decision during a session
+- The meeting-notes skill processes a meeting and extracts decisions
+- You ask the skill to search or retrieve decision history
+
+## How to Use
+
+**Log a Decision (Explicit)**
+
+```
+"Log decision: we're going with the [option] because [reason]"
+"Decision: pivot to [new direction]"
+"Log: approved the [thing] with these constraints [constraints]"
+```
+
+**Search & Retrieve**
+
+```
+"What did we decide about [topic/project]?"
+"Decision history for [Project Name]"
+"Recent decisions"
+"Who decided [decision]?"
+"When did we decide about [X]?"
+"What was the rationale for deciding on [option]?"
+"Show me all decisions on [project] in [timeframe]"
+```
+
+**Pulling in past rulings (cr1#1015).** On `pull in my past rulings` (or `import my rulings`), run the one-time pull. It reads the rulings files (the workspace brief, any file whose name says ruling or decision, and any file the owner names) and puts each dated ruling on the Hub, in Work, under Commitments, To confirm, as a proposed decision, naming the older ruling it would replace. Nothing counts as a decision until the owner confirms it there or in `staff meeting`. Run it once without `apply` and say how many it found, then with `apply: true` when the owner says go:
+
+```bash
+cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_writer --json '{"name": "past_rulings:pull_past_rulings", "args": {"workspace_root": "<WS>", "apply": false}}'
+```
+
+Paste what it prints and run that. Say its `result.line` and nothing about files or rows. Running it again is safe: a ruling already a decision, already waiting, or recently declined is not proposed twice.
+
+**Answering "what did we decide about [topic]" (cr1#1015 — MANDATORY).** Never answer from the log's words alone: a later ruling may have replaced the one whose words match. Ask the decision list, which reads every replacement link the decision log view reads and follows a replaced ruling to the one that stands now:
+
+```bash
+cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_helper --json '{"name": "decision_list:what_did_we_decide", "args": {"workspace_root": "<WS>", "topic": "<the topic in the owner'"'"'s words>"}}'
+```
+
+Paste what it prints and run that. Its `result.lines` are one plain line per ruling that stands now, each naming what it replaced, then one per matching ruling that was closed with nothing standing in its place. Hand them unchanged, as the retrieval's `found` rows, to the composer and the one door in "The wrapper text is composed" below; never retype them. Never restate an older ruling as current: when `result.current` is empty and a line says a ruling was replaced, that line is the answer. `decision_list:decision_list` answers the whole list (`standing_only`, `thread` narrow it); every row carries the decision's id and entry number, which is how a detail is checked against the log entry itself.
+
+**Decision Tracking**
+
+```
+"Is the [decision] still active or superseded?"
+"Has anything changed since we decided [X]?"
+"Which decisions are currently active?"
+"Decisions that need review"
+```
+
+## Decision Entry Format
+
+Each decision in the log follows this structure:
+
+```markdown
+### [Date] — [Decision Title]
+**Project:** [project name]  
+**Decision:** [what was decided]  
+**Rationale:** [why — context, alternatives considered]  
+**Made by:** [who made the call]  
+**Impact:** [what changes as a result]  
+**Status:** Active / Reaffirmed / Snoozed / Resolved / Superseded by [newer decision + date]  
+**Tags:** [relevant categories or outcomes]  
+```
+
+### Example
+
+```markdown
+### 2026-04-08 — Transition to Product-Led Go-To-Market
+**Project:** Go-To-Market Strategy  
+**Decision:** Shift from enterprise sales to freemium product-led model  
+**Rationale:** Market data shows 70% of new users self-serve; enterprise sales cycle is 6+ months. Competitors gaining share. Alternatives: stay with current model (risk), hybrid approach (too complex for now).  
+**Made by:** CEO  
+**Impact:** Sales team realigns to expansion; Product prioritizes onboarding UX; Marketing shifts to product demos  
+**Status:** Active  
+**Tags:** GTM, Product Strategy, Go-To-Market
+```
+
+**Output guard:** no internal tokens, paths, event names, or version numbers in anything the CEO sees — vocabulary per `shared/VOICE_CALIBRATION.md` § Plain-language glossary.
+- Bad: "Status: Superseded by decision_0042"
+- Good: "Status: Superseded by the freemium pricing decision (Apr 12)"
+
+## Key Queries
+
+**What Happened Recently**
+
+```
+"Recent decisions" — last 2 weeks of all decisions
+"Recent decisions on [project]" — last 2 weeks for a specific project
+"Decisions made in [month/date range]"
+```
+
+**Project-Level View**
+
+```
+"All decisions for [Project Name]"
+"Active decisions on [project]"
+"Decision timeline for [project]"
+"What have we decided about [project scope]?"
+```
+
+**Decision Intelligence**
+
+```
+"Which decisions are superseded?"
+"Are we still following through on [decision]?"
+"Decisions that depend on [other decision]"
+"What alternatives did we rule out for [decision]?"
+```
+
+## Triggers
+
+- "log decision"
+- "decision:"
+- "we decided"
+- "log this decision"
+- "what did we decide about"
+- "decision history"
+- "recent decisions"
+- "decision log"
+- "are we still doing"
+- "did we decide to"
+
+## Connected Tools
+
+- **meeting-notes** — Automatically extracts and logs decisions from processed meetings
+- **entities.json + events.jsonl** — the substrate this skill cross-references project status against (MASTER_TRACKER is a regenerated Tier-2 view — never read it as authoritative or write to it)
+- **BUSINESS_CONTEXT** — Provides context for decision rationale
+- **Session Notes** — Pulls decisions from ongoing work sessions
+
+## Craft: how you decide (cr1#1391)
+
+A craft file is how you, or your firm, decide, as numbered rules. On EVERY run, load yours through the read door, one call, with `"subject_ids": []` (add the project or business id the decision is about when the resolver returned one):
+
+```bash
+python3 "$RT/shared/scripts/workspace_access.py" run_helper --json '{"args": {"subject_ids": [], "task": "decision-log", "workspace_root": "<WS>"}, "name": "craft_recall:craft_for_task"}'
+```
+
+Apply the rules in `result.files` in the order given (yours first, then your firm's). Cite every rule the output used: pass their `cite_id`s to the helper and paste each of `result.lines` as one bullet of the `Sources:` section.
+
+```bash
+python3 "$RT/shared/scripts/workspace_access.py" run_helper --json '{"args": {"cite_ids": ["<cite_id>", "<cite_id>"], "workspace_root": "<WS>"}, "name": "craft_recall:cite_rules"}'
+```
+
+No file loaded, or no rule used: the turn says nothing about craft.
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## Gotchas
+
+- **Superseding Old Decisions:** When a new decision overrides an older one, append a `decision_superseded` event referencing the old decision rather than deleting anything — the regenerated view then badges the old entry "Superseded by [newer decision]". Never hand-edit the view. This preserves decision history and context.
+- **Ambiguous Decisions:** If "we decided" but it's unclear who actually made the call, log it as "Team consensus" or "Inferred from [source]"
+- **Timing:** Log decisions as close to when they're made as possible. End-of-day batch logging loses context.
+- **Rationale Matters:** Just logging "Decision: X" without rationale is useless. Future you (or your successor) will need to know why this decision made sense at the time.
+- **Impact Is Key:** A decision without identifying impact is incomplete. What actually changes? Who needs to adjust their work?
+- **Interdependencies:** Some decisions depend on others. Call this out in the "Impact" or "Rationale" section.
+
+## What It Doesn't Do
+
+- It doesn't enforce decisions or track compliance
+- It doesn't automatically reverse or update decisions (you explicitly do that)
+- It doesn't integrate with project management tools directly (but references them)
+- It doesn't create decision-making frameworks — for a structured A-vs-B tradeoff say `decision memo on [topic]` (decision-memo-composer); for failure-mode mapping say `stress test [plan]` (stress-test)
+
+## Workflow Integration
+
+**After Each Meeting:**
+1. meeting-notes skill processes the transcript
+2. Decisions are automatically logged as `decision` events in events.jsonl (the canonical record); the `_hq/views/DECISION_LOG.md` view regenerates from them
+3. You can review them with "decisions from the [Project] meeting"
+
+**Weekly Reviews:**
+1. Run "recent decisions" to see what was decided this week
+2. Check if any decisions need immediate action
+3. If any have been superseded, log the superseding decision — the status badge updates in the regenerated view
+
+**Quarterly Planning:**
+1. Pull "all decisions for [Project]" to see the arc of decisions
+2. Identify patterns or conflicting decisions
+3. Use history to inform next quarter's priorities
+
+## Next Steps
+
+- Connect decisions to project execution through the substrate — `decision` events carry `primary_thread_id`, so project-scoped recall ("all decisions for [Project]") reads events.jsonl directly
+- Use **call-prep** to reference relevant decisions in upcoming meetings
+- Use **people-crm** to track decisions that impact relationships
+- Use **weekly-recap** / **operator-report** to see the period's decisions surfaced in recaps
+
+## Mode: revisit — "what decisions should I revisit" (formerly decision-revisit)
+
+The retrieval-and-re-examination mode of the same log. Logging asks *what did we decide*; this mode asks *is it still right*. It was its own skill (`decision-revisit`) until SKILLMERGE1 (2026-09-03); every phrase it answered routes here, its four widget verbs (`revisit` / `still valid` / `replace` / `snooze 30d`) and their apply-choices dispatch entry (`decision-revisit`, the persisted widget src) are unchanged, and the events it writes keep `source_skill: decision-revisit`. Fires on: 'revisit the [topic] decision', 'what decisions should I revisit', 'decisions to revisit', 'decision audit', 'is the [topic] decision still right', 'which decisions are stale', 'review my decisions'.
+
+### Mode boundary
+
+- **Use the revisit mode for:** proactive surfacing of decisions due for review. Reads the decision log, scores revisit-worthiness, surfaces top candidates with per-item action set.
+- **Use the logging path (above) for:** capturing a NEW decision, and for retrieval of a specific known decision ("what did we decide about pricing").
+- **Use `decision-memo-composer` for:** writing a NEW decision memo (forward-looking tradeoff analysis).
+
+### Writer Contract (v3.8.0+ — substrate-native)
+
+Before writing to any workspace file, read `shared/WORKSPACE_API.md`.
+
+**Appends to:**
+- `_hq/data/events.jsonl` — event type `decision_reaffirmed` when the user confirms a decision is still valid. Carries `{decision_event_seq, reaffirmation_reason, reviewed_at, snooze_until}`.
+- `_hq/data/events.jsonl` — event type `decision_superseded` when the user supersedes a decision (chained invocation to `decision-log` to write the NEW decision; `supersedes_seq` field links the two). This event type already exists in the schema (added in v3.4.5).
+- `_hq/data/events.jsonl` — event type `decision_revisit_scheduled` when the user snoozes a decision. Carries `{decision_event_seq, snooze_until_ts}`. (Snooze surfaces in the next scan as eligible for re-surface after `snooze_until_ts`.)
+
+**Append through the locked writer (SPEC GATE1 / A1):** the `decision_reaffirmed` and `decision_revisit_scheduled` events MUST be written via `atomic_append_jsonl(events_path, [event], holder="decision-revisit")` (the holder / `source_skill` value stays `decision-revisit` — persisted vocabulary is canonical, see `source_skill_compat.FOLDED_SKILL_ALIASES`) (omit `seq`/`ts` — auto-stamped inside the lock), NOT a hand-rolled append. The `decision_superseded` path chains to `decision-log`, which writes its `decision` event through the same locked recipe. See `shared/WORKSPACE_API.md` → Append Protocol §3.
+
+**Reads from:**
+- `_hq/data/events.jsonl` — every `type == "decision"` event (the input universe).
+- `_hq/data/events.jsonl` — every event with `data.references_decision_seq == <decision_seq>` OR matching topic / project-id / affected-entity heuristics (the "contradictory signal" pass).
+- `_hq/data/entities.json` — for the named-condition check. If a decision's `data.rationale` mentioned "we don't have ops capacity" and entities.json now shows a person with `role: "Head of Ops"` added after the decision date, that's a signal worth surfacing.
+- `_hq/views/DECISION_LOG.md` is NOT the source — that's a regenerated view. Read directly from events.jsonl per shared/CONTRACT.md Rule 24 (substrate is the source).
+
+**Conflict boundary:** sole writer of `decision_reaffirmed` and `decision_revisit_scheduled` events. `decision_superseded` writes go through `decision-log` (chained invocation, not direct write).
+
+---
+
+### What the revisit mode does
+
+Decisions are append-only forever; pre-v3.8.0 the substrate had no way to surface "this decision was made 94 days ago, and three events since suggest the rationale no longer holds." This mode closes that loop.
+
+### What It Does
+
+Scans every decision event in events.jsonl. For each `status == "active"` decision, computes a revisit-worthiness score from:
+
+1. **Time elapsed** — decisions older than 60 days enter the candidate pool; >120 days weight higher.
+2. **Contradictory signal** — count of subsequent events that reference the decision's topic, affected entities, or project but represent state changes inconsistent with the decision (e.g., a decision "stay agency-only" followed by a `person_added` event with `role: "Head of Ops"`).
+3. **Named-condition shift** — if the decision's `data.rationale` contains phrases like "we don't have X" / "until Y exists" / "while Z is the bottleneck", check whether those conditions still hold via entities.json + recent events. Each shift adds to the score.
+4. **Stakeholder change** — if a decision's stakeholders (from `person_ids`) have changed roles or left the workspace, score up.
+
+Rank decisions by score. Surface top 5 in a widget with per-decision context ("why revisit?") and the action set.
+
+### How to Use
+
+```
+"what decisions should I revisit"
+"decision audit"
+"decisions to revisit"
+"old decisions worth re-examining"
+"which decisions are stale"
+```
+
+Runs on-demand. Can also be scheduled through `change-schedule` (operator-led setup).
+
+### How It Works
+
+#### Phase 1 — Load candidate decisions
+
+Load the candidate set through the canonical open-decision fold — `from decision_match import load_open_decisions; open_decisions = load_open_decisions(workspace_root / "_hq" / "data" / "events.jsonl")` — NEVER a freelance `status == "active"` filter over raw events. The loader is the one place that honors every accepted supersede shape (SUPERSEQ1: `decision_superseded` by id, by any data-scope seq spelling, or by the top-level `supersedes_seq` field, PLUS the restamp shape — a newer `decision` event carrying `supersedes_seq`); a hand-rolled status filter re-surfaces rulings the ledger already replaced. Then drop from the candidate set anything reaffirmed in the last 30 days or currently snoozed (`decision_reaffirmed` / `decision_revisit_scheduled` overlays referencing the decision by id or seq).
+
+**Named-decision branch ("revisit the hiring decision" / "revisit the pricing decision"):** when the trigger names a specific decision, resolve it against the candidate set (topic/entity fuzzy match; if two candidates tie, ask which). Skip Phases 2–3 entirely — no scoring, no ranking — and render Phase 4's widget with just that ONE decision card (same "why revisit?" snippet, same four actions). Only the bare scan-all triggers ("what decisions should I revisit", "decision audit") run the full rank.
+
+#### Phase 2 — Score each candidate
+
+For each candidate:
+- `time_score` = clamp(`days_since_decision / 60`, 0, 3)
+- `contradictory_signal_score` = count of events in [decision_ts, now) that reference the decision's topic/entities/project but represent state changes inconsistent with the rationale
+- `named_condition_score` = +1 per phrase in rationale that maps to a named condition that has demonstrably shifted (entities.json now contains an entity that contradicts it, OR events.jsonl contains evidence of the condition no longer holding)
+- `stakeholder_score` = +0.5 per stakeholder who has changed role / left workspace since decision date
+- `total = time + contradictory + named_condition + stakeholder`
+
+**Named-condition extraction (ADV1 — how to actually compute `named_condition_score`):** scan the decision's rationale text for the patterns **"until X", "while X", "as long as X", "we don't have X", "once X", "if X changes"**. Each match is a named condition. **"Demonstrably shifted"** means entities.json or events.jsonl now contradicts it — the role got hired (a person with that title now exists), the budget constraint lifted (a funding/revenue event landed), the dependency moved (that project's status changed). **Quote the original condition AND the contradicting evidence in the widget — never score a shift you can't cite.** A condition you can't point to a contradiction for scores 0, not a guess.
+
+**Coefficients are tunable constants, not arbitrary** (so a future session doesn't treat them as magic): `time_score` clamps at **60 days** (the floor where a decision is old enough to re-pressure-test without nagging) up to a max of 3; `stakeholder_score` is **0.5/stakeholder** (a personnel change is a real but secondary signal — half the weight of a directly-contradicted named condition); `named_condition` and `contradictory_signal` are **1.0 each** (the strongest signals — the world directly disagreeing with the rationale). Adjust these if real usage shows the ranking is too eager or too sleepy.
+
+#### Phase 3 — Rank + surface
+
+Take top 5 by total score. Build a "why revisit?" snippet for each — naming the specific events / entity changes / time gap that drove the score. Render as a widget.
+
+#### Phase 4 — Render widget
+
+Per-item action set (all four are CANONICAL_ACTIONS members — the Phase 4 deliberation-set extension; dispatch lives in apply-choices' `decision-revisit` source entry):
+- `revisit` (displays "Revisit now") — opens `decision-memo-composer` pre-filled with the original decision's framing + the contradictory signal pass as starting context.
+- `still valid` (displays "Still valid") — appends `decision_reaffirmed` event. Decision exits the candidate pool for 30 days.
+- `replace` (displays "Replace it") — chains to `decision-log` to capture the new decision; this skill writes `decision_superseded` linking to the original (the event type keeps its name — only the button label is friendly).
+- `snooze 30d` (displays "Snooze (30 days)") — appends `decision_revisit_scheduled` with `snooze_until_ts = now + 30d`. Decision is re-eligible after that.
+
+Widget follows `shared/CHAT_ACTION_WIDGET.md` contract. Validators per `shared/CONTRACT.md` Rules 1-4. **Render it READ-ONLY (SPEC_WIDGETRO1 §2-1, CUT-C item 9 — ATTENDED_TEST_v5.28.0 B5.3):** the one call is `widget_transport.render_and_persist(data_view=<the view>, wrapper="fragment", persist_dir=<WORKSPACE>/_hq/.system/widgets, page=1, read_only=True)` — the rows carry exactly the four verbs above and a pick dispatches on its own; the page carries NO batch footer (no Apply all, no Reset, no `Snooze rest (1 day)` — the footer's 1-day mute contradicted the row's own 30-day snooze and is not a verb of this surface). The transport's validator reds a revisit page that carries one. Relay `transport["html"]` byte-exact.
+
+### Output Structure (widget)
+
+```
+5 decisions worth a second look
+
+1. Acme Co as agency vs in-house     [decided 2026-02-14, about 3 months ago]
+   Original reasoning: "we don't have ops capacity"
+   What's changed: you hired Mira Sample on April 8 as Head of Ops, and
+   recent activity points to internal capacity now beating the agency.
+
+   [Revisit now]  [Still valid]  [Replace it]  [Snooze (30 days)]
+
+2. Quarterly pricing reviews          [decided 2026-01-03, about 4 months ago]
+   Original reasoning: "monthly is too noisy"
+   What's changed: two customers cancelled recently citing "pricing
+   surprise" in their exit notes.
+
+   [Revisit now]  [Still valid]  [Replace it]  [Snooze (30 days)]
+
+[Show 3 more]
+```
+
+**Output guard:** no internal tokens, paths, event names, or version numbers in anything the CEO sees — vocabulary per `shared/VOICE_CALIBRATION.md` § Plain-language glossary (event types like `decision_superseded` stay internal; the buttons say "Replace it" / "Still valid").
+- Bad: "[Supersede] — writes decision_superseded referencing seq 412"
+- Good: "[Replace it] — I'll log the new decision and link it to the old one"
+
+### DOES NOT
+
+- Mutate prior decision events. Per references/DATA_CONTRACT.md: events are append-only. Revisit produces NEW events (`decision_reaffirmed`, `decision_superseded`, `decision_revisit_scheduled`); the original `decision` event is never rewritten.
+- Auto-resolve. Every action is user-initiated via the widget.
+- Surface decisions still inside their snooze window (`snooze_until_ts > now`).
+- Read DECISION_LOG.md as truth — it's a regenerated view. Source is events.jsonl.
+
+## The wrapper text is composed, not written (SPEC FIXTRAIN 6.2 — MANDATORY)
+
+The scan step below has been in this file since CUT-C, and on 09-07 this skill leaked anyway — the ack and the retrieval header named the activity file and the view's path. A rule the model reads is not a fence the model passes through. So the prose AROUND a decision — the "logged it" ack, the "here is what you decided" header, the empty answer — is built by the composer and printed as returned:
+
+```python
+import sys
+sys.path.insert(0, "shared/scripts")
+from surface_composers import decision_log_answer
+print(decision_log_answer(logged=the_decision_in_their_words,
+                          workspace=workspace_root))                 # logging
+print(decision_log_answer(found=one_line_summaries, topic=the_topic,
+                          workspace=workspace_root))                 # retrieval
+```
+
+Where the decision is kept is never part of the answer. The customer asked what they decided, not where it is filed.
+
+**Doubled entries: say it, never offer it (OFFERS1 — MANDATORY).** Asked for the log on 2026-09-16, this skill noticed four entries that were logged twice and **offered to clear them** instead of saying what it sees. It could not have cleared them: the append-only contract below never deletes a line, and the cleanup path that contract points at marks a duplicate entry NUMBER (`seq_health.py --mark`) — two decisions logged under the same heading are two distinct entries with two distinct numbers, which that scan never sees. So the offer promised a verb nothing in this product has. The count and the sentence are both composed, and **the sentence names no door either** (review round 1, F-2): pointing the reader at a command that cannot do it is the same defect one sentence over. It ends at what is true — the log lost nothing:
+
+```python
+import sys
+sys.path.insert(0, "shared/scripts")
+from decision_match import load_open_decisions
+from offer_gate import duplicate_decisions, decision_log_duplicates_line
+
+rows = load_open_decisions(events_jsonl_path)     # the canonical loader
+dupes = decision_log_duplicates_line(duplicate_decisions(rows))
+```
+
+`duplicate_decisions` counts, among the OPEN decisions it is handed, the rows that repeat a heading already logged that day — the same heading the rendered log shows. **It is handed the rows; it never opens the book itself**, and it reaches no other bucket: the rendered log also shows resolved and superseded decisions, and the line says what this count saw, not what every bucket holds (review round 1, F-3). The canonical decision loader is the one reader on this path, and a fence module that reads the ledger a second way is the shape the privacy firewall's allowlist exists to stop. A repeat months later is a decision taken again, not a duplicate entry, and is not counted. When it is zero the line is empty and **nothing is said at all**; there is no "no duplicates found" sentence, because a clean log is the ordinary case and needs no line. When it is not zero, say the line as its own line under the log and say nothing else about it.
+
+**The whole reply goes through one door (SPEC FIXTRAIN v5.31.0 6.1, R-25 — MANDATORY).** A composer gates the sentence it built; it cannot gate the sentences typed after it. Eleven of the thirteen leaks on the v5.31.0 record were exactly that shape — a clean composed answer, then an ungated paragraph naming files, functions, event names and writer ids. The 09-13 record carried the same shape here as everywhere else: the composer's line was clean and the paragraph after it named the record. So compose everything you intend to post, hand it to `post` ONCE, and print what it returns as your entire reply.
+
+```python
+import sys
+sys.path.insert(0, "shared/scripts")
+from surface_composers import post
+from offer_gate import compose, SITE_DECISION_LOG
+# `composed_text` is `decision_log_answer`'s return, in this same run -
+# relay it, never retype it. The door vouches a relay LINE FOR LINE
+# against what a composer here actually returned, so a sentence you
+# wrote yourself cannot ride in as one. Nothing here is the CEO's own
+# typed text, so no rows are named; where a section IS composed around
+# their words it passes `customer_rows` and the door reads the words
+# off those rows itself (see the undo receipt in workspace-manager).
+# `compose` is the OFFER fence (OFFERS1) and it runs FIRST, on the whole
+# reply: this surface offered to clear doubled entries on 09-16, which is
+# a verb it does not have. It raises rather than returning; rewrite the
+# sentence, never the fence.
+print(post(compose(SITE_DECISION_LOG, whole_reply), surface="decision-log",
+           workspace=workspace_root, relayed=composed_text))
+```
+
+`relayed` is the composer's own return, and the door checks it twice: for PRESENCE, IN ITS OWN ORDER (paraphrasing it instead of relaying it is a refusal, not a style — and so is shuffling its lines or repeating one of them: a relay is the composer's return, not its ingredients) and for ORIGIN — every line of it must be a line a composer returned in THIS same run, and the check is in full: one unvouched line refuses the whole post. There is no share of a turn a caller may claim as already-checked. `customer_rows` is how a reply says it was composed around the CEO's own words: you name the ROWS (by seq, or by row id) and **the door reads their customer-typed fields off the book itself**. There is no argument for the words — you cannot tell this door what they typed, only which of their rows to go and read, and a call with no `workspace` declares nothing at all. **Be exact about what a declaration does**: it blanks the declared fragment out of the copy the INTERNAL-NAME classes read — `_hq/` paths, data-file and module names, script names, build codes, the vocabulary roster and the record counter — which is most of this gate, so it is not something to hand yourself. Record ids and the absolute-path scan read the whole text whatever was declared. Everything undeclared is this product's own words and is scanned in full. `post` raises rather than returning, and nothing is caught. **If it refuses, post the composer's return on its own** — it is already gated, and the paragraph that could not pass is the paragraph that should not have been written; **if even that refuses, post `surface_composers.refused_line(<surface>)` and nothing else** — one honest sentence that it could not put the answer together, with the phrase offered again. **There is no sentence after it.**
+
+**On a merged seat, the composer and the door run as ONE form (cr1#1005 part 3, owner ruling 2026-11-12).** Through the workspace door each helper runs in its own process, so a composer run on the read door and `post` run after it never meet, and every relay is refused. Do not call `decision_log_answer` and `post` separately there. Render the combined form with `plan run_writer` and run what it prints: it runs the composer, the offer fence and `post` in one process, with the composer's return as the relay. `composer_args` are the composer's own (`logged`, or `found` and `topic`); `before` and `after` are the only sentences you add, and they are scanned like every other line.
+
+```bash
+cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_writer --json '{"name": "surface_composers:compose_and_post", "args": {"workspace_root": "<WS>", "surface": "decision-log", "composer_args": {"found": ["<each result.lines line, unchanged>"], "topic": "<the topic in the owner'"'"'s words>"}, "after": ""}}'
+```
+
+Print its `result.text` as the entire reply. `result.posted` says which of the three answers it is (`whole`, `composer_only` when your added sentences could not pass, `refused` when even the composer's return could not); the fallback is already done, so there is nothing to retry and no sentence after it.
+
+The doubled-entries line (`decision_log_duplicates_line`, above) goes in `after`, unchanged, when it is not empty. If the door itself refuses the form (`ok` is false, for example a sentence you added that starts like a path), say nothing of why: run `surface_composers:refused_line` with `{"surface": "decision-log"}` through `plan run_helper` and print its `result` alone.
+
+## Narration leak scan (CUT-C item 8 — MANDATORY on every composed line)
+
+Widget bodies are scanned inside `widget_transport.render_and_persist`; the PROSE this skill composes around them is not, unless this step runs. Before posting any sentence you composed — an ack, a header, a summary, a pointer, a "why" line — run `validate_chat_output(<the text>)` from `chat_output_renderer.py` (`shared/scripts/`). It raises `LeakDetectedError` on a raw id (`person_NNN`, `project_NNN`, `org_NNN`, a `cmt_` / `bp_` / `pcand:` wire id), an event or field name, a file name or path, or a score. ABORT the post and rewrite the sentence with the entity's name (`narration_names.humanize(text, narration_names.name_index(<WORKSPACE>))` is the one substitution). NEVER catch the error and post anyway. Text relayed byte-exact from a driver or the transport is already scanned and is not re-composed.
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> Turn every decision the CEO makes — in meetings, Slack threads, or ad-hoc thinking — into a searchable log with who decided, when, why, and what changed. Use when the CEO says 'log decision', 'we decided', 'we decided to', 'we're going with', 'let's go with', 'we'll go with', 'what did we decide', 'what did we decide about', 'what did we decide about pricing', 'decision history', 'show me the decision log', 'show decision log', 'show the decision log', 'pull in my past rulings', 'import my rulings', 'why did we choose', 'why did we pick'. Writes `decision` events to events.jsonl and regenerates _hq/views/DECISION_LOG.md. Also handles first-run personalization settings — use when the CEO says 'tune my decision log', 'tune decision-log', 'show decision-log settings', 'reset decision-log to defaults'. DOES NOT fire on 'decision memo on', 'decision memo for', 'tradeoff analysis', 'choose between' — those go to decision-memo-composer (v3.8.0+ — structured multi-option tradeoff). Revisit mode (formerly decision-revisit, folded in SKILLMERGE1 2026-09-03) — surface decisions worth re-examining based on elapsed time, contradictory new signal, and whether the original rationale's named conditions still hold: 'what decisions should I revisit', 'decision audit', 'decisions to revisit', 'decision revisit', 'decision review', 'old decisions worth revisiting', 'which decisions are stale', 'review my decisions', 'decisions worth re-examining', 'revisit the hiring decision', 'revisit the pricing decision', 'revisit the' (any single-decision revisit-by-name), 'is the [topic] decision still right'. DOES NOT fire on 'what should I decide' (that's advisory, not logging).

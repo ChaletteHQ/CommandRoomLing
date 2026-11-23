@@ -1,0 +1,2741 @@
+#!/usr/bin/env python3
+"""
+Atomic write helper for Command Room data substrate files (entities.json,
+events.jsonl, aliases.json) on Drive-synced workspaces.
+
+THE BUG THIS FIXES (added v2.10.5):
+
+When a skill writes entities.json with `path.write_text(...)` or `open(...,
+"w") + .write()` on Windows, the OS does:
+  1. truncate the file to zero
+  2. write the new content
+  3. close
+
+If Drive for Desktop syncs during step 1 or step 2, the partial-write state
+gets propagated. Other consumers (the Claude app, the same workspace on another
+machine, another skill running concurrently) see a truncated or partial
+entities.json and either error out or fall back to backups.
+
+Evidence this has happened:
+  * `_hq/data/_backups/entities.json.pre-rewrite-20260427-223852.backup` —
+    workspace-manager backed up a corrupted state on Apr 27 before
+    bash-rewriting a clean version
+  * Cracks-watch fire on Apr 28 noted "the live entities.json is currently
+    truncated mid-file at person_058" and fell back to a backup
+  * A legacy Cowork bridge fire on Apr 29 reported the same truncation symptom while
+    the live file on disk was actually valid (38353 bytes) — the legacy app was
+    seeing a stale Drive-sync view of a partial-write state from a prior
+    skill's non-atomic write
+
+THE FIX:
+
+Atomic write pattern. Write to a temp sibling, fsync, then rename.
+
+  1. Write content to entities.json.tmp.<unique-id>
+  2. fsync the temp file (force OS to flush to disk)
+  3. os.replace temp → entities.json (atomic on every modern filesystem)
+
+Drive only ever sees the rename — never the partial-write states. Any
+concurrent reader either sees the OLD valid content (before rename) or the
+NEW valid content (after rename), never a torn write.
+
+This module is a hard dependency for any skill that writes entities.json,
+events.jsonl, aliases.json, or any other workspace data substrate file
+that the Claude app / cross-machine sync / weekly-audit reads.
+
+USAGE:
+
+    from atomic_write import atomic_write_text, atomic_write_json
+    atomic_write_text(path, content_string)
+    atomic_write_json(path, dict_or_list, indent=2)
+
+For event-stream-style files use atomic_append_jsonl. Since SPEC INDEX1
+Phase A (2026-09-02) it has TWO paths: `events.jsonl` is TRUE-APPENDED
+(`O_APPEND|O_BINARY`, one write, fsync, read-back, under the writer lock —
+the ledger is never rewritten and the cost of an append no longer grows with
+the history); every other JSONL file keeps the whole-file read + atomic
+rename, because its contract is whole-file. See `atomic_append_jsonl`.
+
+    from atomic_write import atomic_append_jsonl
+    atomic_append_jsonl(path, [event_dict_1, event_dict_2])
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+def _require_named_writer() -> None:
+    """BRIEFDOOR1 MUST 5 (ruling R-RW3-8) -- no write without a named writer
+    on a merged seat's sandbox VM.
+
+    `receipts.require_writer_on_vm_seat`, asked by the two paths every
+    writer in the tree funnels through: `atomic_append_jsonl` (the one
+    append path -- `event_gate.append_event` delegates to it) and
+    `acquire_write_lock` (the sentinel lock under every `entities.json` /
+    `aliases.json` rewrite). Asked BEFORE anything is read, locked or
+    written, so a refusal leaves the ledger, the anchor file and the lock
+    directory exactly as they were. On every legacy and local seat the
+    question reads the environment and returns: byte for byte today.
+
+    Lazy and import-tolerant with the same shape as `_clock1()`:
+    this module sits at the bottom of the import graph, and a runtime whose
+    `receipts` predates the question keeps today's behaviour.
+    """
+    try:
+        import receipts as _receipts
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            import receipts as _receipts
+        except Exception:
+            return
+    except Exception:
+        return
+    ask = getattr(_receipts, "require_writer_on_vm_seat", None)
+    if ask is not None:
+        ask()
+
+
+def left_in_place(op: str, path, exc: BaseException) -> None:
+    """Say ONE line when a delete was refused and the file was left behind.
+
+    ACCESS1 (probe P2, `build/P1_RESULT_2026-09-19.md`): on the merged
+    environment's mount `os.unlink` raises `PermissionError(1, 'Operation not
+    permitted')` — the device shell's no-delete policy, not a filesystem ACL.
+    Every delete in the write path was already written to swallow `OSError` and
+    carry on, which is the right POSTURE and the wrong volume: a refused delete
+    became invisible, so the residue it leaves had no explanation and no trail.
+    The behaviour is unchanged (leave it, carry on); the line is the change.
+
+    Never raises, never fails a write. Warnings go to stderr, which the access
+    layer returns to the caller as `stderr_tail`.
+    """
+    try:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[atomic_write] {op}: could not remove {path} "
+            f"({type(exc).__name__}: {exc}); left in place\n"
+        )
+    except Exception:
+        pass
+
+
+def atomic_write_text(path: str | Path, content: str, encoding: str = "utf-8",
+                      create_parents: bool = True) -> None:
+    """Write text to `path` atomically. Guarantees that any concurrent reader
+    of `path` sees either the old content or the new content, never a torn
+    write or a truncated/partial state.
+
+    Implementation: write to a temp sibling, fsync, then os.replace.
+
+    `create_parents` (FOLDERGUARD) decides what happens when the parent
+    directory is missing. Default True preserves every `_hq/` substrate caller,
+    which must self-create. Pass **False** for any path inside a user's project
+    folder: those directories are the CEO's, not ours, and a missing one means
+    the *record* is wrong — a mkdir there fabricates a folder that was never
+    there and makes the bad record look valid to every later reader. False turns
+    that silent corruption into a loud FileNotFoundError.
+    """
+    path = Path(path)
+    if create_parents:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    elif not path.parent.is_dir():
+        raise FileNotFoundError(
+            f"refusing to create parent directory for {path} "
+            f"(create_parents=False and {path.parent} does not exist)")
+
+    # mkstemp gives us a unique sibling temp file with restrictive perms.
+    # We use the same parent directory so os.replace is a same-filesystem rename
+    # (which is the atomic guarantee on Windows + POSIX).
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.tmp.",
+        suffix=".write",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_path)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        # On Windows, os.replace overwrites atomically (POSIX-equivalent rename).
+        os.replace(tmp_path, path)
+    except Exception:
+        # If anything went wrong, clean up the temp file. Don't leave it
+        # behind (Drive will sync it as garbage otherwise).
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError as _exc:
+            left_in_place("atomic_write_text temp cleanup", tmp_path, _exc)
+        raise
+
+
+def atomic_write_json(
+    path: str | Path,
+    data: Any,
+    indent: int | None = 2,
+    ensure_ascii: bool = False,
+    create_parents: bool = True,
+) -> None:
+    """Atomic JSON write. Wraps atomic_write_text with json.dumps."""
+    content = json.dumps(data, indent=indent, ensure_ascii=ensure_ascii)
+    if indent is not None:
+        # json.dumps doesn't add a trailing newline; add one for tooling sanity.
+        content = content + "\n"
+    atomic_write_text(path, content, create_parents=create_parents)
+
+
+#: The ONE plain sentence a refused append says when the ledger on disk is
+#: older than the copy Command Room last wrote (cr1#385). No seq, no path, no
+#: mechanism: the customer did nothing wrong and the repair is the product's.
+SUBSTRATE_REGRESSED_LINE = (
+    "Nothing was saved: the activity log in this folder is older than the copy "
+    "Command Room last wrote, so a sync put a stale copy over it. The change was "
+    "set aside, not lost; say `health check` to see the repair.")
+
+
+class SubstrateRegressionError(Exception):
+    """Raised when an events.jsonl in-place append is refused because the file
+    on disk regressed below the recorded seq high-water mark (FS-04) — a stale
+    lineage clobbered the live file (the multi-machine Drive last-writer-wins
+    hazard). The batch is quarantined, never lost.
+
+    cr1#385: carries `cr_refusal_reason` and `line`, so the access layer's
+    doors (`append_jsonl`, `run_writer`) answer `substrate_regressed` with the
+    one plain sentence instead of a traceback, on a merged seat and a local
+    one alike."""
+
+    cr_refusal_reason = "substrate_regressed"
+
+    def __init__(self, message: str = "", *, line: str = SUBSTRATE_REGRESSED_LINE):
+        super().__init__(message or line)
+        self.line = line
+
+
+def _seqhw_path(events_path: Path) -> Path:
+    return events_path.with_name(events_path.name + ".seqhw")
+
+
+def _read_seqhw(events_path: Path) -> int | None:
+    """The recorded max seq high-water for this events log, or None if no
+    sidecar yet. The sidecar lives next to events.jsonl (Drive-synced), so it
+    travels with the file and — being small — syncs down BEFORE the big log,
+    which is exactly what makes a stale-log/fresh-sidecar clobber detectable."""
+    p = _seqhw_path(events_path)
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        v = raw.get("max_seq")
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+        return None
+
+
+def _write_seqhw(events_path: Path, max_seq: int) -> bool:
+    """Advance the `.seqhw` sidecar. Returns True on success, False when the
+    write failed. Never raises: for the repair / reconcile callers the sidecar
+    is a guard, not a hard dependency. The APPEND path (INDEX1 Phase A, R2)
+    reads the False and refuses to stay silent — see `_note_seqhw_write_failed`."""
+    import datetime as _dt
+    try:
+        atomic_write_json(
+            _seqhw_path(events_path),
+            {"max_seq": int(max_seq),
+             "updated": _dt.datetime.now(_dt.timezone.utc).isoformat()},
+        )
+        return True
+    except Exception:
+        return False
+
+
+class SeqHighWaterError(Exception):
+    """Raised AFTER a successful events append when the `.seqhw` sidecar could
+    not be advanced AND the rescan marker that would force the next append to
+    re-derive the maximum from the whole file could not be written either
+    (INDEX1 Phase A, R2). The batch IS on disk — the message says so — but the
+    seq allocator has lost both of its safety nets, and silence here is how a
+    reused seq would enter the ledger."""
+
+
+class AppendVerificationError(Exception):
+    """Raised when the post-append read-back does not find the batch at the
+    end of the events file (INDEX1 Phase A, R4). The classic shape is a POSIX
+    inode swap: another process replaced the file (rotation / repair outside
+    the writer lock) between our open and our write, so the bytes landed on
+    the orphaned inode. The batch is set aside in a `.appendverify-*.jsonl`
+    side file (NOT the `.quarantine-*` family, so it is never auto-replayed —
+    a false negative must not become a duplicate) and `.seqhw` is NOT
+    advanced."""
+
+
+def _rescan_marker_path(events_path: Path) -> Path:
+    """`events.jsonl.seqhw.rescan.json` — present when a previous append could
+    not advance `.seqhw`. Forces the next append to derive the maximum from a
+    full scan (R2) instead of the bounded tail, then clears itself."""
+    return events_path.with_name(events_path.name + ".seqhw.rescan.json")
+
+
+def _note_seqhw_write_failed(events_path: Path, intended_max_seq: int,
+                             holder: str) -> None:
+    """R2 — a failed `.seqhw` advance after a successful append must not
+    silently allow a reused seq. Write the rescan marker (best-effort, two
+    ways); if even that fails, raise SeqHighWaterError."""
+    import datetime as _dt
+    marker = _rescan_marker_path(events_path)
+    body = {
+        "reason": "seqhw_write_failed",
+        "detected": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "intended_max_seq": int(intended_max_seq),
+        "holder": holder,
+    }
+    try:
+        atomic_write_json(marker, body)
+        return
+    except Exception:
+        pass
+    try:
+        with open(marker, "w", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(body) + "\n")
+        return
+    except Exception:
+        pass
+    raise SeqHighWaterError(
+        f"the batch (max seq {int(intended_max_seq)}) IS on disk, but the "
+        f".seqhw high-water sidecar could not be advanced and the rescan "
+        f"marker {marker.name} could not be written either (holder={holder}). "
+        f"Until one of them can be written, the seq allocator has no witness "
+        f"against a clobbered file. Check disk space / permissions on "
+        f"{marker.parent}."
+    )
+
+
+def _clear_rescan_marker(events_path: Path) -> None:
+    marker = _rescan_marker_path(events_path)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # The marker stays; the L638 truth-check self-heals it later. Said out
+        # loud so a mount that refuses deletes explains its own residue.
+        left_in_place("rescan marker", marker, exc)
+
+
+# INDEX1 Phase A — the append path opens the ledger in BINARY mode on every
+# platform. On Windows a text-mode CRT fd rewrites "\n" as "\r\n" on write,
+# and a CRLF ledger is a different file from the one every reader parses;
+# `O_BINARY` exists only on Windows, so the flag is 0 elsewhere.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+# How much of the ledger's tail the appender reads to learn the two facts it
+# needs — the max human-counter seq and the newest timestamp. 64 KiB is ~100
+# rows of the operator's ledger (≈700 B/row) and ~10x the largest batch any
+# writer produces; the read is O(1) in file size, which is the whole point
+# of Phase A. A tail that disagrees with `.seqhw` falls back to a full scan
+# (see `_read_stamp_write`), so a smaller-than-ideal window costs time, never
+# correctness.
+_TAIL_READ_BYTES = 64 * 1024
+
+
+class _TailView:
+    """What the bounded tail read learned. `text` is the decoded run of
+    COMPLETE lines inside the window (a partial first line is dropped when
+    the window starts mid-file); `raw_all` is the untrimmed window bytes;
+    `whole_file` says the window covered the file from byte 0, in which case
+    `text` is the entire ledger and the tail max IS the file max."""
+
+    __slots__ = ("text", "raw_all", "size", "ends_with_newline", "whole_file")
+
+    def __init__(self, text: str, raw_all: bytes, size: int,
+                 ends_with_newline: bool, whole_file: bool) -> None:
+        self.text = text
+        self.raw_all = raw_all
+        self.size = size
+        self.ends_with_newline = ends_with_newline
+        self.whole_file = whole_file
+
+
+def _read_events_tail(path: Path, encoding: str = "utf-8",
+                      max_bytes: int | None = None) -> _TailView:
+    """Bounded tail read of a JSONL ledger (INDEX1 Phase A, R1).
+
+    Opens read-only in binary, seeks to `size - max_bytes`, reads to EOF, and
+    drops the (possibly partial) first line when the window started mid-file
+    so every line in `text` is a complete, newline-delimited record. An
+    absent file reads as empty. Raises OSError for anything else — the
+    appender must not allocate against a ledger it could not read.
+    """
+    if max_bytes is None:
+        max_bytes = _TAIL_READ_BYTES
+    try:
+        fd = os.open(str(path), os.O_RDONLY | _O_BINARY)
+    except FileNotFoundError:
+        return _TailView("", b"", 0, True, True)
+    try:
+        size = os.fstat(fd).st_size
+        start = max(0, size - int(max_bytes))
+        if start:
+            os.lseek(fd, start, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = size - start
+        while remaining > 0:
+            b = os.read(fd, min(remaining, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            remaining -= len(b)
+        raw_all = b"".join(chunks)
+    finally:
+        os.close(fd)
+    whole_file = start == 0
+    raw = raw_all
+    if not whole_file:
+        nl = raw.find(b"\n")
+        raw = raw[nl + 1:] if nl >= 0 else b""
+    ends_with_newline = size == 0 or raw_all.endswith(b"\n")
+    return _TailView(raw.decode(encoding, errors="replace"), raw_all, size,
+                     ends_with_newline, whole_file)
+
+
+def _append_bytes(path: Path, payload: bytes) -> None:
+    """True append (INDEX1 Phase A, R5): `O_APPEND|O_WRONLY|O_CREAT` in binary
+    mode, the payload written as ONE `os.write` (the loop only runs again on
+    a short write, which regular files do not produce short of disk-full),
+    then `os.fsync`. No temp file, no rename — the ledger is never rewritten
+    on the append path, so a concurrent reader holding the file open never
+    forces a Windows `os.replace` sharing-violation retry, and the cost of an
+    append no longer grows with the history."""
+    fd = os.open(str(path), os.O_APPEND | os.O_WRONLY | os.O_CREAT | _O_BINARY,
+                 0o644)
+    try:
+        view = memoryview(payload)
+        while len(view):
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+# EPOCH_THRESHOLD — any seq at/above this is a nano-epoch artifact (1.77e18…),
+# not a human counter. Shared by the tail scan + the auto-stamp step, kept in
+# one place so the "ignore ≥1e10" contract can never drift between them.
+_EPOCH_THRESHOLD = 10**10
+
+# BUG-8330 item 8 — bound on an explicit caller-supplied seq ABOVE the
+# ledger's max. The honor-explicit branch accepted anything < 10^10, so one
+# hand-stamped `"seq": 999999` relocated the whole allocation ceiling (both
+# allocators are max+1, and the .seqhw sidecar then locks the jump in — a
+# real ledger now allocates above 1,000,000). One rotation window is 10k;
+# a legitimate explicit seq never leads the ledger by anywhere near that.
+# Beyond the gap the seq is REASSIGNED like a stale one, with loud stderr.
+# Already-relocated ledgers: shared/scripts/repair_seq_relocation.py
+# (supervised one-shot remap).
+SEQ_GAP_MAX = 1000
+
+# CLOCKTS1 — the SYMMETRIC bound on an explicit caller-supplied `ts` ahead of
+# the machine clock. `SEQ_GAP_MAX` above has bounded a suspicious explicit
+# `seq` since BUG-8330; the same file honoured any explicit `ts` verbatim, and
+# a single future-dated row became the ledger maximum, was adopted as a
+# clock-skew floor, and re-stamped itself onto every later append.
+#
+# WHY A DAY AND NOT THE 300s TOLERANCE. This bound REFUSES a write, so it may
+# only catch rows that are certainly wrong. A rounded placeholder written for a
+# same-day item legitimately lands a few hours ahead (the field case: a
+# weekly-recap interaction stamped at local noon), and refusing those would
+# break a real workflow to fix a stamp. So the division of labour is:
+#
+#   this gate REFUSES the certainly-wrong — a row dated a day or more ahead,
+#   which no writer in the product has any reason to produce;
+#   `trusted_now.classify_substrate_max` NEUTRALIZES the merely-suspicious —
+#   the row still lands, but it can never become a floor for anything else.
+#
+# Together they close both scales. Neither alone does. CR_TS_LEAD_GUARD=0
+# disables this check, for supervised historical replay and for the repair
+# tool — the same escape-hatch shape as CR_SEQ_HIGHWATER=0.
+TS_LEAD_MAX_SECONDS = 86400
+
+
+class FutureTimestampRefused(Exception):
+    """Raised when an events append is refused because a caller supplied a `ts`
+    leading the machine clock by more than TS_LEAD_MAX_SECONDS. The batch is
+    written to a REVIEW side file and never silently re-stamped and never
+    silently accepted — a wrong date in the permanent ledger drives wrong
+    windows and, since the confirmed-tier age-out, wrong closures."""
+
+
+def _clock1():
+    """The CLOCK1 helper module, or None.
+
+    Lazily imported and fully defensive, with the same sys.path retry the
+    dedup hook above uses: this module sits at the bottom of the import graph
+    and the append gate must keep working even if the clock helper is missing.
+    None everywhere below means "cannot corroborate", which leaves the stamp on
+    the machine clock exactly as it was before CLOCK1.
+    """
+    try:
+        import trusted_now
+
+        return trusted_now
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            import trusted_now
+
+            return trusted_now
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _scan_events_text(path: Path, existing_text: str):
+    """ONE json.loads pass over the ledger text for BOTH facts the writer needs:
+    `(newest_ts_or_None, max_human_counter_seq)`.
+
+    Fused deliberately. The seq scan and the CLOCK1 corroboration read want the
+    same parse of the same bytes, and running them separately measured +36ms on
+    every append against a multi-megabyte ledger — a cost paid on the hot path
+    for no information. Falls back to the seq-only scan if the clock helper is
+    unavailable, so the writer never depends on it.
+    """
+    mod = _clock1()
+    if mod is not None:
+        try:
+            newest, max_seq = mod.scan_jsonl_text(
+                existing_text, epoch_threshold=_EPOCH_THRESHOLD)
+            return newest, max_seq
+        except Exception:
+            pass
+    return None, _file_max_seq(path, existing_text=existing_text)
+
+
+def _ts_lead_seconds(raw_ts: str, machine_now) -> float | None:
+    """How far `raw_ts` leads `machine_now`, in seconds, or None.
+
+    None means "no opinion" and is returned for anything unparseable — the
+    defensive-reader posture every other reader here takes. A `ts` this cannot
+    parse is a different defect (event_payload_check's job) and must not be
+    turned into a refusal by this guard, which would make an unrelated
+    malformed row look like a clock incident.
+    """
+    try:
+        from event_time import parse_ts
+    except ImportError:
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from event_time import parse_ts
+        except Exception:
+            return None
+    except Exception:
+        return None
+    try:
+        parsed = parse_ts(raw_ts)
+        if parsed is None:
+            return None
+        return (parsed - machine_now).total_seconds()
+    except Exception:
+        return None
+
+
+def _clock1_floor_stamp(machine_now, newest_ts, events_path=None) -> dict:
+    """CLOCK1 — the `ts` this append should carry, plus its provenance.
+
+    Returns `{"ts", "ts_source", "machine_ts"}`. When the helper is
+    unavailable, or the ledger does not prove the clock is behind, this is the
+    machine reading with no annotation — byte-identical to pre-CLOCK1 output.
+    `events_path` scopes the anomaly suppression to THIS workspace.
+    """
+    mod = _clock1()
+    plain = {"ts": machine_now, "ts_source": None, "machine_ts": None,
+             "refused": None}
+    if mod is None:
+        return plain
+    try:
+        return mod.floor_stamp(machine_now, newest_ts,
+                               events_path=events_path)
+    except Exception:
+        return plain
+
+
+def _file_max_seq(events_path: str | Path, existing_text: str | None = None) -> int:
+    """The maximum human-counter seq on disk in `events_path` (0 when the file
+    is absent/empty/all-nano-epoch). Ignores non-dict / non-numeric / nano-epoch
+    (>=1e10) seqs, exactly like next_seq.py. `existing_text` lets a caller that
+    already read the file avoid a second read (the writer's hot path)."""
+    path = Path(events_path)
+    if existing_text is None:
+        try:
+            existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        except OSError:
+            return 0
+    max_seq = 0
+    for line in existing_text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        s = entry.get("seq")
+        if (
+            isinstance(s, (int, float))
+            and not isinstance(s, bool)
+            and s < _EPOCH_THRESHOLD
+            and s > max_seq
+        ):
+            max_seq = int(s)
+    return max_seq
+
+
+def events_freshness(events_path: str | Path) -> dict:
+    """SPEC SYNC1 A1 — read-side staleness detection. Compare the max seq
+    ACTUALLY VISIBLE in `events_path` against the recorded `.seqhw` high-water.
+
+    A regression (file_max_seq < seqhw_max) means the view we can see is behind
+    its own high-water — a mid-sync flush, a stale Drive last-writer-wins copy,
+    or (the row-17 class) a legacy Cowork sandbox mount serving a copy from a
+    pre-recovery lineage. Reads are stale even with zero laptop involvement, and
+    because `atomic_append_jsonl` is read-modify-write, a write through a stale
+    view rewrites the whole file from stale content — a stale READ becomes a
+    clobbering WRITE. This is the read-path extension of the FS-04 write guard.
+
+    Returns {file_max_seq, seqhw_max, regressed, checked_at}. `seqhw_max` is
+    None on a workspace with no sidecar yet (a fresh log) — `regressed` is False
+    there (nothing to regress below), so single-machine / brand-new workspaces
+    no-op clean (back-compat, D-5).
+
+    An ABSENT events.jsonl with a live `.seqhw` sidecar IS regressed (second-eyes
+    fix): that view once reached the high-water and now shows nothing — the most
+    stale view possible (a partial mount / mid-sync dir). Treating it as fresh
+    let the reconciler rebuild the log from a quarantine at seq 1 and silently
+    LOWER the high-water — the exact clobber this module exists to prevent. The
+    failure direction here must always be refuse."""
+    import datetime as _dt
+    path = Path(events_path)
+    file_max = _file_max_seq(path)
+    seqhw = _read_seqhw(path)
+    regressed = seqhw is not None and file_max < seqhw
+    return {
+        "file_max_seq": file_max,
+        "seqhw_max": seqhw,
+        "regressed": bool(regressed),
+        "checked_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+
+
+def _regression_marker_path(events_path: Path) -> Path:
+    return events_path.with_name(events_path.name + ".seqregression.json")
+
+
+def _recovery_dir(events_path: Path) -> Path:
+    """A fresh, timestamped `_recovery_<stamp>/` under the data dir — where the
+    reconciler + the marker truth-check archive resolved artifacts (snapshot-
+    never-delete). Created on demand."""
+    import datetime as _dt
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    d = events_path.parent / f"_recovery_{stamp}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def check_substrate_regression(events_path: str | Path) -> dict | None:
+    """Read the FS-04 regression marker if one was left by a refused append.
+    system-health / morning-briefing call this to surface the LOUD alarm.
+    Returns the marker dict (with `quarantine_path`, counts, seqs) or None.
+
+    SPEC SYNC1 A2 — TRUTH-CHECK THE MARKER (the row-17 fix). The 2026-07-19
+    incident left a marker (file 3591 / sidecar 4606) that outlived its truth:
+    the real file on the primary machine was healthy at 4643, but the marker
+    lingered and `substrate_alarm_lines` surfaced a data-loss alarm that was
+    false by read-time. So before returning a marker, re-verify it: if the live
+    file now satisfies `file_max_seq >= sidecar_max_seq`, the condition has
+    resolved — archive the marker into a `_recovery_<stamp>/` snapshot (never
+    delete) and return None. A still-true marker is returned unchanged."""
+    events_path = Path(events_path)
+    p = _regression_marker_path(events_path)
+    try:
+        marker = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(marker, dict):
+        return None
+    sidecar_max = marker.get("sidecar_max_seq")
+    if isinstance(sidecar_max, (int, float)) and not isinstance(sidecar_max, bool):
+        # Truth-check: is the condition still true against the live file?
+        if _file_max_seq(events_path) >= int(sidecar_max):
+            _archive_resolved_marker(events_path, p, marker)
+            return None
+    return marker
+
+
+def _archive_resolved_marker(events_path: Path, marker_path: Path, marker: dict) -> None:
+    """Best-effort: move a resolved regression marker out of the live path into a
+    `_recovery_<stamp>/` snapshot so it can never be re-surfaced as a live alarm,
+    while the audit trail is preserved. Never raises — a read-time truth-check
+    that could crash the health surface would be a worse bug than the stale
+    marker it clears."""
+    try:
+        dest = _recovery_dir(events_path) / marker_path.name
+        atomic_write_json(dest, marker)
+        try:
+            marker_path.unlink()
+        except OSError:
+            # If the mount refuses unlink, mv-aside so it stops matching the
+            # live marker glob (same doctrine as the lock-litter sweep).
+            try:
+                import time as _time
+                marker_path.rename(
+                    marker_path.with_suffix(marker_path.suffix + f".archived.{int(_time.time())}")
+                )
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+# CAPTUREONCE1 — what the capture-once filter refused on the LAST append, so a
+# receipt can say it. The chokepoint returns only the rows that landed (it has
+# to: every caller reads the stamped copies), so the count of what it refused
+# has nowhere else to go. Read it with `last_capture_once_refusal()`
+# IMMEDIATELY after the append that produced it; it is diagnostics for the
+# receipt line, never a source of truth about the ledger — `count_meeting_
+# writes` is that, and G59 makes the receipt agree with it either way.
+_LAST_CAPTURE_ONCE: dict[str, Any] = {
+    "holder": "", "n_rerun": 0, "n_deduped_on_disk": 0, "by_source_ref": {}}
+
+
+def _refusal_ref_keys(ref) -> set:
+    """Both spellings of one transcript pointer, folded. Mirrors
+    `meeting_capture._norm_ref_keys` deliberately: the substrate carries
+    `granola:<id>` and bare `<id>` for the same meeting, and a receipt asking
+    for its own refusals must match either."""
+    keys = set()
+    s = str(ref or "").strip().lower()
+    if not s:
+        return keys
+    keys.add(s)
+    if ":" in s:
+        prefix, _, tail = s.partition(":")
+        if prefix in ("granola", "fireflies", "otter", "zoom", "teams") and tail:
+            keys.add(tail)
+    return keys
+
+
+def _note_capture_once(holder: str, split: dict) -> None:
+    # CAPTUREONCE1 (review F-2, 2026-09-14) — PER SOURCE_REF, not just a
+    # total. A receipt derives its own on-disk count from this, and a total
+    # alone would let the count of an unrelated append land on it. The map is
+    # keyed on the refused row's own pointer, so a receipt gets a number only
+    # when the refusal was about ITS meeting.
+    by_ref: dict[str, dict[str, int]] = {}
+    for row in (split.get("dropped") or []):
+        if not isinstance(row, dict):
+            continue
+        data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        ref = str(data.get("source_ref") or row.get("source_ref") or "").strip()
+        if not ref:
+            continue
+        reason = row.get("_capture_dedup_reason")
+        slot = by_ref.setdefault(
+            ref.lower(), {"n_rerun": 0, "n_deduped_on_disk": 0})
+        if reason == "on_disk":
+            slot["n_deduped_on_disk"] += 1
+        elif reason == "rerun":
+            slot["n_rerun"] += 1
+    _LAST_CAPTURE_ONCE.update({
+        "holder": holder,
+        "n_rerun": int(split.get("n_rerun") or 0),
+        "n_deduped_on_disk": int(split.get("n_deduped_on_disk") or 0),
+        "by_source_ref": by_ref,
+    })
+
+
+#: cr1#1005 part 4: where the last append in this process really landed, when
+#: it was routed to this computer's own log (cr1#1061), else None. Read by the
+#: append door so its answer names the file the rows are in.
+_LAST_APPEND_ROUTE: dict[str, Any] = {"target": None}
+
+
+def reset_append_route() -> None:
+    """Clear the last append's route record (the append door calls it first)."""
+    _LAST_APPEND_ROUTE["target"] = None
+
+
+def last_append_route() -> Any:
+    """The file the last append in this process was routed to, or None when
+    it wrote the file it was handed."""
+    return _LAST_APPEND_ROUTE.get("target")
+
+
+def reset_capture_once() -> None:
+    """Clear the last append's refusal record (cr1#1005). The append door
+    calls it before an append, so the record it then reads back is that
+    append's own and never an earlier one's in the same process."""
+    _LAST_CAPTURE_ONCE.update({"holder": "", "n_rerun": 0,
+                               "n_deduped_on_disk": 0, "by_source_ref": {}})
+
+
+def last_capture_once_refusal(source_ref=None) -> dict[str, Any]:
+    """What the capture-once filter refused on the last append.
+
+    With no argument: the whole batch's totals (plus `by_source_ref`).
+    With a `source_ref`: only the refusals whose own pointer is that
+    transcript, in either spelling — which is what a `meeting_processed`
+    receipt needs, and the reason it can derive its own on-disk count instead
+    of being handed one by a sentence in a SKILL file (review F-2)."""
+    if source_ref is None:
+        return dict(_LAST_CAPTURE_ONCE)
+    wanted = _refusal_ref_keys(source_ref)
+    out = {"holder": _LAST_CAPTURE_ONCE.get("holder", ""),
+           "n_rerun": 0, "n_deduped_on_disk": 0}
+    if not wanted:
+        return out
+    for ref, slot in (_LAST_CAPTURE_ONCE.get("by_source_ref") or {}).items():
+        if _refusal_ref_keys(ref) & wanted:
+            out["n_rerun"] += int(slot.get("n_rerun") or 0)
+            out["n_deduped_on_disk"] += int(slot.get("n_deduped_on_disk") or 0)
+    return out
+
+
+def _receipts_module():
+    """`receipts`, imported beside this file, or None. Never raises."""
+    try:
+        import receipts as _r
+        return _r
+    except ImportError:
+        import sys as _sys
+        _here = str(Path(__file__).resolve().parent)
+        if _here not in _sys.path:  # LOWS2 row 7 (LEDGER3 N-6): insert once
+            _sys.path.insert(0, _here)
+        try:
+            import receipts as _r
+            return _r
+        except Exception:  # noqa: BLE001
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+#: cr1#1139 (ruling A5): the top-level field naming the account that wrote a
+#: row, as its org-free account mark (`schedule_holder.account_mark`).
+ACCOUNT_FIELD = "account"
+
+
+def stamp_account(events: list, env=None) -> list:
+    """cr1#1139: every row a seat writes carries that seat's account mark.
+
+    Two accounts may use one folder (ruling A5: one owner, the second acts for
+    the owner). Every row lands in the owner's book, so the book alone cannot
+    say which account wrote it. This is the one place every row passes, so
+    the mark is stamped here, beside `seq` and `ts`: the top-level `account`
+    field, the `ac-` mark that names neither the folder nor the organisation
+    (the account uuid itself never lands).
+
+    A row that already carries a well-formed `account` keeps it (the caller's
+    value wins, as an explicit `seq` does). A seat with no account mark stamps
+    nothing. Rows are new dicts; a caller's own are never mutated. It never
+    raises: identity never blocks a write."""
+    try:
+        try:
+            import schedule_holder as _sh
+        except ImportError:
+            import sys as _sys
+            _here = str(Path(__file__).resolve().parent)
+            if _here not in _sys.path:
+                _sys.path.insert(0, _here)
+            import schedule_holder as _sh
+        mark = _sh.account_mark(env)
+        if not mark:
+            return events
+        out = []
+        for ev in events:
+            if isinstance(ev, dict) and not _sh.is_account_mark(ev.get(ACCOUNT_FIELD)):
+                ev = {**ev, ACCOUNT_FIELD: mark}
+            out.append(ev)
+        return out
+    except Exception:  # noqa: BLE001 - identity never blocks a write
+        return events
+
+
+def stamp_receipt_machine(events: list, env=None) -> list:
+    """LEDGER3 (F-T2-6, D-T2B-4): every receipt row lands with a writer id.
+
+    THE FINDING (the v5.33.x walk, 2026-09-27). Four receipts on M's book had
+    no `data.machine`: the bridge's hand-typed `plugin_update` row, the brief
+    writer's `gate_ran`, a `question_expiry_run` and a `flow_measure`. Each
+    writer composed its own `data` and none of them asked
+    `receipts.machine_fields`, so the one question the field exists to answer
+    ("which seat wrote this?") had no answer on those rows.
+
+    THE FIX is at the one place every row passes, the same doctrine as the
+    `seq` / `ts` auto-stamp beside the call: a row whose `type` is in
+    `receipts.MACHINE_STAMPED_TYPES` and whose `data` is a dict carrying
+    neither `machine` nor the fallback flag gains exactly what
+    `receipts.machine_fields(env)` answers, merged into `data`. So a merged
+    seat with a forwarded writer id stamps that id, a VM seat with no writer
+    stamps the fallback flag and no machine, and a legacy seat stamps its
+    marker, all through the one helper every receipt writer already calls.
+
+    What it never does: touch a row of any other type (a `type` that is not
+    a string included), a row whose `data` is not a dict, or a row that
+    already names its writer with a non-empty `machine` or the fallback flag
+    (the caller's value wins, as an explicit `seq` or `ts` does). Those rows
+    are returned as the very objects handed in. The stamped row is a NEW dict
+    with a NEW `data`, so a caller's own dicts are never mutated.
+    `machine_fields` is asked at most once per batch; an empty answer stamps
+    nothing. It never raises, for any row shape: identity never blocks a
+    write.
+    """
+    rmod = _receipts_module()
+    types = getattr(rmod, "MACHINE_STAMPED_TYPES", None) if rmod else None
+    # Fix round 1 (REVIEW N-1): a set that is not a set is no set to test
+    # against, and a membership test on it could raise.
+    if not isinstance(types, (set, frozenset)) or not types:
+        return list(events)
+    try:
+        from machine_identity import FALLBACK_FIELD as _fallback
+    except Exception:  # noqa: BLE001
+        _fallback = getattr(rmod, "_FALLBACK_FIELD_FALLBACK",
+                            "machine_id_fallback")
+    fields = None
+    out = []
+    for ev in events:
+        data = ev.get("data") if isinstance(ev, dict) else None
+        etype = ev.get("type") if isinstance(ev, dict) else None
+        # Fix round 1: the type is tested as a STRING before the set lookup
+        # (REVIEW N-1: a list or dict `type` raised TypeError here and lost
+        # the batch under CR_EVENT_GATE=0), and an empty or null `machine`
+        # does not count as naming the writer (REVIEW N-3).
+        if (isinstance(data, dict) and isinstance(etype, str)
+                and etype in types
+                and not data.get("machine") and _fallback not in data):
+            if fields is None:
+                try:
+                    fields = dict(rmod.machine_fields(env) or {})
+                except Exception:  # noqa: BLE001 - identity never blocks a write
+                    fields = {}
+            if fields:
+                ev = {**ev, "data": {**data, **fields}}
+        out.append(ev)
+    return out
+
+
+#: LEDGERPLACE1 (cr1#124) - the one sentence an append refused because its
+#: ledger folder does not exist carries to the door. Nothing was saved.
+LEDGER_FOLDER_MISSING_LINE = ("Not saved: that change pointed at a folder that is "
+                              "not your Command Room folder, so nothing was "
+                              "written and nothing changed.")
+
+
+class LedgerFolderMissing(FileNotFoundError):
+    """LEDGERPLACE1 (cr1#124): an `events.jsonl` append whose ledger AND
+    ledger folder are both absent. Writing through it would create a brand-new
+    workspace at a wrong path (a mis-converted `/c/Users/...` spelling) and
+    report a seq the real ledger never got, so NOTHING is created. Carries
+    `cr_refusal_reason = "missing_parent"` and `line`, so a door answers
+    `ok:false` with the plain sentence. A new workspace's ledger folder is
+    made on purpose with `create_ledger=True`."""
+
+    cr_refusal_reason = "missing_parent"
+    line = LEDGER_FOLDER_MISSING_LINE
+
+    def __init__(self, path: Path):
+        self.path = path
+        super().__init__(
+            f"refused to append: the ledger {path} does not exist and neither "
+            f"does its folder, so this is not a workspace's ledger. Nothing "
+            f"was created. Check the path; a new workspace's ledger is made "
+            f"with create_ledger=True.")
+
+
+def _refuse_missing_ledger_folder(path: Path) -> None:
+    """LEDGERPLACE1 (cr1#124): raise `LedgerFolderMissing` when `path` is an
+    `events.jsonl` that is absent in a folder that is absent too. Asked before
+    the gate, the lock or anything else touches the disk."""
+    if path.name != "events.jsonl":
+        return
+    try:
+        resolved = path.resolve()
+    except (OSError, ValueError):
+        resolved = path.absolute()
+    if not resolved.exists() and not resolved.parent.is_dir():
+        raise LedgerFolderMissing(resolved)
+
+
+#: cr1#1376 - the one sentence an append refused because it named the top of
+#: the Command Room folder instead of its data folder carries to the door.
+LEDGER_AT_WORKSPACE_ROOT_LINE = ("Not saved: that entry was headed for the top of "
+                                 "your Command Room folder instead of its activity "
+                                 "log, so nothing was written and nothing changed.")
+
+
+class LedgerAtWorkspaceRoot(ValueError):
+    """cr1#1376: an `events.jsonl` (or year shard) append aimed at a WORKSPACE
+    ROOT's top (a folder holding `_hq/data/`) instead of `_hq/data` itself.
+
+    Every reader that is handed the workspace root used to read such a stray
+    file instead of the real log (`events_io._data_dir`), so one misdirected
+    append replaced the whole book for the Hub and Maintenance. Nothing is
+    read, locked or created. Carries `cr_refusal_reason` and `line`, so a door
+    answers `ok:false` with the plain sentence."""
+
+    cr_refusal_reason = "ledger_outside_data"
+    line = LEDGER_AT_WORKSPACE_ROOT_LINE
+
+    def __init__(self, path: Path):
+        self.path = path
+        super().__init__(
+            f"refused to append: {path.name} sits at the top of a workspace "
+            f"({path.parent}); the activity log lives in its _hq/data folder. "
+            f"Nothing was written.")
+
+
+_LEDGER_SHARD_RE = re.compile(r"^events-\d{4}\.jsonl$")
+
+
+def _refuse_ledger_at_workspace_root(path: Path) -> None:
+    """cr1#1376: raise `LedgerAtWorkspaceRoot` when `path` is the activity log
+    (or a year shard) directly inside a workspace root whose `_hq/data` holds
+    the real log (the live file or a shard). That is the same rule the readers
+    use (`events_io._data_dir`), so a write is refused exactly where a read
+    would never look. A root whose `_hq/data` holds no log is left alone, for
+    reads and writes alike (owner's ruling pending: the log at the top may be
+    the only one). Asked before anything touches the disk."""
+    name = path.name.lower()
+    if name != "events.jsonl" and not _LEDGER_SHARD_RE.match(name):
+        return
+    try:
+        parent = path.resolve().parent
+    except (OSError, ValueError):
+        parent = path.absolute().parent
+    data = parent / "_hq" / "data"
+    try:
+        holds = (data / "events.jsonl").is_file() or any(
+            _LEDGER_SHARD_RE.match(p.name) for p in data.glob("events-*.jsonl"))
+    except OSError:
+        holds = False
+    if holds:
+        raise LedgerAtWorkspaceRoot(parent / path.name)
+
+
+def atomic_append_jsonl(
+    path: str | Path,
+    events: list[dict[str, Any]] | dict[str, Any],
+    encoding: str = "utf-8",
+    holder: str = "atomic_append_jsonl",
+    create_ledger: bool = False,
+) -> list[dict[str, Any]]:
+    """Append one or more JSON-line records to a JSONL file atomically.
+
+    TWO WRITE PATHS (SPEC INDEX1 Phase A, 2026-09-02):
+      * `events.jsonl` — TRUE APPEND. A bounded tail read (last 64 KiB,
+        complete lines only) yields the max seq and the newest timestamp;
+        seq is allocated from max(file max, `.seqhw`) + 1; the batch lands
+        via `O_APPEND|O_WRONLY|O_CREAT|O_BINARY`, one write, fsync; the write
+        is read back and must be the file's suffix before `.seqhw` advances.
+        A torn tail (no trailing newline) is healed by leading the batch with
+        a newline and recorded through the FS-15 read-alarm sidecar — never
+        truncated. Append cost is independent of the history's size, and the
+        ledger is never rewritten on this path (rotation, reconcile_forward
+        and the repair tools keep their whole-file rewrite — out of scope).
+      * every other JSONL file — read the existing file, construct the full
+        new content, write via atomic_write_text (their contract is
+        whole-file).
+
+    RETURNS the written event copies AS STAMPED (BUG-8330 item 7) — for
+    events.jsonl that means the allocated `seq` and `ts` are readable from
+    the return value. A caller that needs the seq of what it just wrote
+    reads it HERE; calling next_seq() first and hand-stamping `"seq"` is the
+    racy reserve-then-write pattern that produced duplicate seqs, and
+    writer_contract_lint now flags it.
+
+    WRITER LOCK FOR events.jsonl (SPEC A1, v3.19.x):
+    For writes to a file named `events.jsonl` specifically, the entire
+    read -> auto-stamp -> atomic-rename sequence runs inside the cross-process
+    `writer_lock.events_writer_lock` so seq reservation and the write are one
+    critical section. This closes the last-writer-wins race documented in
+    RELIABILITY.md §3 (two racing callers losing an event or duplicating a
+    seq; on Windows the racing os.replace could even raise PermissionError).
+    The lock is an OS byte-range lock on `_hq/data/.writer.lock` (kernel
+    releases it on crash — zero manual cleanup), with a sentinel fallback on
+    unsupported mounts and best-effort contention telemetry. `holder` is an
+    optional caller label recorded in the lock diagnostics + any timeout
+    message; it defaults so every existing call site keeps working unchanged.
+    Non-events.jsonl writes take NO lock (they have their own contracts).
+
+    Use for events.jsonl, staging_emissions.jsonl, classifier_feedback.jsonl,
+    .backfill_cursor — anything the Claude app or cross-machine sync reads.
+
+    Batched appends (one call with N events) are still preferred where a
+    writer has N related events — a batch is one lock hold, one fsync and one
+    referentially-linked unit for the FS-04 / CLOCKTS1 set-aside paths.
+
+    DEFENSIVE WRAP (v3.13.8.1 — Bug #68):
+    Accepts either a list of dicts (canonical) OR a single dict. A single
+    dict gets wrapped to [dict] before the iteration. This closes a corruption
+    class observed in v3.13.8 where some commitment writers passed a bare
+    dict — `for e in events` iterated the dict's keys, writing each key as
+    a malformed line. The helper now tolerates either shape and raises
+    TypeError on any other input rather than silently producing garbage.
+
+    AUTO-STAMP seq + ts FOR events.jsonl (v3.13.8.3 — Bug #74 + Bug #75):
+    For writes to a file named `events.jsonl` specifically, this helper now
+    auto-stamps two canonical fields on every event before the write:
+      - `seq` — monotonic human-counter integer, computed inline from the
+        existing tail (max human-counter seq + 1, ignoring nano-epoch
+        artifacts above 1e10 per next_seq.py contract). Stamped only when
+        the caller omitted `seq` or passed None.
+      - `ts` — ISO-8601 UTC timestamp. Stamped only when the caller omitted
+        `ts`, passed None, or passed an empty/whitespace-only string.
+    Bug #74 root cause: 36% of events in M's events.jsonl lacked seq because
+    LLM-driven writers (skill prose templates) frequently omitted the field;
+    next_seq.py existed but writers didn't always call it. Bug #75 root
+    cause: the coach SKILL.md template lacked a `ts` field, so the LLM wrote
+    coach_session events without ts. Both fixes are caller-agnostic: even
+    a malformed template now produces canonical-shaped events. Caller-side
+    seq/ts stamping still works exactly as before — explicit values are
+    respected; only missing/empty values are filled.
+
+    For non-events.jsonl writes (staging_emissions.jsonl, classifier
+    feedback, etc.), no auto-stamping happens — those files have their own
+    schema contracts.
+
+    A LEDGER IN A FOLDER THAT DOES NOT EXIST (LEDGERPLACE1, cr1#124):
+    an `events.jsonl` that is absent in a folder that is absent too is
+    refused with `LedgerFolderMissing` before anything is read, locked or
+    created; the message names the resolved path. A ledger whose folder
+    exists (a fresh workspace's first row) is created as before. A new
+    workspace's ledger folder is made on purpose with `create_ledger=True`.
+    """
+    # LEDGERPLACE1 (cr1#124) - first, so a refusal creates no folder, no
+    # lock file and no ledger.
+    if not create_ledger:
+        _refuse_missing_ledger_folder(Path(path))
+    # cr1#1376 - never a ledger at a workspace root's top, even a new one.
+    _refuse_ledger_at_workspace_root(Path(path))
+    # BRIEFDOOR1 MUST 5 -- the writer is named before anything is read or
+    # locked (see `_require_named_writer`).
+    _require_named_writer()
+    # Defensive wrap — tolerate single-dict callers (Bug #68 fix)
+    if isinstance(events, dict):
+        events = [events]
+    if not isinstance(events, list):
+        raise TypeError(
+            f"atomic_append_jsonl expects list[dict] or dict, got "
+            f"{type(events).__name__}"
+        )
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            raise TypeError(
+                f"atomic_append_jsonl entries must be dicts; entry {i} is "
+                f"{type(ev).__name__}: {ev!r}"
+            )
+
+    path = Path(path)
+    is_events = path.name == "events.jsonl"
+
+    # CLOCK1 — teach the clock helper which workspace this process is working
+    # in. The ~20 writer helpers that pre-stamp their own `ts` do it through
+    # no-argument `_now_iso()` functions that cannot be handed a root without
+    # rewriting every call site, so the seams that DO know the root register it
+    # on the way past. Best-effort and silent: an unregistered workspace simply
+    # means those helpers keep using the machine clock.
+    if is_events:
+        _mod = _clock1()
+        if _mod is not None:
+            try:
+                _mod.register_workspace_from_data_path(path)
+            except Exception:
+                pass
+
+    # EVENT GATE (Phase 1 Foundation F1, 2026-07) — the append_event()
+    # gatekeeper runs INSIDE this single append path so every event family is
+    # gated from day one, caller-agnostic (same doctrine as the auto-stamp
+    # below): type-drift normalization, cmt_<ulid> minting + data.kind on
+    # commitments, fail-loud rejection of id-less commitment_resolved, and
+    # schema-enum validation. STRICT on both entries as of Phase 4 (2026-07-02)
+    # — the F1 burn-in ended with the Phase 1-3 writer migrations: an
+    # unregistered event type or kind-less commitment now rejects here too,
+    # identical to event_gate.append_event. Gate failures RAISE — they must
+    # never be swallowed. CR_EVENT_GATE=0 disables (emergencies only).
+    if is_events:
+        try:
+            from event_gate import gate_events
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from event_gate import gate_events
+        events = gate_events(events, strict_enum=True, holder=holder,
+                             events_jsonl_path=path)
+
+        # ACCOUNT-SCOPE WALL (connector-agnostic-v1, R2/R3) — the writer-side
+        # privacy guarantee, run at this same single chokepoint. A personal /
+        # out-of-scope account's mail can never enter events.jsonl; a
+        # provenance-REQUIRED family with no provenance is rejected (the R2
+        # fail-open fix). NO-OP unless the workspace has classified accounts
+        # (R4) — every existing workspace behaves exactly as today. Only raises
+        # the deliberate AccountScopeError; an internal error degrades to
+        # "allow the write" so a broken account map never bricks the substrate.
+        try:
+            from account_scope_gate import enforce_scope
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            try:
+                from account_scope_gate import enforce_scope
+            except Exception:
+                enforce_scope = None
+        except Exception:
+            enforce_scope = None
+        if enforce_scope is not None:
+            events = enforce_scope(events, path=path, holder=holder)
+
+        # SEMANTIC DEDUP AT CAPTURE (v4.6.0 C4) — the `(source_ref, title)`
+        # dedup key is source-scoped, so the same real commitment captured by
+        # different writers (meeting + follow-up email + nightly sweep) lands
+        # as three open items. This hook compares each new `commitment` in the
+        # batch against the OPEN set (owner + counterparty + name-stripped
+        # title similarity within a time window) and FLAGS suspects
+        # (data.pending_review + data.suspected_duplicate_of) for the confirm
+        # flow — never drops, never merges. Runs here, caller-agnostically,
+        # for the same reason the gate does. Fail-open: a check failure
+        # appends the batch unflagged (today's behavior); it must never lose
+        # a capture. CR_DEDUP_CHECK=0 disables.
+        try:
+            from commitment_dedup import flag_suspected_duplicates
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            try:
+                from commitment_dedup import flag_suspected_duplicates
+            except Exception:
+                flag_suspected_duplicates = None
+        except Exception:
+            flag_suspected_duplicates = None
+        if flag_suspected_duplicates is not None:
+            try:
+                events = flag_suspected_duplicates(events, path)
+            except Exception:
+                pass
+
+        # CAPTURE-ONCE AT THE WRITE (CAPTUREONCE1, M's ruling R4, 2026-09-14).
+        # `flag_suspected_duplicates` above is a FLAGGER by design — it guesses
+        # at semantic twins and must never drop one. This is the other half,
+        # and it is not a guess: a capture row whose `(source_ref, title)` is
+        # already on disk, or whose meeting already carries a
+        # `meeting_processed` receipt, is a row this workspace has written
+        # before. It is refused HERE, caller-agnostically, for the same reason
+        # the gate and the account-scope wall are: the capture legs are driven
+        # from SKILL prose, so any check that lives in a helper a model has to
+        # remember to call is a check that is one re-worded instruction away
+        # from being absent. The v5.30.0 attended test measured exactly that —
+        # a reprocess of one call wrote 13 duplicate rows and resurrected 4
+        # the customer had dropped, while `meeting_capture.already_processed`
+        # sat two modules away, correct and never consulted on a write path.
+        # O(1) via the source_ref index; fail-open (a check failure appends the
+        # batch unchanged); CR_CAPTURE_ONCE=0 disables.
+        if os.environ.get("CR_CAPTURE_ONCE", "1") != "0":
+            try:
+                from source_ref_index import filter_capture_duplicates
+            except ImportError:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).resolve().parent))
+                try:
+                    from source_ref_index import filter_capture_duplicates
+                except Exception:
+                    filter_capture_duplicates = None
+            except Exception:
+                filter_capture_duplicates = None
+            if filter_capture_duplicates is not None:
+                try:
+                    _split = filter_capture_duplicates(
+                        path.parent.parent.parent, events)
+                    _note_capture_once(holder, _split)
+                    events = _split["kept"]
+                except Exception:
+                    pass
+
+    # ONE LOG PER COMPUTER (cr1#1061 slice 2). Everything above -- the gate,
+    # the account wall, the dedup flag and the capture-once refusal -- ran
+    # against the live log, as before. Here the append is pointed at THIS
+    # computer's own file when, and only when, it knows of another computer
+    # and does not own the live file (`computer_logs.route`). A computer that
+    # knows of no other gets None and the rest of this function is today's.
+    own_route = None
+    own_floor = 0
+    # The live log, kept by name: the writer lock, the lease and the
+    # capture-once index stay the LIVE log's (and the workspace's) even when
+    # the rows go to this computer's own file, so every process on this
+    # computer still excludes every other one (review round, cr1#1061).
+    live_path = path
+    if is_events:
+        try:
+            import computer_logs as _cl
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            try:
+                import computer_logs as _cl
+            except Exception:
+                _cl = None
+        except Exception:
+            _cl = None
+        if _cl is not None:
+            own_route = _cl.route(path)
+            if own_route is not None:
+                path = Path(own_route["target"])
+                _LAST_APPEND_ROUTE["target"] = str(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                own_floor = _cl.merged_seq_floor(Path(own_route["live"]), path)
+            else:
+                # The live file's writer numbers from the merged view too
+                # (ruling 2a): above every computer's own file. 0 when there
+                # is none, so a one-computer seat allocates exactly as today.
+                own_floor = _cl.computer_files_floor(path)
+
+    # BUG-8330 item 7 — the stamped copies (assigned seq/ts) are RETURNED so
+    # callers that need the allocated seq read it from the return value.
+    # Pre-computing via next_seq() then stamping "seq" by hand is the racy
+    # reserve-then-write pattern this replaces; writer_contract_lint flags it.
+    stamped: list[dict[str, Any]] = []
+
+    def _read_stamp_write(evs: list[dict[str, Any]]) -> None:
+        existing = ""
+        existing_max_seq = 0
+        existing_newest_ts = None
+        tail: _TailView | None = None
+        hw_guard_on = is_events and os.environ.get("CR_SEQ_HIGHWATER", "1") != "0"
+        hw: int | None = None
+        rescan = False
+        if is_events:
+            # INDEX1 Phase A (R1/R3) — a BOUNDED tail read replaces the
+            # whole-file read. ONE parse pass over the tail gives both answers
+            # the writer needs (SPEC SYNC1's seq contract plus CLOCK1's
+            # corroboration input): the max human-counter seq and the newest
+            # timestamp. Every writer appends rows whose seq is >= everything
+            # before them (stale explicit seqs are reassigned below), so on a
+            # ledger written by this appender the tail max IS the file max.
+            tail = _read_events_tail(path, encoding=encoding)
+            existing_newest_ts, existing_max_seq = _scan_events_text(
+                path, tail.text)
+            if hw_guard_on:
+                hw = _read_seqhw(path)
+            # WHEN THE TAIL IS NOT ENOUGH — fall back to the full scan the old
+            # path always paid. Three cases, all rare on a healthy ledger:
+            #   * `.seqhw` is absent or unreadable and the window did not
+            #     cover the file: a fresh or legacy ledger may be
+            #     non-monotonic mid-file (the operator's has 71 such spots
+            #     from the pre-appender era), and with no high-water to
+            #     corroborate the tail, only the file itself can say.
+            #   * a previous append could not advance `.seqhw` and left the
+            #     rescan marker (R2): the sidecar is known to be behind.
+            #   * the tail max is BELOW `.seqhw`: either a clobbered stale
+            #     lineage (FS-04 below will refuse) or a legitimate ledger
+            #     whose maximum sits mid-file. The full scan tells them
+            #     apart, so the refusal keeps exactly its old semantics —
+            #     "the FILE's max seq regressed below the high-water" — and a
+            #     non-monotonic legacy ledger is never refused by mistake.
+            #   * the high-water guard is OFF (CR_SEQ_HIGHWATER=0, the
+            #     emergency hatch): with no sidecar to corroborate the tail,
+            #     the allocator pays the old whole-file scan rather than
+            #     trust a window it cannot check.
+            rescan = _rescan_marker_path(path).exists()
+            needs_full = (not tail.whole_file) and (
+                (not hw_guard_on) or hw is None or rescan
+                or existing_max_seq < hw)
+            if needs_full:
+                full_newest, full_max = _scan_events_text(
+                    path, path.read_text(encoding=encoding, errors="replace"))
+                existing_max_seq = max(existing_max_seq, full_max)
+                if full_newest is not None and (
+                        existing_newest_ts is None
+                        or full_newest > existing_newest_ts):
+                    existing_newest_ts = full_newest
+        elif path.exists():
+            # Non-events files keep the whole-file read + atomic rewrite:
+            # their contract is whole-file (SPEC INDEX1 D6).
+            existing = path.read_text(encoding=encoding)
+            if existing and not existing.endswith("\n"):
+                existing = existing + "\n"
+
+        # v3.13.8.3 Bug #74 + #75 — auto-stamp seq + ts for events.jsonl writes.
+        # Shallow-copy each event to avoid mutating caller's dicts.
+        if is_events:
+            import datetime as _dt
+            EPOCH_THRESHOLD = _EPOCH_THRESHOLD
+            evs = [{**ev} for ev in evs]
+            # LEDGER3 (D-T2B-4): a receipt-type row that does not name its
+            # writer gains `receipts.machine_fields()`'s answer in `data`;
+            # every other row is the object it was (`stamp_receipt_machine`).
+            evs = stamp_receipt_machine(evs)
+            # cr1#1139: and every row names the account that wrote it.
+            evs = stamp_account(evs)
+            # R1 — the allocation base is max(file max, .seqhw), NEVER the
+            # sidecar alone: a sidecar that fell behind the file (a failed
+            # advance, a repair that moved the file without it) must not hand
+            # out a seq the ledger already holds. With the guard on and no
+            # regression, the two agree and this is the file max.
+            next_seq_val = max(existing_max_seq, hw if hw is not None else 0) + 1
+            # cr1#1061 (owner ruling 2a): numbering is the merged view's, so
+            # `own_floor` is the highest number in every OTHER log (the live
+            # file and every computer's own file); 0 on a one-computer seat,
+            # so this is a no-op there and the allocation is today's.
+            if own_floor >= next_seq_val:
+                next_seq_val = own_floor + 1
+            # CLOCK1 — a stale machine clock must not stamp the permanent
+            # ledger. `clock_stamp` returns the machine reading unchanged
+            # unless the ledger PROVES the clock is behind, in which case it
+            # returns the newest recorded timestamp as a floor. It writes and
+            # annotates; it never refuses (a raise here would lose every
+            # remaining substrate write the fire owes).
+            # The RAW machine reading, kept in a name. CLOCKTS1 judges a
+            # caller-supplied `ts` against THIS, never against `clock_stamp`:
+            # the floor is exactly the value a poisoned ledger moves, so
+            # measuring a suspicious lead against it would let a contaminated
+            # workspace excuse the row that contaminated it.
+            machine_now = _dt.datetime.now(_dt.timezone.utc)
+            clock_stamp = _clock1_floor_stamp(
+                machine_now, existing_newest_ts, events_path=path)
+            now_iso = clock_stamp["ts"].isoformat()
+            if clock_stamp.get("refused"):
+                # CLOCKTS1 — a floor correction was available and was REFUSED
+                # because the ledger maximum is a forward-dated row, not clock
+                # evidence. Said out loud: silence here is how the field case
+                # ran for eighteen days without anyone noticing.
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[atomic_append_jsonl] substrate clock floor refused "
+                    f"({clock_stamp['refused']}): the newest ledger timestamp "
+                    f"leads the .seqhw witness, so it is a forward-dated row "
+                    f"rather than proof this clock is behind. Stamped the "
+                    f"machine reading (holder={holder}). Run "
+                    f"shared/scripts/repair_future_ts.py to see what is "
+                    f"recoverable.\n"
+                )
+            # WHICH CLOCK A CALLER'S `ts` IS JUDGED AGAINST (fix round, F-2).
+            # The raw machine reading is the right reference in general — a
+            # contaminated workspace must not be allowed to excuse the row that
+            # contaminated it. But on the exact incident this module exists for
+            # — a machine that booted unsynced and reads days behind — "the
+            # real time" IS ahead of the raw clock, by precisely the skew, so a
+            # caller passing a meeting's CORRECT start time was refused at 25h
+            # behind. The discriminator tolerates that same machine's skew up
+            # to four days; the gate refusing it at one was the two bounds
+            # disagreeing about one clock.
+            #
+            # So: when a floor was actually ADOPTED, the corroborated stamp is
+            # this machine's best reading of now and is the reference. When it
+            # was not — including every refusal, which is what a poisoned
+            # workspace now produces — `ts_source` is None and the reference
+            # stays the raw clock. The anti-excuse property is untouched.
+            ts_reference = (clock_stamp["ts"] if clock_stamp["ts_source"]
+                            else machine_now)
+            ts_refused: list[tuple[int, str, float]] = []
+            for ev in evs:
+                current_seq = ev.get("seq")
+                seq_is_valid_human_counter = (
+                    isinstance(current_seq, (int, float))
+                    and not isinstance(current_seq, bool)
+                    and current_seq < EPOCH_THRESHOLD
+                )
+                if current_seq is None or not isinstance(current_seq, (int, float)) or isinstance(current_seq, bool):
+                    ev["seq"] = next_seq_val
+                    next_seq_val += 1
+                elif (
+                    seq_is_valid_human_counter
+                    and int(current_seq) >= next_seq_val
+                    and int(current_seq) > existing_max_seq + SEQ_GAP_MAX
+                ):
+                    # BUG-8330 item 8 — explicit seq LEADS the ledger by more
+                    # than SEQ_GAP_MAX: almost certainly a hand-stamped
+                    # artifact (the 999999 case), and honoring it relocates
+                    # the allocation ceiling permanently (max+1 allocators +
+                    # the .seqhw sidecar lock the jump in). Reassign like a
+                    # stale seq, loudly — the write itself is preserved.
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[atomic_append_jsonl] explicit seq {int(current_seq)} "
+                        f"leads the ledger max ({existing_max_seq}) by more than "
+                        f"SEQ_GAP_MAX={SEQ_GAP_MAX}; reassigned to {next_seq_val} "
+                        f"(holder={holder}). Never hand-stamp seq — omit it and "
+                        "the appender allocates inside the writer lock.\n"
+                    )
+                    ev["seq"] = next_seq_val
+                    next_seq_val += 1
+                elif seq_is_valid_human_counter and int(current_seq) >= next_seq_val:
+                    # Explicit human-counter seq in this batch — bump counter past it
+                    # so subsequent missing-seq events stamp monotonically. Nano-epoch
+                    # seqs are NOT considered (would jump next_seq to 1.77e18+1).
+                    next_seq_val = int(current_seq) + 1
+                elif seq_is_valid_human_counter and int(current_seq) < next_seq_val:
+                    # Explicit but STALE human-counter seq — a value the caller
+                    # peeked before a concurrent append overtook it. Honoring it
+                    # would write a DUPLICATE seq, corrupting supersedes_seq /
+                    # source_event_seq / _commitment_id back-references (and letting
+                    # one resolution close two commitments). Reassign it like a
+                    # missing seq so the ledger stays monotonic + collision-free
+                    # (deep-audit 2026-05-29, finding #7).
+                    ev["seq"] = next_seq_val
+                    next_seq_val += 1
+                current_ts = ev.get("ts")
+                if current_ts is None or not isinstance(current_ts, str) or not current_ts.strip():
+                    ev["ts"] = now_iso
+                    if clock_stamp["ts_source"]:
+                        # The contamination trail (CLOCK1 D4), additive so
+                        # every existing reader is unaffected: what the stamp
+                        # came from, and what the machine actually said.
+                        ev["ts_source"] = clock_stamp["ts_source"]
+                        ev["machine_ts"] = clock_stamp["machine_ts"]
+                else:
+                    # A caller-supplied non-empty `ts` is still never REWRITTEN
+                    # — historic backfills are legal and indistinguishable from
+                    # intent, and `ts` = meeting start time is a live data
+                    # contract that dormancy and "when did I last meet with X"
+                    # read. CLOCKTS1 changes nothing about a backward `ts`.
+                    #
+                    # A FORWARD one is different in kind: it is a claim about
+                    # something that has not happened, it becomes the ledger
+                    # maximum, and every window in the product reads it. Bound
+                    # it exactly the way an explicit `seq` above is bounded.
+                    lead = _ts_lead_seconds(current_ts, ts_reference)
+                    if lead is not None and lead > TS_LEAD_MAX_SECONDS:
+                        ts_refused.append((len(ts_refused), current_ts, lead))
+
+            # CLOCKTS1 — REFUSE INTO REVIEW. Neither of the two silent outcomes
+            # is acceptable here: re-stamping the row loses the caller's stated
+            # time with no trail (and the caller may have meant it — a genuinely
+            # scheduled item belongs in the payload, not in `ts`), and accepting
+            # it writes a future date into the permanent ledger that every
+            # window, the dormancy math and the confirmed-tier age-out will read
+            # as fact. So the batch goes to a REVIEW side file with a named
+            # reason, exactly like the FS-04 quarantine below, and the caller
+            # hears about it.
+            #
+            # The WHOLE batch is set aside, not just the offending rows: a batch
+            # is often referentially linked (a commitment and the closure that
+            # resolves it), and splitting it would land half a relationship.
+            if ts_refused and os.environ.get("CR_TS_LEAD_GUARD", "1") != "0":
+                stamp = machine_now.strftime("%Y%m%dT%H%M%S%fZ")
+                r_path = path.with_name(path.name + f".tsreview-{stamp}.jsonl")
+                r_lines = "".join(
+                    json.dumps(e, ensure_ascii=False) + "\n" for e in evs)
+                try:
+                    r_existing = (r_path.read_text(encoding=encoding)
+                                  if r_path.exists() else "")
+                    if r_existing and not r_existing.endswith("\n"):
+                        r_existing += "\n"
+                    atomic_write_text(r_path, r_existing + r_lines,
+                                      encoding=encoding)
+                except Exception:
+                    pass
+                marker = path.with_name(path.name + ".tsreview.json")
+                worst = max(ts_refused, key=lambda r: r[2])
+                try:
+                    atomic_write_json(marker, {
+                        "detected": machine_now.isoformat(),
+                        "reason": "caller_ts_leads_machine_clock",
+                        "n_refused": len(ts_refused),
+                        "n_in_batch": len(evs),
+                        "worst_ts": worst[1],
+                        "worst_lead_seconds": worst[2],
+                        "ts_lead_max_seconds": TS_LEAD_MAX_SECONDS,
+                        "machine_now": machine_now.isoformat(),
+                        "reference": ts_reference.isoformat(),
+                        "reference_kind": ("substrate_floor"
+                                           if clock_stamp["ts_source"]
+                                           else "machine_clock"),
+                        "review_path": str(r_path),
+                        "holder": holder,
+                    })
+                except Exception:
+                    pass
+                raise FutureTimestampRefused(
+                    f"refused {len(ts_refused)} event(s) whose caller-supplied "
+                    f"`ts` leads this workspace's best reading of now by more "
+                    f"than TS_LEAD_MAX_SECONDS={TS_LEAD_MAX_SECONDS}s (worst: "
+                    f"{worst[1]!r}, {worst[2]:.0f}s ahead of "
+                    f"{ts_reference.isoformat()}; machine clock reads "
+                    f"{machine_now.isoformat()}; holder={holder}). The batch of "
+                    f"{len(evs)} was set aside for review at {r_path.name} — "
+                    f"nothing was re-stamped and nothing was written to the "
+                    f"ledger. A future date in `ts` becomes the ledger maximum "
+                    f"and is read as fact by every window, by dormancy, and by "
+                    f"the confirmed-tier age-out. If the event has already "
+                    f"happened, pass its real time; if it has not, omit `ts` "
+                    f"and put the scheduled time in the payload."
+                )
+
+        if is_events and own_route is not None:
+            # cr1#1061: computer, its own count and the content fingerprint,
+            # on per-computer entries only (the live file's rows unchanged).
+            _cl.stamp(evs, own_route["mark"],
+                      _cl.own_count(tail.text if tail is not None else ""))
+        stamped[:] = evs
+        new_lines = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in evs)
+
+        # FS-04 — seq high-water regression guard. If the file on disk regressed
+        # below the recorded high-water (a stale lineage clobbered it via Drive
+        # last-writer-wins), REFUSE the in-place append (writing it would append
+        # to the stale lineage and let the clobber win again), QUARANTINE the
+        # batch to a side file so nothing is lost, drop a LOUD marker, and RAISE.
+        # CR_SEQ_HIGHWATER=0 disables (emergencies / intentional resets).
+        if hw_guard_on:
+            # `hw` was read once, above, alongside the tail (INDEX1 Phase A);
+            # `existing_max_seq` is the tail max, promoted to the full-file max
+            # whenever the tail disagreed with the sidecar — so this comparison
+            # keeps its exact meaning: the FILE regressed below the high-water.
+            # No `path.exists()` here (second-eyes fix 2026-07-20): an ABSENT
+            # events.jsonl with a live .seqhw is the most-regressed view possible
+            # (a partial mount) and is never legitimate — rotation always leaves
+            # the active file in place with its seq-continuity marker. Writing
+            # through it would start a fresh seq-1 lineage and the high-water
+            # advance below would silently LOWER .seqhw. Refuse + quarantine.
+            if hw is not None and existing_max_seq < hw:
+                import datetime as _dt
+                stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                q_path = path.with_name(path.name + f".quarantine-{stamp}.jsonl")
+                try:
+                    q_existing = q_path.read_text(encoding=encoding) if q_path.exists() else ""
+                    if q_existing and not q_existing.endswith("\n"):
+                        q_existing += "\n"
+                    atomic_write_text(q_path, q_existing + new_lines, encoding=encoding)
+                except Exception:
+                    pass
+                marker = path.with_name(path.name + ".seqregression.json")
+                try:
+                    atomic_write_json(marker, {
+                        "detected": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                        "file_max_seq": existing_max_seq,
+                        "sidecar_max_seq": hw,
+                        "n_quarantined": len(evs),
+                        "quarantine_path": str(q_path),
+                        "holder": holder,
+                    })
+                except Exception:
+                    pass
+                raise SubstrateRegressionError(
+                    f"events.jsonl regressed below the seq high-water "
+                    f"(on-disk max seq {existing_max_seq} < recorded {hw}) — a "
+                    f"stale lineage clobbered the live log. Refused the in-place "
+                    f"append; quarantined {len(evs)} event(s) to {q_path.name}. "
+                    f"Recover the live log (Drive version history + merge) before "
+                    f"re-firing; see the substrate-regression alarm in a health "
+                    f"check or the morning brief."
+                )
+
+        if not is_events:
+            atomic_write_text(path, existing + new_lines, encoding=encoding)
+        else:
+            # INDEX1 Phase A (R4/R5) — TRUE APPEND. The ledger is opened
+            # O_APPEND in binary mode and the batch lands as one write + fsync.
+            # Nothing before the appended bytes is touched, ever.
+            assert tail is not None
+            lines_bytes = new_lines.encode(encoding)
+            payload = lines_bytes
+            if tail.size > 0 and not tail.ends_with_newline:
+                # TORN TAIL (R4 / SPEC D7). The file does not end in a newline:
+                # a crash or a mid-append sync left a partial last line. Never
+                # truncate — history is additive. Lead the batch with a newline
+                # so the fragment stays a complete, skippable junk line (the
+                # defensive readers already tolerate interior junk), and put
+                # the heal ON THE RECORD through the FS-15 read-alarm sidecar
+                # — the same sidecar `events_io._iter_file` uses for the
+                # truncation signature — so it surfaces in system-health and
+                # the brief instead of vanishing. Recorded in BOTH shapes: a
+                # fragment that will not parse (a mid-append crash or sync
+                # flush) and an unterminated line that does parse (a hand
+                # edit); this appender always terminates its rows, so either
+                # shape means something other than the appender wrote here.
+                payload = b"\n" + lines_bytes
+                frag = tail.raw_all.rsplit(b"\n", 1)[-1]
+                frag_parses = False
+                try:
+                    frag_parses = isinstance(
+                        json.loads(frag.decode(encoding, errors="replace")),
+                        dict)
+                except (ValueError, TypeError):
+                    frag_parses = False
+                try:
+                    from read_alarm import record_read_alarm
+                except ImportError:
+                    import sys as _sys
+                    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+                    try:
+                        from read_alarm import record_read_alarm
+                    except Exception:
+                        record_read_alarm = None
+                except Exception:
+                    record_read_alarm = None
+                if record_read_alarm is not None:
+                    shape = ("unparseable fragment" if not frag_parses
+                             else "parseable row missing its terminator")
+                    record_read_alarm(
+                        path,
+                        f"torn tail healed by appender ({shape}): {len(frag)} "
+                        f"unterminated byte(s) kept as a skippable line "
+                        f"before appending {len(evs)} event(s)",
+                        reader=f"atomic_append_jsonl:{holder}",
+                    )
+            _append_bytes(path, payload)
+
+            # R4 — READ BACK before trusting the write. On POSIX a rotation or
+            # repair that replaced the file between our open and our write
+            # leaves the bytes on an orphaned inode; on any platform a write
+            # that did not land must not advance `.seqhw`. Re-open, read a
+            # window at least as large as the batch, and require (a) the
+            # batch bytes to be PRESENT in the live file's tail and (b) the
+            # file's last complete line to parse to the stamped seq. (b) is
+            # the contract; (a) is what decides between "our write never
+            # landed" (raise, side-file, do not advance) and "something else
+            # wrote after us outside the lock" (the batch IS in the ledger, so
+            # raising would set aside a duplicate — say so on stderr instead).
+            verify = _read_events_tail(
+                path, encoding=encoding,
+                max_bytes=max(_TAIL_READ_BYTES, len(lines_bytes) + 1024))
+            # CAPTUREONCE1 (review F-6, 2026-09-14) - AN EMPTY BATCH IS NOT
+            # A WRITE. When the capture-once chokepoint refuses every row,
+            # `evs` is empty and the payload is zero bytes: `landed` is
+            # trivially True (an empty bytes is in any bytes) and there is no
+            # expected last seq, so the check below accused an untouched
+            # ledger of being appended to OUTSIDE the writer lock on every
+            # all-refused batch - the loudest line in the run, printed by the
+            # new fence working exactly as designed. Nothing was written, so
+            # there is nothing to read back.
+            landed = (lines_bytes in verify.raw_all) if evs else True
+            last_seq_expected = evs[-1].get("seq") if evs else None
+            last_line_ok = False
+            try:
+                last_line = verify.raw_all.rstrip(b"\n").rsplit(b"\n", 1)[-1]
+                parsed_last = json.loads(last_line.decode(encoding))
+                last_line_ok = (isinstance(parsed_last, dict)
+                                and parsed_last.get("seq") == last_seq_expected)
+            except (ValueError, TypeError):
+                last_line_ok = False
+            if evs and landed and not last_line_ok:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[atomic_append_jsonl] read-back: the batch landed but "
+                    f"the last line of {path.name} is not its final row (seq "
+                    f"{last_seq_expected}) — another writer appended OUTSIDE "
+                    f"the writer lock (holder={holder}).\n"
+                )
+            if not landed:
+                import datetime as _dt
+                stamp = _dt.datetime.now(_dt.timezone.utc).strftime(
+                    "%Y%m%dT%H%M%S%fZ")
+                side = path.with_name(path.name + f".appendverify-{stamp}.jsonl")
+                try:
+                    atomic_write_text(side, new_lines, encoding=encoding)
+                except Exception:
+                    pass
+                try:
+                    atomic_write_json(
+                        path.with_name(path.name + ".appendverify.json"), {
+                            "detected": _dt.datetime.now(
+                                _dt.timezone.utc).isoformat(),
+                            "reason": "batch_not_at_file_tail_after_append",
+                            "n_events": len(evs),
+                            "side_file": str(side),
+                            "holder": holder,
+                        })
+                except Exception:
+                    pass
+                raise AppendVerificationError(
+                    f"appended {len(evs)} event(s) but the read-back does not "
+                    f"find them at the end of {path.name} — the file was "
+                    f"replaced under the writer (rotation / repair outside the "
+                    f"lock, or a sync swap). The batch is preserved at "
+                    f"{side.name}; .seqhw was NOT advanced (holder={holder})."
+                )
+
+        # FS-04 — advance the high-water mark AFTER a clean, verified write.
+        if hw_guard_on:
+            new_max = max((int(e["seq"]) for e in evs
+                           if isinstance(e.get("seq"), (int, float))
+                           and not isinstance(e.get("seq"), bool)
+                           and e["seq"] < 10**10), default=existing_max_seq)
+            target = max(new_max, existing_max_seq, hw if hw is not None else 0)
+            if _write_seqhw(path, target):
+                # A successful advance retires any pending rescan marker: the
+                # sidecar is the file's max again.
+                if rescan:
+                    _clear_rescan_marker(path)
+            else:
+                # R2 — never silent. Marker or raise; the batch is on disk.
+                _note_seqhw_write_failed(path, target, holder)
+
+        # SPEC A3 — maintain the source_ref dedup index while still holding the
+        # writer lock (events branch only). Best-effort: an index failure must
+        # NEVER fail the event write. Mirrors the auto-stamp caller-agnostic
+        # pattern — LLM-driven writers can't forget the index because they never
+        # touch it. path = <ws>/_hq/data/events.jsonl → workspace root is 3 up.
+        if is_events:
+            try:
+                from source_ref_index import record_keys
+            except ImportError:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).resolve().parent))
+                from source_ref_index import record_keys
+            try:
+                record_keys(live_path.parent.parent.parent, evs)
+            except Exception:
+                pass
+
+            # SPEC EVT1 — WARN-ONLY payload validation. Surfaces payload drift on
+            # stderr for the burn-in; NEVER blocks the write (promotion to
+            # blocking is a later release after zero-warning burn-in). Disable
+            # with CR_PAYLOAD_CHECK=0.
+            import os as _os
+            if _os.environ.get("CR_PAYLOAD_CHECK", "1") != "0":
+                try:
+                    from event_payload_check import check_payload
+                    import sys as _sys
+                    for _e in evs:
+                        _viol = check_payload(_e)
+                        if _viol:
+                            _sys.stderr.write("[event_payload] " + "; ".join(_viol) + "\n")
+                except Exception:
+                    pass
+
+    if is_events:
+        # SPEC A1 — serialize the whole read->stamp->rename behind the writer
+        # lock so concurrent appends can't lose an event or duplicate a seq.
+        # Lazy import avoids an import cycle (writer_lock imports atomic_write).
+        try:
+            from writer_lock import events_writer_lock
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from writer_lock import events_writer_lock
+        # LEASE2 MUST 3 (seam S-1) — the lock is taken through the ONE backend
+        # flag (`shared/config/writer_lock.json`, `lease_lock.writer_lock_backend`).
+        # `flock` (the shipped value) hands back `events_writer_lock` itself, so
+        # this path is today's byte for byte. `lease` holds the directory lease
+        # around the append, and a hold that is no longer this writer's at the
+        # write raises `LeaseLost` (door: `ok:false, reason: lease_lost`) with
+        # NOTHING appended. A lease module that cannot load is the flock path.
+        # Under `lease` the flock is STILL taken first, outside the lease: the
+        # read-check-then-append sections that hold `events_writer_lock`
+        # directly (commitment_state, mute_ledger, rotation, the repair tools)
+        # keep excluding this append on the same machine, where flock works;
+        # the lease adds the exclusion across sessions, where it does not.
+        # Always flock then lease, never the reverse, so no order inverts.
+        # LEASE3 MUST 5 (REVIEW_T2_LEASE2 N-8, D-T3-4): a lease module that
+        # cannot load is the flock path ONLY when the flag says flock. When the
+        # flag (read here, without the module) says lease, falling back would
+        # run every append with no cross-session exclusion, silently; so it is
+        # a typed refusal instead (`lease_unavailable`), NOTHING appended.
+        _lease_mod = None
+        _lock_cm = events_writer_lock
+        try:
+            import lease_lock as _lease_mod
+            _lock_cm = _lease_mod.writer_lock_backend()
+        except Exception as _lease_exc:
+            _lease_mod, _lock_cm = None, events_writer_lock
+            if _writer_lock_flag() == "lease":
+                raise LeaseBackendUnavailable(
+                    f"{type(_lease_exc).__name__}: {_lease_exc}") from _lease_exc
+        _on_lease = _lease_mod is not None and _lock_cm is _lease_mod.events_lease
+        import contextlib as _ctx
+        _same_machine = (events_writer_lock(live_path, holder=holder) if _on_lease
+                         else _ctx.nullcontext())
+        with _same_machine, _lock_cm(live_path, holder=holder):
+            if _on_lease:
+                _lease_mod.check_held(live_path)
+            # SPEC SYNC1 A3 — quarantine auto-reconcile + fail-closed merge-
+            # forward, INSIDE the lock, BEFORE the FS-04 check below. Fast no-op
+            # unless a marker / quarantine / Drive conflict-copy is present, so
+            # the normal append path pays nothing. On a healthy view it replays
+            # any quarantined batches (self-heal — zero manual recovery); on a
+            # regressed view it merges forward ONLY when a candidate at/above the
+            # high-water is visible, and otherwise does nothing so the FS-04
+            # guard in _read_stamp_write stays the last-resort fail-closed floor
+            # (the load-bearing rule: a stale sandbox mount must never let the
+            # reconciler promote the stale copy and become the clobberer itself).
+            # Best-effort: a reconcile failure must never block the caller's
+            # write — the FS-04 guard still protects the substrate.
+            if os.environ.get("CR_RECONCILE_FORWARD", "1") != "0":
+                try:
+                    from reconcile_forward import reconcile_forward
+                except ImportError:
+                    import sys as _sys
+                    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+                    try:
+                        from reconcile_forward import reconcile_forward
+                    except Exception:
+                        reconcile_forward = None
+                except Exception:
+                    reconcile_forward = None
+                if reconcile_forward is not None:
+                    try:
+                        reconcile_forward(path, holder=holder)
+                    except Exception:
+                        pass
+            if _on_lease:
+                _lease_mod.check_held(live_path)
+            _read_stamp_write(events)
+            if _on_lease:
+                # LEASE3 fix N-1: count what landed under this hold, so a
+                # SECTION holding the lease (events_write_section) can say a
+                # takeover after its appends when it lets go.
+                _lease_mod.note_appended(live_path, len(stamped))
+        if _on_lease:
+            # The release's answer is read, never discarded: a hold taken over
+            # AFTER the pre-write check means the batch landed under a lease
+            # that was no longer ours. The batch is on disk (retrying would
+            # duplicate it), so this is said on stderr, never raised.
+            _rel = _lease_mod.last_release(live_path) or {}
+            if _rel.get("reason") == "not_ours":
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[lease] {len(stamped)} event(s) appended to {path.name} by "
+                    f"{holder} under a lease that was taken over before release\n")
+                # LEASE3 MUST 3 — and ONE marker the health check reads
+                # (`_hq/.system/lease_hold_lost.json`); never raises.
+                try:
+                    _lease_mod.record_hold_lost(live_path, holder, len(stamped))
+                except Exception:
+                    pass
+    else:
+        _read_stamp_write(events)
+    return stamped
+
+
+#: LEASE3 MUST 5 — the one sentence an append refused because the lease module
+#: could not load under the `lease` flag carries to the door. Nothing was saved.
+LEASE_UNAVAILABLE_LINE = ("Nothing was saved, because part of the Command Room install that "
+                          "keeps two sessions from writing at once is missing - say update "
+                          "command room, then say it again.")
+
+#: The flag file, spelled the way `lease_lock._config_path` and the runtime
+#: manifest's asset scan read it (`shared/config/writer_lock.json`).
+_WRITER_LOCK_FLAG_REL = ("config", "writer_lock.json")
+
+
+class LeaseBackendUnavailable(RuntimeError):
+    """The writer-lock flag says `lease` but `lease_lock` could not load (or
+    `writer_lock_backend()` raised): NOTHING was appended. Carries
+    `cr_refusal_reason = "lease_unavailable"` and `line`, so a door answers
+    `ok:false, reason: lease_unavailable` with `LEASE_UNAVAILABLE_LINE`."""
+
+    cr_refusal_reason = "lease_unavailable"
+
+    def __init__(self, detail: str = ""):
+        super().__init__("the events lease backend is unavailable under the lease flag"
+                         + (f": {detail}" if detail else ""))
+        self.cause = detail
+        self.line = LEASE_UNAVAILABLE_LINE
+
+
+def _writer_lock_flag() -> str:
+    """The writer-lock flag read WITHOUT `lease_lock` (LEASE3 MUST 5):
+    `CR_WRITER_LOCK_BACKEND`, else `shared/config/writer_lock.json` beside this
+    file. `lease` or `flock`; anything unknown or unreadable is `flock`, the
+    same default `lease_lock.configured_backend` applies."""
+    override = str(os.environ.get("CR_WRITER_LOCK_BACKEND", "") or "").strip().lower()
+    if override in ("flock", "lease"):
+        return override
+    try:
+        cfg = Path(__file__).resolve().parent.parent.joinpath(*_WRITER_LOCK_FLAG_REL)
+        b = str(json.loads(cfg.read_text(encoding="utf-8")).get("backend", "")).strip().lower()
+    except (OSError, ValueError, AttributeError):
+        return "flock"
+    return b if b in ("flock", "lease") else "flock"
+
+
+def events_write_section(events_path, holder: str = "unknown", **kw):
+    """The direct read-check-then-append sections' ONE import (LEASE3 fix N-3).
+
+    Hands back `lease_lock.events_write_section(events_path, holder=..., **kw)`
+    (flock then lease on `lease`, the plain flock on `flock`). When `lease_lock`
+    cannot be imported it answers the way the append does (D-T3-4): under the
+    `lease` flag `LeaseBackendUnavailable` (`lease_unavailable`, the pinned
+    line), nothing read or written; under `flock` exactly
+    `writer_lock.events_writer_lock(events_path, holder=..., **kw)`, the call the
+    sections made before LEASE3."""
+    try:
+        from lease_lock import events_write_section as _section
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            from lease_lock import events_write_section as _section
+        except ImportError as exc:
+            if _writer_lock_flag() == "lease":
+                raise LeaseBackendUnavailable(f"{type(exc).__name__}: {exc}") from exc
+            import writer_lock as _wl
+            kw.pop("ttl_s", None)
+            return _wl.events_writer_lock(events_path, holder=holder, **kw)
+    return _section(events_path, holder=holder, **kw)
+
+
+def acquire_write_lock(
+    path: str | Path,
+    holder: str = "unknown",
+    timeout_s: float = 10.0,
+    stale_after_s: float = 60.0,
+) -> Path:
+    """Acquire a cooperative cross-process write lock on `path` (v3.13.0+).
+
+    NEW CODE: for events.jsonl use `writer_lock.events_writer_lock` (SPEC A1) —
+    an OS byte-range lock that the kernel releases on crash. This sentinel
+    variant remains the canonical lock for entities.json / aliases.json (its
+    mtime-staleness + mv-aside semantics are load-bearing for those callers).
+
+    Creates a sentinel file at `{path}.lock` containing the current PID +
+    timestamp + caller-provided holder name. If the lock file already exists
+    AND is fresh (mtime < stale_after_s ago), waits up to `timeout_s` for the
+    holder to release; if still locked after that, raises TimeoutError.
+
+    A "stale" lock file (older than stale_after_s) is assumed to be from a
+    crashed writer and is reclaimed automatically — this prevents permanent
+    deadlock if a skill crashes mid-write.
+
+    Returns the lock-file Path so the caller can release it via
+    release_write_lock(lock_path).
+
+    Use this BEFORE read-modify-write on entities.json / aliases.json. Atomic
+    rename alone doesn't prevent two concurrent read-modify-writes from
+    overwriting each other's changes (last-writer-wins, silent data loss);
+    this lock does.
+
+    For append-only writes to events.jsonl, atomic_append_jsonl already does
+    a full read+rewrite per call, so concurrent appends are rare-but-possible
+    races; if you have many events to append, BATCH them into one call rather
+    than calling per event under separate locks.
+
+    Cooperative-only: only protects against writers that also call this
+    helper. If a script does direct `path.write_text(...)`, this lock won't
+    stop them. Every canonical writer in shared/scripts/ goes through this.
+
+    Background on why a sentinel file vs. fcntl/flock: fcntl is POSIX-only
+    (no Windows). msvcrt.locking is Windows-only. portalocker would work
+    but adds a dependency. A sentinel file is portable, simple, and good
+    enough for the actual concurrency volume we see (a few skills hitting
+    the same file within seconds, not high-volume contention).
+    """
+    import datetime
+    import os as _os
+    import time as _time
+
+    # BRIEFDOOR1 MUST 5 -- no sentinel is minted for a writer that cannot be
+    # named on a merged seat (see `_require_named_writer`).
+    _require_named_writer()
+    path = Path(path)
+    lock_path = path.parent / (path.name + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    start = _time.monotonic()
+    while True:
+        # If lock exists, check whether it's stale
+        if lock_path.exists():
+            try:
+                mtime = lock_path.stat().st_mtime
+                age = _time.time() - mtime
+            except OSError:
+                # Race: file disappeared between exists() and stat(). Retry the loop.
+                continue
+            # BUG-8330 item 7d — REFUSE the mtime-stale reclaim while the
+            # holder pid is provably ALIVE on this machine. The mtime backstop
+            # exists for crashed writers; a live writer mid-way through a slow
+            # multi-MB append is not crashed, and reclaiming its lock is
+            # exactly the duplicate-seq / lost-event race the lock closes.
+            # A dead or unreadable pid (crash, other machine) keeps today's
+            # reclaim behavior.
+            holder_alive = False
+            if age > stale_after_s:
+                try:
+                    lock_pid, _epoch = _read_lock_payload(lock_path)
+                    holder_alive = bool(lock_pid) and _pid_alive(lock_pid)
+                except Exception:
+                    holder_alive = False
+            if age > stale_after_s and not holder_alive:
+                # Stale — reclaim. Best-effort; if another writer grabs it
+                # first, we'll loop again on our next attempt. v4.8.1 (F-11):
+                # reclaim goes through _clear_lock_file so a refused unlink
+                # (cloud-sync client briefly holding the file) mv-asides
+                # instead of crashing the writer; if even the rename fails,
+                # fall into the timeout below rather than spinning forever.
+                if not _clear_lock_file(lock_path):
+                    if _time.monotonic() - start > timeout_s:
+                        raise TimeoutError(
+                            f"Write lock on {path.name} is stale but cannot be "
+                            f"cleared (unlink and rename both refused by the "
+                            f"mount). Waited {timeout_s:.1f}s."
+                        )
+                    _time.sleep(0.1)
+                    continue
+            else:
+                # Fresh lock held by someone else. Wait + retry.
+                if _time.monotonic() - start > timeout_s:
+                    try:
+                        held_by = lock_path.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        held_by = "(unreadable)"
+                    raise TimeoutError(
+                        f"Write lock on {path.name} is held by another process: {held_by}. "
+                        f"Waited {timeout_s:.1f}s. Retry, or check for hung writers."
+                    )
+                _time.sleep(0.1)
+                continue
+
+        # Try to atomically create the lock file. O_EXCL fails if another
+        # process beat us to it; that's the "I lost the race" signal.
+        try:
+            fd = _os.open(
+                str(lock_path),
+                _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            # Another writer grabbed the lock between our check and create. Retry.
+            continue
+        # Write metadata. If this fails, drop the lock so we don't hang others.
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                payload = {
+                    "pid": _os.getpid(),
+                    "holder": holder,
+                    # UTC-aware (TZ1) — `_read_lock_payload` turns this
+                    # string into an epoch through `fromisoformat`, so a
+                    # NAIVE stamp was read in the READER's zone and the
+                    # stale-lock window was computed against a clock the
+                    # writer never used. Across a container / VM / PC split
+                    # that is hours of error in a reclaim decision.
+                    "acquired_at": _diagnostic_stamp(),
+                }
+                f.write(json.dumps(payload))
+        except Exception:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            raise
+        return lock_path
+
+
+def _clear_lock_file(lock_path: Path, unlink_retries: int = 3,
+                     retry_delay_s: float = 0.05) -> bool:
+    """Remove a lock sentinel, tolerating cloud-sync mounts (v4.8.1, F-11).
+
+    Unlink with brief retries first, mv-aside second. Returns True when the
+    lock file is out of the way (deleted, renamed, or already gone), False
+    only when both unlink and rename are refused.
+
+    WHY THE RETRIES (F-11, integration-2026-07): the seven
+    `entities.json.lock.stale.*` files from one multi-write session were NOT
+    crashed writers — every write succeeded. They were mv-aside litter: on a
+    Drive-synced workspace the sync client briefly holds each freshly-created
+    lock file, the release-time unlink gets OSError-refused, and the old code
+    renamed immediately. The hold is transient (ms), so a couple of short
+    retries clears almost every case without littering. The mv-aside stays as
+    the backstop; cleanup Rule 9 (`cleanup_actions.sweep_stale_locks`, weekly)
+    and the maintenance fire's daily M2b (`sweep_lock_litter`) archive
+    whatever still lands.
+
+    cr1#930: the aside name never clobbers (a taken name gets `-N`), so the
+    rename needs no delete permission even for a second release in the same
+    second; only a mount that refuses the rename itself returns False.
+    """
+    import os as _os
+    import time as _time
+
+    last_exc: BaseException | None = None
+    for attempt in range(max(1, unlink_retries)):
+        try:
+            lock_path.unlink()
+            return True
+        except FileNotFoundError:
+            return True  # someone else cleared it; done
+        except OSError as exc:
+            last_exc = exc
+            if attempt + 1 < max(1, unlink_retries):
+                _time.sleep(retry_delay_s)
+    # Unlink keeps getting refused — mv-aside to the stale-name
+    # (`<file>.lock.stale.<epoch>.<pid>`, the exact pattern the daily M2b
+    # sweep and the weekly Rule 9 sweep archive into _archive/stale-locks/).
+    #
+    # cr1#930 — NEVER-CLOBBER. On the merged seat unlink is EPERM on EVERY
+    # release, so every release lands here; one process that writes
+    # entities.json twice in the same second (a Maintenance job does) asked
+    # for the SAME aside name twice. The second rename then has to replace an
+    # existing file — a delete of the target, which a no-delete mount can
+    # refuse (Windows always refuses it: FileExistsError) — so it failed,
+    # False came back, and the bare `<file>.lock` stayed live: the next writer
+    # read it as HELD and timed out behind it. A taken name now gets `-2`,
+    # `-3`, ... (the `delete_grant._free_aside` idiom), so the rename never
+    # has to remove anything. An aside never matches `<file>.lock`, the only
+    # name acquire treats as held, so a moved-aside lock cannot block.
+    base = lock_path.with_suffix(
+        lock_path.suffix + f".stale.{int(_time.time())}.{_os.getpid()}"
+    )
+    rename_exc: BaseException | None = None
+    for n in range(1, _ASIDE_TRIES + 1):
+        stale_path = base if n == 1 else base.with_name(f"{base.name}-{n}")
+        if stale_path.exists():
+            continue
+        try:
+            _os.rename(str(lock_path), str(stale_path))
+        except FileNotFoundError:
+            return True  # someone else cleared it between our tries; done
+        except FileExistsError as exc:
+            rename_exc = exc  # a racer took this name; try the next one
+            continue
+        except OSError as exc:
+            rename_exc = exc
+            break
+        if last_exc is not None:
+            # On the merged mount this is the STEADY state, not an anomaly,
+            # so it is said once per release — and it says where the lock
+            # went. (cr1#930: the old line said "left in place" BEFORE the
+            # rename was even tried, so a release that worked read as a lock
+            # that stayed.)
+            _say_lock_moved(lock_path, last_exc, stale_path)
+        return True
+    # Both the delete and the rename were refused: the lock IS still in place,
+    # and acquire's staleness reclaim (dead pid + `stale_after_s`) is the only
+    # thing that frees it. Say so, once.
+    left_in_place("lock release", lock_path,
+                  last_exc if last_exc is not None
+                  else (rename_exc or OSError("rename refused")))
+    return False
+
+
+#: How many `-N` aside names `_clear_lock_file` tries before it gives up. One
+#: process makes at most a handful of releases per second; the bound only
+#: exists so a mount that lies about `exists()` can never loop.
+_ASIDE_TRIES = 64
+
+
+def _say_lock_moved(lock_path, exc: BaseException, dest) -> None:
+    """ONE line when a refused lock delete became a rename (cr1#930). Same
+    words as `left_in_place` up to the ending, the way
+    `delete_grant._say_moved` mirrors it, so the two outcomes read alike in a
+    stderr tail and only the true one says "left in place". Never raises."""
+    try:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[atomic_write] lock release: could not remove {lock_path} "
+            f"({type(exc).__name__}: {exc}); moved aside to {Path(dest).name}\n"
+        )
+    except Exception:
+        pass
+
+
+def release_write_lock(lock_path: Path) -> None:
+    """Release a write lock acquired via acquire_write_lock. Idempotent —
+    silently no-ops if the lock file is already gone (someone else reclaimed
+    it as stale, or this is a second release call).
+
+    v3.13.8: handles sandbox-mount OSError on unlink via mv-aside fallback
+    (Bug #21 — Drive-mounted workspaces sometimes refuse unlink but permit
+    rename). v4.8.1 (F-11): unlink is retried briefly before the mv-aside so
+    a transient sync-client hold doesn't litter a `.stale.*` file per write;
+    leftover `.stale.*` files are archived by cleanup Rule 9's weekly sweep.
+    If even the rename fails, this is a release-time non-fatal; the lock will
+    eventually be reclaimed as stale by acquire_write_lock.
+    """
+    _clear_lock_file(lock_path)
+
+
+# ---------------------------------------------------------------------------
+# Multi-write context manager (v3.13.8 — Bug #20 + #18 + #21)
+# ---------------------------------------------------------------------------
+
+class AtomicWriteLockError(RuntimeError):
+    """Raised by multi_write_context when the lock cannot be acquired."""
+
+
+def _diagnostic_stamp() -> str:
+    """A UTC-AWARE ISO stamp for a lock diagnostic (TZ1, SPEC_NIGHTM2 §6).
+
+    Routed through `clock_policy.diagnostic_stamp` so "which clock a stamp is
+    in" is answered in ONE place for the whole tree. That helper imports
+    nothing from this tree, so there is no cycle; the local fallback keeps
+    this module standalone in a stripped install.
+    """
+    try:
+        from clock_policy import diagnostic_stamp
+
+        return diagnostic_stamp()
+    except Exception:  # noqa: BLE001 — a diagnostic never blocks a write
+        import datetime as _dtx
+
+        return _dtx.datetime.now(_dtx.timezone.utc).isoformat(timespec="seconds")
+
+
+def _read_lock_payload(lock_path: Path) -> tuple[int, float]:
+    """Best-effort read of (pid, acquired_at_epoch) from a lock sentinel.
+
+    Returns (0, 0.0) when the lock is unreadable, corrupted, or missing
+    expected fields — the caller treats that as a corrupt lock and reclaims.
+    """
+    import datetime as _dt
+
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0, 0.0
+    if not raw:
+        return 0, 0.0
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0, 0.0
+    if not isinstance(payload, dict):
+        return 0, 0.0
+    pid = payload.get("pid")
+    if not isinstance(pid, int):
+        pid = 0
+    acquired_at = payload.get("acquired_at")
+    epoch = 0.0
+    if isinstance(acquired_at, str):
+        try:
+            epoch = _dt.datetime.fromisoformat(acquired_at).timestamp()
+        except ValueError:
+            epoch = 0.0
+    return pid, epoch
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """Windows pid-liveness via OpenProcess + WaitForSingleObject.
+
+    A running process's handle stays unsignalled, so WaitForSingleObject(h, 0)
+    returns WAIT_TIMEOUT. Once it exits, the handle signals and we get
+    WAIT_OBJECT_0. That distinction is the liveness answer.
+
+    Deliberately NOT using GetExitCodeProcess/STILL_ACTIVE: a process that exits
+    with code 259 is indistinguishable from one still running.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    WAIT_TIMEOUT = 0x00000102
+    ERROR_ACCESS_DENIED = 5
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # Explicit prototypes are mandatory: ctypes defaults restype to c_int, which
+    # truncates a 64-bit HANDLE and yields a bogus handle on win64.
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(
+        SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+    if not handle:
+        # Access-denied means the pid exists but belongs to another user or a
+        # protected process — same call as the POSIX PermissionError branch:
+        # it's alive, just not ours. Anything else (chiefly
+        # ERROR_INVALID_PARAMETER) means no such process.
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort pid-liveness check that works on Windows and POSIX.
+
+    WINDOWS MUST NOT GO THROUGH os.kill (found 2026-07-15).
+
+    `os.kill(pid, 0)` is the standard POSIX liveness idiom: signal 0 is a no-op
+    probe that checks existence and sends nothing. On Windows it means something
+    else entirely. CPython's os.kill special-cases the signal value BEFORE it
+    ever reaches TerminateProcess:
+
+        if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT)
+            err = GenerateConsoleCtrlEvent((DWORD)signal, (DWORD)pid);
+
+    and on Windows CTRL_C_EVENT == 0. So `os.kill(pid, 0)` does not probe the
+    process — it broadcasts a real Ctrl+C to the console process group. The call
+    returns normally (so the old code reported "alive"), and the Ctrl+C lands
+    asynchronously a beat later, killing whatever shares that console: the test
+    runner, a CI job, the operator's terminal.
+
+    Observed: tests/run_all.py died with KeyboardInterrupt inside
+    WaitForSingleObject on 4/4 runs, always at run_atomic_write_multi_test.py —
+    the only suite reaching this path — with nobody at the keyboard. The
+    traceback was indistinguishable from a human pressing Ctrl+C, because it is
+    the same signal.
+
+    The no-console case is no better: GenerateConsoleCtrlEvent fails, OSError is
+    raised, the old `except OSError: return False` reports "dead" — for every pid
+    it is ever asked about. A live writer's lock then reads as abandoned and gets
+    reclaimed, which is precisely what the lock exists to prevent.
+
+    Regression coverage: tests/run_pid_alive_windows_test.py
+    """
+    import os as _os
+    import sys as _sys
+
+    if pid <= 0:
+        return False
+
+    if _sys.platform == "win32":
+        return _pid_alive_windows(pid)
+
+    try:
+        _os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Pid exists but is owned by another user / system process — treat as alive.
+        return True
+    except OSError:
+        return False
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def multi_write_context(
+    workspace_path,
+    holder: str = "multi_write",
+    timeout_s: float = 60.0,
+    stale_after_s: float = 300.0,
+):
+    """Hold a single shared write lock across multiple writes in the same
+    process (v3.13.8+ — Bug #20 multi-write deadlock fix).
+
+    The classic pattern of calling atomic_write_json_locked() N times in a row
+    in the same process can deadlock on Drive-synced workspaces when the prior
+    release hasn't propagated to the filesystem view yet. multi_write_context
+    grabs ONE lock at entry, holds it across all writes, and releases ONCE at
+    exit. Bundles three Bug fixes in one helper:
+
+      - Bug #20: same-process multi-write deadlock (one lock, not N)
+      - Bug #18: stale-lock auto-reclaim (pid-liveness OR time-based fallback)
+      - Bug #21: sandbox mount unlink-fail (mv-aside fallback per
+        release_write_lock above)
+
+    Args:
+      workspace_path: workspace root (the directory containing _hq/).
+      holder: caller name (e.g. "command-room-update-bridge").
+      timeout_s: max seconds to wait if lock is held by ANOTHER live writer.
+      stale_after_s: lock files older than this are considered abandoned and
+        reclaimed even if their PID still appears alive on the system. 5min
+        default (matches the architectural-review spec). The pid-liveness
+        check fires first; this is the belt-and-suspenders backstop.
+
+    Usage in update-bridge migration:
+
+        with multi_write_context(workspace_path, holder="update-bridge"):
+            run_corruption_recovery_if_needed()
+            apply_canonical_surname_fix()
+            prompt_brain_name_if_missing()
+            # ...all writes under single lock — no deadlock, no partial state
+
+    Raises:
+      AtomicWriteLockError: if the lock cannot be acquired within timeout_s
+        and the existing holder is genuinely alive + recent.
+    """
+    import os as _os
+    import time as _time
+
+    workspace_path = Path(workspace_path)
+    lock_dir = workspace_path / "_hq" / ".system"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "atomic.lock"
+
+    pid = _os.getpid()
+    acquired = False
+    existing_pid = 0
+    start = _time.monotonic()
+
+    while not acquired:
+        try:
+            fd = _os.open(
+                str(lock_path),
+                _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL,
+                0o600,
+            )
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                import datetime as _dt
+                payload = {
+                    "pid": pid,
+                    "holder": holder,
+                    "acquired_at": _diagnostic_stamp(),  # UTC-aware (TZ1)
+                }
+                f.write(json.dumps(payload))
+            acquired = True
+            break
+        except FileExistsError:
+            existing_pid, lock_epoch = _read_lock_payload(lock_path)
+            if existing_pid == 0 and lock_epoch == 0.0:
+                # Corrupt / unreadable lock — reclaim. v4.8.1 (F-11, second-eyes
+                # finding 1): a reclaim whose unlink AND rename are both refused
+                # must fall into the timeout, not spin forever.
+                if not _clear_lock_file(lock_path):
+                    if _time.monotonic() - start > timeout_s:
+                        raise AtomicWriteLockError(
+                            f"Could not clear corrupt multi_write lock at "
+                            f"{lock_path} after {timeout_s:.0f}s (unlink and "
+                            f"rename both refused by the mount)."
+                        )
+                    _time.sleep(1.0)
+                continue
+
+            now = _time.time()
+            stale_by_time = (now - lock_epoch) > stale_after_s
+            alive = _pid_alive(existing_pid)
+
+            if not alive or stale_by_time:
+                # Reclaim a dead-pid or time-stale lock (same F-11 contract:
+                # unclearable → timeout, never an infinite loop).
+                if not _clear_lock_file(lock_path):
+                    if _time.monotonic() - start > timeout_s:
+                        raise AtomicWriteLockError(
+                            f"Stale multi_write lock at {lock_path} cannot be "
+                            f"cleared after {timeout_s:.0f}s (unlink and rename "
+                            f"both refused by the mount); holder "
+                            f"pid={existing_pid} is dead or expired."
+                        )
+                    _time.sleep(1.0)
+                continue
+
+            if _time.monotonic() - start > timeout_s:
+                raise AtomicWriteLockError(
+                    f"Could not acquire multi_write lock on {lock_path} after "
+                    f"{timeout_s:.0f}s; holder pid={existing_pid} appears alive."
+                )
+            _time.sleep(1.0)
+
+    try:
+        yield lock_path
+    finally:
+        release_write_lock(lock_path)
+
+
+def atomic_write_json_locked(
+    path: str | Path,
+    data: Any,
+    holder: str = "unknown",
+    indent: int | None = 2,
+    ensure_ascii: bool = False,
+    timeout_s: float = 10.0,
+    verify_parse: bool = True,
+    precheck: Any = None,
+) -> None:
+    """Atomic JSON write WITH cross-process lock + post-write parse check.
+
+    The canonical writer for entities.json / aliases.json (v3.13.0+). Three
+    guarantees on top of atomic_write_json:
+
+      1. **Cross-process lock**: acquires a sentinel lock before writing, so
+         two skills writing concurrently can't overwrite each other's
+         changes. Releases the lock after write completes (or fails).
+
+      2. **Post-write parse check** (when verify_parse=True): re-reads the
+         file after write and confirms it parses as JSON. If it doesn't,
+         attempts to restore from the newest backup in `_backups/` and
+         raises so the caller knows the write failed.
+
+      3. **Caller identification**: `holder` is written into the lock file
+         and into any lock-conflict error so debugging concurrent-writer
+         issues is easier. Pass the calling skill name (e.g.
+         holder="people-crm").
+
+    Use this for ANY write to a substrate file where:
+      - the file is read-modify-written (concurrent writers can race)
+      - downstream readers depend on the file being valid JSON
+
+    `precheck` (ACCESS1, SPEC_NIGHTM1 §2 item 2) is an optional callable run
+    with `path` INSIDE the lock and before the write. It exists so a
+    compare-and-swap ("write only if the file is still the one I read") can be
+    a real critical section rather than a narrowed window: the access layer's
+    `write` verb stats the file here, with the lock held, on the same host that
+    is about to write it. A precheck that raises aborts the write and the lock
+    is still released. None (the default) leaves every existing caller's
+    behaviour byte-identical.
+
+    For append-only events.jsonl: prefer atomic_append_jsonl directly
+    (it's append-only so the lock helps less, and the read+rewrite cost
+    is already paid).
+    """
+    path = Path(path)
+    lock_path = acquire_write_lock(path, holder=holder, timeout_s=timeout_s)
+    try:
+        if precheck is not None:
+            precheck(path)
+        atomic_write_json(path, data, indent=indent, ensure_ascii=ensure_ascii)
+        if verify_parse:
+            try:
+                content = path.read_text(encoding="utf-8")
+                json.loads(content)  # raises if invalid
+            except (OSError, json.JSONDecodeError) as e:
+                _try_restore_from_backup(path)
+                raise RuntimeError(
+                    f"Post-write parse check failed on {path.name}: {e}. "
+                    f"Restored from newest backup (if any). The write was rejected."
+                ) from e
+        # SPEC SYNC1 D-4 — freshness sidecar for name-bearing substrate.
+        # entities.json / aliases.json have no seq semantics, so the seqhw guard
+        # can't cover them; sighting #2 (2026-07-19) was a transient entities
+        # parse failure in a scheduled fire. A tiny `<file>.rev` sidecar stamped
+        # at this chokepoint lets a reader notice it is looking at an older view
+        # than the last locked write produced. Best-effort — the write is
+        # already durable; a rev-stamp failure must never fail the write.
+        _stamp_rev_sidecar(path)
+    finally:
+        release_write_lock(lock_path)
+
+
+_REV_SIDECAR_NAMES = ("entities.json", "aliases.json")
+
+
+def _rev_sidecar_path(path: Path) -> Path:
+    return path.with_name(path.name + ".rev")
+
+
+def _stamp_rev_sidecar(path: Path) -> None:
+    """Bump `<file>.rev` = {rev, updated} after a locked write to entities.json /
+    aliases.json (SPEC SYNC1 D-4). rev is a monotonic counter read from the
+    prior sidecar (absent/corrupt → start at 1). No-op for other files."""
+    if path.name not in _REV_SIDECAR_NAMES:
+        return
+    try:
+        import datetime as _dt
+        prior = 0
+        sp = _rev_sidecar_path(path)
+        try:
+            raw = json.loads(sp.read_text(encoding="utf-8"))
+            v = raw.get("rev")
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                prior = v
+        except (OSError, json.JSONDecodeError, AttributeError, ValueError):
+            prior = 0
+        atomic_write_json(sp, {
+            "rev": prior + 1,
+            "updated": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
+
+
+def read_rev_sidecar(path: str | Path) -> dict | None:
+    """The `{rev, updated}` freshness sidecar for entities.json / aliases.json,
+    or None when absent/corrupt (SPEC SYNC1 D-4). Back-compat: a workspace with
+    no sidecar reads as None — readers must treat that as 'no signal', never a
+    warning (a pre-D4 substrate has no sidecars and is perfectly healthy)."""
+    try:
+        raw = json.loads(_rev_sidecar_path(Path(path)).read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _try_restore_from_backup(path: Path) -> None:
+    """Best-effort restore of `path` from the newest sibling backup under
+    `_backups/`. Called by atomic_write_json_locked when post-write parse
+    fails. Silent if no backup is found — the caller raises regardless, so
+    the calling skill knows the write didn't take.
+    """
+    backups_dir = path.parent / "_backups"
+    if not backups_dir.exists():
+        return
+    candidates = []
+    for p in backups_dir.iterdir():
+        if not p.is_file():
+            continue
+        # Match siblings of this file: entities.json* / aliases.json* etc.
+        if p.name.startswith(path.stem):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, p))
+    if not candidates:
+        return
+    candidates.sort(reverse=True)
+    newest = candidates[0][1]
+    try:
+        content = newest.read_text(encoding="utf-8")
+        json.loads(content)  # only restore if backup itself parses
+    except (OSError, json.JSONDecodeError):
+        return
+    try:
+        atomic_write_text(path, content)
+    except OSError:
+        # Can't even restore. Caller will raise; user will need to manually
+        # recover from the backup. Don't mask the original error.
+        return
+
+
+# Convenience: re-export common usage patterns to make caller code obvious.
+__all__ = [
+    "atomic_write_text",
+    "atomic_write_json",
+    "atomic_write_json_locked",
+    "atomic_append_jsonl",
+    "acquire_write_lock",
+    "release_write_lock",
+    "multi_write_context",
+    "AtomicWriteLockError",
+    "SubstrateRegressionError",
+    "SeqHighWaterError",
+    "AppendVerificationError",
+    "LedgerAtWorkspaceRoot",
+    "check_substrate_regression",
+    "events_freshness",
+    "read_rev_sidecar",
+]
+
+
+# CLI mode for shell-based callers (e.g., bash skills that pipe JSON in).
+def main() -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Atomic write helper. Reads JSON or text from stdin, writes to --path atomically."
+    )
+    parser.add_argument("--path", required=True, type=Path, help="Destination path.")
+    parser.add_argument(
+        "--mode",
+        choices=["text", "json", "append-jsonl"],
+        default="text",
+        help="Write mode. text = raw content. json = parse stdin as JSON, format with indent=2. "
+        "append-jsonl = parse stdin as a JSON array of records, append each as a JSONL line.",
+    )
+    args = parser.parse_args()
+
+    raw = sys.stdin.read()
+    if args.mode == "text":
+        atomic_write_text(args.path, raw)
+    elif args.mode == "json":
+        atomic_write_json(args.path, json.loads(raw))
+    elif args.mode == "append-jsonl":
+        events = json.loads(raw)
+        if not isinstance(events, list):
+            print("ERROR: append-jsonl mode requires a JSON array on stdin", file=sys.stderr)
+            return 2
+        atomic_append_jsonl(args.path, events)
+    print(f"OK wrote {args.path}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

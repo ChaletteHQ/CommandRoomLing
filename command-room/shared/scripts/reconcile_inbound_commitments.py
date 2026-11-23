@@ -1,0 +1,2200 @@
+"""Inbound-mail → open-commitment reconciliation (REPLYCLOSE, 2026-07).
+
+WHY THIS EXISTS
+---------------
+M ruled 2026-07-29 that a counterparty's reply should close a "waiting on X"
+item. Two scheduled fires already FETCH inbound mail and already run
+`cru_match` Path 4 with closure power — inbox-triage's Phase 5.5 and the daily
+Commitments/Waiting-On backstop's Phase 2.6 — but both did the whole job as
+hand-rolled prose: load, match, close, append, per message, at the call site.
+That is precisely the shape Bug #98-v3 diagnosed on the sent rail:
+
+  * seven manual steps means seven places to half-do it,
+  * nothing writes a verifiable trace, so a fire that silently did nothing is
+    indistinguishable from a fire that found nothing,
+  * the closures carry no batch stamp, so `undo` cannot list them, and
+  * the fence parameters `cru_match` exposes are simply never passed.
+
+This module is the missing ORCHESTRATOR — the inbound mirror of
+`reconcile_sent_commitments.reconcile_and_receipt`. One call takes the batch of
+inbound messages the skill already fetched and does everything else: match,
+close through THE closure path, persist the mid-confidence proposals, record
+the schedule-shift updates, and emit ONE `inbound_reconcile` audit event whose
+fields exist only because the work ran.
+
+WHAT IS DELIBERATELY *NOT* MIRRORED FROM THE SENT RAIL
+-----------------------------------------------------
+**FS-11 does not apply here.** On the sent rail an unambiguous moderate match
+is auto-closed, because M ruled twice "if they are closed, just close them"
+about mail HE sent — his own outbound act is the fulfillment. Inbound is
+somebody else's message about somebody else's work, and REPLYCLOSE §2.2 is
+explicit that a non-thread inbound match proposes at best. So a
+`pending_review` here stays a `pending_review`; nothing is promoted.
+
+**No cursor.** Both callers already own their own window (inbox-triage scans
+the threads it fetched; the Commitments backstop scans since its last fire), and
+a second cursor would be a second source of truth for the same window with no
+reader to reconcile them. The audit event's timestamp plus
+`validate_inbound_reconcile_ran` is the run trace instead.
+
+INPUT SHAPE (inbound_messages)
+  [{"message_id": str, "ts": iso-str, "sender_person_id": str,
+    "subject": str|None, "body": str|None,
+    "thread_id": str|None,                  # REPLYCLOSE R1 — the thread anchor
+    "has_attachment": bool,                 # REPLYCLOSE — the fulfillment shape
+    "attachment_names": [str]}, ...]        # cr1#764 — no name, only a proposal
+`thread_id` and `has_attachment` are optional and absent → the behavior that
+field enables simply does not fire (never a guess). A message with no resolvable
+`sender_person_id` is skipped and COUNTED — an unresolvable sender is the single
+most common reason this rail goes quiet, and a quiet rail must never look like a
+clean one.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import re
+import sys
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from cru_match import (  # noqa: E402
+    _commitment_id,
+    build_commitment_updated_event,
+    cru_eligible,
+    load_open_commitments,
+    match_inbound_to_commitments,
+    AMBIGUOUS_REPLY_BASIS as _AMBIGUOUS_REPLY_BASIS,
+    REPLY_BASIS as _REPLY_BASIS,
+    REPLY_PROPOSED_BASIS as _REPLY_PROPOSED_BASIS,
+)
+from connector_adapters.provenance import (  # noqa: E402
+    canonical_dedup_key,
+    is_same_artifact,
+    primary_artifact_key,
+    resolve_mail_provider,
+)
+
+# TZDATE3 — canonical date localizer (tz.py, hoisted TZDATE2). Guarded: a
+# stripped install missing tz.py keeps the pre-TZDATE3 UTC-slice behavior
+# exactly (matches the render_*.py precedent).
+try:
+    from tz import localize_date as _localize_date  # noqa: E402
+except ImportError:
+    def _localize_date(ts: str | None, workspace_path: str | None = None) -> str:
+        return ts[:10] if isinstance(ts, str) and ts else ""
+
+# Bug #102 — ONE exception type across both reconcile rails, so a caller that
+# already catches the sent rail's abort catches this one too. Importing it
+# rather than declaring a sibling is deliberate: two names for one failure is
+# how a caller ends up handling half of it.
+from reconcile_sent_commitments import PrimaryUserUnresolvedError  # noqa: E402
+
+# The undo batch class every closure written here is stamped with. Matches the
+# `commitment_close` reverser registered in `brain_undo.REVERSERS` — the D2
+# legality check `brain_proposals.propose(tier="auto")` runs.
+CHANGE_CLASS = "commitment_close"
+
+# TTL for the confirm proposals this rail queues, mirroring the sent rail's so
+# an un-adjudicated proposal expires instead of accumulating.
+# POLICY1-A D8/D15 — ONE TTL, the policy constant (was a private 14).
+from commitment_policy import PROPOSAL_TTL_DAYS as REVIEW_PROPOSAL_TTL_DAYS  # noqa: E402
+
+
+#: cr1#664 (the cr1#609 ruling of 2026-11-03): how a matched close from
+#: inbound mail lands. `close` is the ruled default for the inbound-mail
+#: Maintenance job: the close stands only when the message CARRIES THE
+#: DELIVERABLE (`carries_deliverable`), and a reply that only acknowledges
+#: lands as a proposal. `propose` sends every matched close to the confirm
+#: list. None (every caller before cr1#664) is the rail exactly as it was.
+CLOSE_MODE_CLOSE = "close"
+CLOSE_MODE_PROPOSE = "propose"
+CLOSE_MODES = (CLOSE_MODE_CLOSE, CLOSE_MODE_PROPOSE)
+#: cr1#1121 (#903 case 11): what an on-demand caller passes to say "the mail
+#: connector's own close dial". The writer reads the dial; when it is set to
+#: `close` or `propose` that decides, and when it is left unset the run
+#: proposes (owner ruling 2026-11-12). Distinct from None, which keeps every
+#: graded close exactly as before cr1#664.
+CLOSE_MODE_DIAL = "dial"
+
+
+def resolve_dial_mode(workspace_root, *, unset=CLOSE_MODE_PROPOSE):
+    """The mail connector's `close_mode` dial as the owner set it, or `unset`
+    (`propose` by default) when it is not set or cannot be read (cr1#1121):
+    an unset mode never closes on a reply alone."""
+    # The declared row as the owner left it: `connector_reads` fills an unset
+    # dial with the default, which is exactly what must not decide here. The
+    # raw rows, so a row with a dial and no server id still counts (cr1#1121
+    # review).
+    try:
+        from connector_config import declared_backends
+        rec = declared_backends(workspace_root).get("email")
+    except Exception:  # noqa: BLE001 - unreadable reads as unset
+        rec = None
+    dials = (rec or {}).get("dials") if isinstance(rec, dict) else None
+    raw = str(((dials or {}) if isinstance(dials, dict) else {}).get("close_mode") or "").strip().lower()
+    return raw if raw in CLOSE_MODES else unset
+
+#: The reason a close demoted by `close_mode` carries on the confirm list.
+CLOSE_MODE_ACK_REASON = "their reply did not carry the item itself"
+CLOSE_MODE_PROPOSE_REASON = "this mail is set to ask before closing"
+
+
+#: cr1#764 - the words a connector may send for "no attachment". A flag that
+#: arrives as the TEXT "false" used to read as True through `bool()`.
+_ATTACHMENT_FALSE_WORDS = frozenset({"", "0", "false", "no", "none", "null",
+                                     "off", "n"})
+
+def attachment_flag(message) -> bool:
+    """The connector's attachment flag, read for what it says (cr1#764): a
+    bool as itself, a count or a list by whether it is non-empty, and TEXT
+    by its words, so "false", "no" and "0" read as False. An absent key is
+    False: no evidence is not weak evidence. Pure."""
+    value = message.get("has_attachment") if isinstance(message, dict) else message
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        return value.strip().lower() not in _ATTACHMENT_FALSE_WORDS
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return bool(value)
+
+
+def attachment_names(message) -> list:
+    """The attachment file names a message carries, when the connector sent
+    them (`attachment_names`, or `attachments` as names or as dicts with a
+    `name` / `filename`). [] when it did not: the behaviour that field
+    enables simply does not fire. Pure."""
+    if not isinstance(message, dict):
+        return []
+    raw = message.get("attachment_names")
+    if raw in (None, ""):
+        raw = message.get("attachments")
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for item in raw if isinstance(raw, (list, tuple)) else []:
+        name = item
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("filename") or item.get("title")
+        name = str(name or "").strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _party_names_of(commitment, people_names=None) -> list:
+    """The names a commitment's parties go by: the names the row carries and,
+    through `people_names` ({person id: [names]}), the names on file for
+    every party id it names. A shared name never counts as a shared subject
+    (the cr1#468 rule)."""
+    data = commitment.get("data") if isinstance(commitment.get("data"), dict) else {}
+    names = []
+    try:
+        from commitment_parties import counterparty_names
+        names += list(counterparty_names(data) or [])
+    except Exception:  # noqa: BLE001
+        pass
+    for key in ("owner_external", "owner_name", "counterparty_name"):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            names.append(v.strip())
+    if people_names:
+        ids = [data.get("owner_id"), data.get("counterparty_id")]
+        ids += list(data.get("counterparty_ids") or [])
+        ids += list(commitment.get("person_ids") or [])
+        ids += list(data.get("person_ids") or [])
+        for pid in ids:
+            if pid:
+                names += [str(n) for n in people_names.get(str(pid)) or [] if n]
+    return names
+
+
+def _delivery_grade(message, commitment, people_names=None) -> int:
+    """cr1#764 - the grade `delivery_evidence.delivery_strength` gives this
+    message for this item: 0 unless the message is a plain hand-over of it.
+    Also 0 when a file cannot do what the title asks (`asks_for_delivery`:
+    "introduce me to their finance lead", "pay the invoice"). Pure, never
+    raises."""
+    if not isinstance(message, dict) or not isinstance(commitment, dict):
+        return 0
+    try:
+        from cru_match import _commitment_field
+        from delivery_evidence import asks_for_delivery, delivery_strength
+        title = str(_commitment_field(commitment, "title") or "")
+        parties = _party_names_of(commitment, people_names)
+        if not asks_for_delivery(title, parties):
+            return 0
+        return delivery_strength(str(message.get("body") or ""),
+                                 attachment_names(message), title, parties)
+    except Exception:  # noqa: BLE001 - what cannot be read is not evidence
+        return 0
+
+
+def attachment_is_the_item(message, commitment, *, people_names=None,
+                           thread_items=()) -> bool:
+    """cr1#764 - is there evidence the attachment on `message` IS the thing
+    `commitment` is waiting for? True when the message's own words or its
+    file's name link it to this item (`delivery_evidence`: the subject line
+    is left out because a reply on the item's own thread always echoes it)
+    and links it better than to any other open item in `thread_items`, the
+    open items on the same thread. Two items that fit equally stay proposals:
+    the message cannot say which it delivers. Pure, never raises."""
+    grade = _delivery_grade(message, commitment, people_names)
+    if not grade:
+        return False
+    return all(_delivery_grade(message, other, people_names) < grade
+               for other in thread_items or () if other is not commitment)
+
+
+def _open_items_on_thread(message, opens, provider) -> list:
+    """The open items whose own thread is the one `message` sits on."""
+    tid = str((message or {}).get("thread_id") or "").strip()
+    if not tid:
+        return []
+    from cru_match import commitment_matches_thread_ref
+    key = primary_artifact_key(provider, tid)
+    return [c for c in opens or ()
+            if isinstance(c, dict) and commitment_matches_thread_ref(c, key)]
+
+
+#: The rows that end an item (`cru_match`'s own closer set).
+_ENDING_TYPES = ("commitment_resolved", "thread_resolved", "commitment_superseded")
+
+
+def closed_items(workspace_root, opens=()) -> list:
+    """cr1#1119 - the items the book has ended and that are not open now,
+    each as its last `commitment` row with its latest wording
+    (`commitment_updated`'s `new_title`) and `_ended_at`, the time of the row
+    that ended it. Read once per run, so the sibling check sees an item that
+    ended on the thread. Pure read; an unreadable book raises to the caller."""
+    from closure_index import closer_target_id
+    from events_io import load_events_owner_scoped
+    events, _skipped = load_events_owner_scoped(str(workspace_root))
+    open_ids = {str(_commitment_id(c)) for c in opens or ()}
+    ended: dict = {}
+    titles: dict = {}
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        et = e.get("type") or ""
+        d = e.get("data") if isinstance(e.get("data"), dict) else {}
+        if et in _ENDING_TYPES:
+            cid = str(closer_target_id(e) or "")
+            if cid:
+                ended[cid] = str(e.get("ts") or "")
+        elif et == "commitment_updated" and d.get("new_title"):
+            cid = str(d.get("target_id") or d.get("commitment_id") or "")
+            if cid:
+                titles[cid] = str(d["new_title"])
+    latest: dict = {}
+    for e in events:
+        if not isinstance(e, dict) or e.get("type") != "commitment":
+            continue
+        cid = str(_commitment_id(e))
+        if cid in ended and cid not in open_ids:
+            row = dict(e)
+            data = dict(row.get("data") or {})
+            if cid in titles:
+                data["title"] = titles[cid]
+            row["data"] = data
+            row["_ended_at"] = ended[cid]
+            latest[cid] = row
+    return list(latest.values())
+
+
+def _rivals_while_open(closed, commitment) -> list:
+    """The ended items that were still open when `commitment` was: ended at
+    or after it was captured. An item that ended before this one existed (last
+    month's report on a monthly thread) never competed with it."""
+    from cru_match import _parse_ts
+    born = _parse_ts(str((commitment or {}).get("ts") or ""))
+    out = []
+    for c in closed or ():
+        at = _parse_ts(str(c.get("_ended_at") or ""))
+        if born is None or at is None or at >= born:
+            out.append(c)
+    return out
+
+
+def carries_deliverable(row, message, commitment, *, provider=None,
+                        people_names=None, opens=(), used_messages=(),
+                        closed=()) -> bool:
+    """True when the inbound `message` behind a graded close IS the delivery,
+    by the sent matcher's own three evidence rules (cr1#664) plus the
+    content rule of cr1#764:
+
+      * ATTACHMENT - the connector says the message carries one
+        (`has_attachment`, read by `attachment_flag`: the text "false" is
+        False);
+      * THREAD ID - the message sits in the item's own conversation: the
+        matcher's thread-anchored basis (`REPLY_BASIS`), or the commitment's
+        own thread or source refs naming the message's thread
+        (`commitment_matches_thread_ref`, the SENTMATCH signal B compare);
+      * SEND TIME - the message has a readable time, so EVORDER's layer 3
+        (a reply cannot be evidence for a promise captured after it) has
+        already run on it in the matcher;
+      * THE ATTACHMENT IS THE ITEM (cr1#764, `attachment_is_the_item`): an
+        attachment on the item's thread used to be read as the delivery
+        whatever it was, so an unrelated file, an old version sent with
+        "this is not it", a calendar invite or a signature image closed the
+        item. Now the message must be a plain hand-over of this item
+        (`delivery_evidence`), and name it more than any other open item on
+        the thread (`opens`); otherwise the close is a proposal.
+
+    All four are required, and a message some proposal already rests on
+    (`used_messages`, `evidence_answered.messages_used_for_proposals`) stays
+    a proposal: the sibling check sees only open items, so confirming one of
+    two items must not let the next fire close the other on that message.
+    No new threshold and no new matcher: each rule is a field the rails
+    already compute or read. Pure, never raises."""
+    if not isinstance(message, dict) or not attachment_flag(message):
+        return False
+    ts = message.get("ts")
+    try:
+        from cru_match import _parse_ts
+        if not ts or _parse_ts(ts) is None:
+            return False
+    except Exception:  # noqa: BLE001 - an unreadable time is not evidence
+        return False
+    if not isinstance(commitment, dict):
+        return False
+    on_thread = (row or {}).get("close_basis") == _REPLY_BASIS
+    if not on_thread:
+        tid = str(message.get("thread_id") or "").strip()
+        if not tid:
+            return False
+        try:
+            from cru_match import commitment_matches_thread_ref
+            on_thread = bool(commitment_matches_thread_ref(
+                commitment, primary_artifact_key(provider, tid)))
+        except Exception:  # noqa: BLE001
+            return False
+    if not on_thread:
+        return False
+    if used_messages and _answered_key(primary_artifact_key(
+            provider, message.get("message_id"))) in used_messages:
+        return False
+    try:
+        # cr1#1119 (#903 case 8): an item already closed on the thread still
+        # competes. A message that tied two items while both were open does
+        # not become sure of the second once the first has closed.
+        if closed is None:  # the ended items could not be read: no close
+            return False
+        siblings = _open_items_on_thread(
+            message, list(opens or []) + _rivals_while_open(closed, commitment),
+            provider)
+    except Exception:  # noqa: BLE001 - the thread cannot be read: no close
+        return False
+    return attachment_is_the_item(message, commitment, people_names=people_names,
+                                  thread_items=siblings)
+
+
+#: cr1#764 - the lede a promoted close carries (the matcher's own R1 words).
+DELIVERY_PROMOTED_LEDE = "they replied on this thread with what you were waiting for"
+
+
+def _reply_may_close(row, message, commitment, *, user_person_id=None,
+                     workspace_root=None) -> bool:
+    """cr1#764 - would the matcher let a reply close this item outright? The
+    guards of its own reply path, so a promotion never overrides why a row
+    was held back: no document ask and no words saying done (its
+    `evidence_ok`), a reply that moves the date, a scheduling item
+    (a file does not answer "set up a call"), an item this sender does not
+    owe, an unconfirmed guess, an item with several counterparties (one
+    person's delivery is a receipt, MC1), a parent with open sub-items (SUB1:
+    propose, never auto-close). Never raises: unreadable is False."""
+    try:
+        from commitment_parties import has_multiple_counterparties
+        from cru_match import (_commitment_field, _is_pending_review,
+                               commitment_is_waiting_on,
+                               detect_deliverable_artifact, detect_scheduling_intent,
+                               parent_blocks_auto_resolve)
+        if not isinstance(commitment, dict) or not isinstance(message, dict):
+            return False
+        title = _commitment_field(commitment, "title") or ""
+        says_done = row.get("has_completion_signal") is True
+        if not says_done and not detect_deliverable_artifact(title):
+            return False
+        return not (
+            row.get("has_schedule_shift_signal")
+            or detect_scheduling_intent(title)
+            or not commitment_is_waiting_on(
+                commitment, user_person_id=user_person_id,
+                sender_person_id=message.get("sender_person_id"))
+            or _is_pending_review(commitment)
+            or has_multiple_counterparties(commitment, workspace_root=workspace_root)
+            or parent_blocks_auto_resolve(commitment))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def promote_deliveries(pending, inbound_messages, opens, *, close_mode,
+                       provider=None, people_names=None, user_person_id=None,
+                       workspace_root=None, used_messages=(), closed=()):
+    """`(promoted, still_pending)` (cr1#764): in `close` mode, a proposal the
+    matcher graded on the TITLE path (the reply echoes the item's words, no
+    completion language) becomes a close when the message carries the item
+    itself on the item's own thread (`carries_deliverable`). The matcher's
+    reply bases are confined to the band below the confirm bar by design, so
+    the genuine delivery whose words ALSO match the title was only ever
+    proposed while a bare attachment closed. A promoted row carries the
+    thread-reply basis, since that is the evidence it closes on. An ambiguous
+    reply (one message fitting several items) is never promoted, nor a row
+    the matcher's own reply path would hold back (`_reply_may_close`). Any
+    mode but `close` promotes nothing. Pure."""
+    rows = list(pending or [])
+    if close_mode != CLOSE_MODE_CLOSE:
+        return [], rows
+    by_mid = {str(m.get("message_id") or ""): m
+              for m in (inbound_messages or []) if isinstance(m, dict)}
+    by_cid = {str(_commitment_id(c)): c for c in (opens or [])}
+    promoted, still = [], []
+    for row in rows:
+        basis = row.get("close_basis") or ""
+        if basis in (_AMBIGUOUS_REPLY_BASIS, _REPLY_PROPOSED_BASIS):
+            still.append(row)
+            continue
+        message = by_mid.get(str(row.get("message_id") or ""))
+        commitment = by_cid.get(str(row.get("commitment_id") or ""))
+        if _reply_may_close(row, message, commitment, user_person_id=user_person_id,
+                            workspace_root=workspace_root) and carries_deliverable(
+                row, message, commitment, provider=provider,
+                people_names=people_names, opens=opens,
+                used_messages=used_messages, closed=closed):
+            out = dict(row)
+            out["recommendation"] = "auto_resolve"
+            out["close_basis"] = _REPLY_BASIS
+            out["close_mode_promoted"] = True
+            out["has_completion_signal"] = True
+            out["evidence"] = DELIVERY_PROMOTED_LEDE + (
+                f" \"{by_mid.get(str(row.get('message_id') or ''), {}).get('subject')}\""
+                if by_mid.get(str(row.get("message_id") or ""), {}).get("subject") else "")
+            promoted.append(out)
+        else:
+            still.append(row)
+    return promoted, still
+
+
+def apply_close_mode(auto_close, inbound_messages, opens, *, close_mode,
+                     provider=None, people_names=None, used_messages=(),
+                     closed=()):
+    """`(kept, demoted)`: the graded closes `close_mode` lets stand, and the
+    ones it sends to the confirm list instead, each demoted row carrying its
+    reason in `close_mode_reason`. `close_mode` None keeps everything (the
+    rail before cr1#664); an unknown value is read as `close`, the ruled
+    default, because a typo must never widen what closes. Pure."""
+    rows = list(auto_close or [])
+    if close_mode is None:
+        return rows, []
+    mode = close_mode if close_mode in CLOSE_MODES else CLOSE_MODE_CLOSE
+    by_mid = {str(m.get("message_id") or ""): m
+              for m in (inbound_messages or []) if isinstance(m, dict)}
+    by_cid = {str(_commitment_id(c)): c for c in (opens or [])}
+    kept, demoted = [], []
+    for row in rows:
+        if mode == CLOSE_MODE_CLOSE and carries_deliverable(
+                row, by_mid.get(str(row.get("message_id") or "")),
+                by_cid.get(str(row.get("commitment_id") or "")),
+                provider=provider, people_names=people_names, opens=opens,
+                used_messages=used_messages, closed=closed):
+            kept.append(row)
+            continue
+        out = dict(row)
+        out["recommendation"] = "pending_review"
+        out["close_mode_reason"] = (CLOSE_MODE_ACK_REASON
+                                    if mode == CLOSE_MODE_CLOSE
+                                    else CLOSE_MODE_PROPOSE_REASON)
+        demoted.append(out)
+    return kept, demoted
+
+
+def apply_close_mode_to_receipts(partial, inbound_messages, opens, *,
+                                 close_mode, provider=None, people_names=None,
+                                 used_messages=(), closed=()):
+    """`(kept, demoted)` for the MC1 per-person receipts (cr1#664 review).
+
+    A receipt is not a close, but enough of them close the item outright
+    through the roster-complete close, so an acknowledgement that wrote a
+    receipt would become a close from an acknowledgement two steps later.
+    Under a close mode each receipt therefore passes the same rule a close
+    does: in `close` it is kept only when its message carries the deliverable
+    on the item's own thread (`carries_deliverable`), in `propose` none is
+    kept. A partial row left with no receipt becomes ONE confirm row for its
+    item (the pending shape the confirm writer takes). None keeps everything,
+    byte for byte. Pure."""
+    rows = list(partial or [])
+    if close_mode is None:
+        return rows, []
+    mode = close_mode if close_mode in CLOSE_MODES else CLOSE_MODE_CLOSE
+    by_mid = {str(m.get("message_id") or ""): m
+              for m in (inbound_messages or []) if isinstance(m, dict)}
+    by_cid = {str(_commitment_id(c)): c for c in (opens or [])}
+    kept, demoted = [], []
+    for p in rows:
+        commitment = by_cid.get(str(p.get("commitment_id") or ""))
+        ok, held = [], []
+        for r in p.get("receipts") or []:
+            if mode == CLOSE_MODE_CLOSE and carries_deliverable(
+                    {}, by_mid.get(str(r.get("message_id") or "")), commitment,
+                    provider=provider, people_names=people_names, opens=opens,
+                    used_messages=used_messages, closed=closed):
+                ok.append(r)
+            else:
+                held.append(r)
+        if ok:
+            kept.append(dict(p, receipts=ok))
+        if held and not ok:
+            first = held[0]
+            demoted.append({
+                "commitment_id": p.get("commitment_id"),
+                "score": p.get("score"),
+                "title": p.get("title") or "",
+                "primary_thread_id": p.get("primary_thread_id") or "",
+                "message_id": first.get("message_id") or "",
+                "ts": first.get("ts") or "",
+                "evidence": first.get("evidence") or "matched their reply",
+                "close_basis": "",
+                "recommendation": "pending_review",
+                "close_mode_reason": (CLOSE_MODE_ACK_REASON
+                                      if mode == CLOSE_MODE_CLOSE
+                                      else CLOSE_MODE_PROPOSE_REASON),
+            })
+    return kept, demoted
+
+
+def _message_instant(value):
+    """cr1#748 - when a message arrived, for the one compare that can reopen
+    an item, so a real reply is not refused for its connector's time format:
+    ISO-8601, an RFC 2822 date, or an epoch in seconds or milliseconds. A
+    date with no time reads as the END of that day, since the message may
+    have come after a close that same day; the message that opened the item
+    is held off by the identity compare whatever its time reads. None when
+    no time can be read."""
+    from cru_match import _parse_ts
+    if isinstance(value, bool):
+        return None
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        text += "T23:59:59+00:00"
+    at = _parse_ts(text)
+    if at is not None:
+        return at
+    try:
+        if re.fullmatch(r"\d{9,13}(\.\d+)?", text):
+            secs = float(text)
+            return _dt.datetime.fromtimestamp(
+                secs / 1000 if secs >= 1e11 else secs, tz=_dt.timezone.utc)
+        at = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return at if at.tzinfo else at.replace(tzinfo=_dt.timezone.utc)
+
+
+def _answered_key(source_ref) -> str:
+    """cr1#763 - the identity form of a pointer, as `evidence_answered`
+    folds it; the raw ref when that module is off the tree."""
+    try:
+        from evidence_answered import evidence_key
+        return evidence_key(source_ref)
+    except Exception:  # noqa: BLE001
+        return str(source_ref or "").strip().lower()
+
+
+def _clock_now(workspace_root=None):
+    """CLOCK1 - the corroborated UTC instant this module stamps from.
+
+    Swaps the CLOCK SOURCE only: every window, cutoff, threshold and output
+    format around it is unchanged. A machine clock that has not synced used to
+    write its own wrong reading straight into the permanent record; this reads
+    the same clock, cross-checked against the newest timestamp the workspace
+    already holds. Falls back to the raw machine clock if the helper is
+    unavailable, so a stamp can never fail for want of corroboration.
+
+    `workspace_root` is threaded in wherever the calling function already
+    has one, because a helper that has to GUESS which workspace it is in
+    guesses wrong exactly when it matters: a fire's early phases run in
+    their own subprocesses, before anything has registered a root.
+    """
+    try:
+        from trusted_now import trusted_now_utc
+
+        return trusted_now_utc(workspace_root)
+    except Exception:
+        import datetime as _clock_dt
+
+        return _clock_dt.datetime.now(_clock_dt.timezone.utc)
+
+
+def _empty_signal_fields() -> dict:
+    """The REPLYCLOSE observability block, zeroed.
+
+    PRESENCE IS COUNTED SEPARATELY FROM TRUTH, and that distinction is the whole
+    point (the SENTMATCH F-4/F-5 discipline). A message carrying
+    `has_attachment: False` is the connector ANSWERING; a message whose dict
+    never carried the key at all is the connector never being ASKED. Only the
+    second means the rail is dead, and a counter that conflated them would
+    report the dead-rail state as an ordinary quiet day.
+
+    `n_from_user_skipped` and `n_sender_unresolved` are the two ways this rail
+    goes quiet without any defect in the matcher, and both are invisible from
+    the outcome alone.
+    """
+    return {
+        "n_fetched": 0,
+        "n_scored": 0,
+        "n_sender_unresolved": 0,
+        "n_from_user_skipped": 0,
+        "n_thread_field_present": 0,
+        "n_with_thread_ref": 0,
+        "n_attachment_field_present": 0,
+        "n_with_attachment": 0,
+        # cr1#764 - messages with a file the connector did not name. Such a
+        # file is only ever a proposal, so a seat where this tracks
+        # `n_with_attachment` never auto-closes a delivery.
+        "n_attachment_unnamed": 0,
+        # GRADED AND WRITTEN ARE TWO DIFFERENT MOMENTS — see the sent rail's
+        # `_empty_signal_fields` for the live instance (seq 9561/9617) that
+        # named this class. `n_graded_on_reply` is what the MATCHER proposed;
+        # `n_closed_on_reply` and `n_proposed_on_reply` are filled by
+        # `reconcile_inbound_and_receipt` from the lists that survived
+        # `close_commitments`, so neither can outrun the `n_closed` /
+        # `n_pending` beside them in the same audit event.
+        #
+        # NO REFUSAL IS REACHABLE ON THIS RAIL TODAY: every raise inside
+        # `close_commitments` is pre-empted by a matcher-side downgrade
+        # (`_is_pending_review` and `parent_blocks_auto_resolve` in Path 4,
+        # a source_ref this rail always builds through `primary_artifact_key`).
+        # This half is therefore structural, not a live-defect fix — it makes
+        # the number's SOURCE the written list, so the day an FS-11-shaped
+        # promotion lands here the receipt cannot quietly reopen the same lie.
+        "n_graded_on_reply": 0,
+        "n_closed_on_reply": 0,
+        "n_proposed_on_reply": 0,
+        "n_graded_close_refused": 0,
+        "close_refusals": {},
+        # MAILTRUST1 — matches whose evidence lives on a thread the caller
+        # could not corroborate (two differently-shaped reads disagreed).
+        # Held, not written: a wrong hold is recoverable, a wrong close is not.
+        "n_held_uncorroborated": 0,
+        # EVORDER — candidates refused because the reply predates the promise it
+        # would have closed. Non-zero is the fence working, not an error.
+        "n_stale_evidence_skipped": 0,
+        # cr1#763 - matches set aside because the owner already answered
+        # that message for that commitment (an undone close, a dismissed
+        # proposal). Non-zero is the memory working, not an error.
+        "n_answered_evidence_skipped": 0,
+    }
+
+
+def _empty_coverage() -> dict:
+    """How much of the open set this rail can even REACH (spec §1).
+
+    A reply is matched to an item by the item's OWNER, so an item with no
+    resolvable owner can never be closed here no matter what arrives. On the
+    reference substrate 40 of 254 owned items carry neither a counterparty id
+    nor a name; the equivalent unreachable class on this rail is the UNOWNED
+    bucket, and it is reported rather than quietly excluded. A receipt that
+    claimed full coverage of the open set would be lying by omission.
+    """
+    return {"n_open_eligible": 0, "n_waiting_on": 0, "n_unreachable_unowned": 0}
+
+
+def _coverage_for(opens, user_person_id) -> dict:
+    """Classify the eligible open set through THE canonical projector
+    (`surface_split`, CTS1 §2.4) — never a re-derived owner comparison."""
+    from surface_split import (SURFACE_UNOWNED, SURFACE_WAITING_ON,
+                               classify_surface)
+    out = _empty_coverage()
+    eligible = cru_eligible(opens or [])
+    out["n_open_eligible"] = len(eligible)
+    for ev in eligible:
+        surface = classify_surface(ev, user_person_id)
+        if surface == SURFACE_WAITING_ON:
+            out["n_waiting_on"] += 1
+        elif surface == SURFACE_UNOWNED:
+            out["n_unreachable_unowned"] += 1
+    return out
+
+
+def _short_date(ts, workspace_path=None):
+    """'2026-05-31T14:00:00' → '2026-05-31'. Defensive — return '' on junk.
+
+    TZDATE3 — localizes via `tz.localize_date` when a workspace path is
+    passed (the evidence line is chat-facing prose, so an evening-local
+    reply must not read as tomorrow's UTC date). `workspace_path=None`
+    (the default) keeps the pre-TZDATE3 raw-UTC-slice behavior for any
+    caller that hasn't been updated."""
+    if not isinstance(ts, str) or not ts:
+        return ""
+    if workspace_path:
+        return _localize_date(ts, workspace_path)
+    return ts[:10]
+
+
+def _record_blocked_run(workspace_root, events_path, *, reason, source_skill,
+                        fired_via, provider=None, batch_id=None) -> dict:
+    """TRAINFIX F-4 — the receipt for a fire whose INBOUND read could not run.
+
+    THE GATE THIS PAYS. MAILSEAM item 8 gave the SENT rail a loud receipt for a
+    read that never happened; the inbound rail shipped without one. `fetch_blocked`
+    appeared 3x in `reconcile_sent_commitments.py` and 0x here, so an inbound fire
+    with no mail connector, an exhausted connector budget, or an unclassified
+    account wrote the byte-identical CLEAN audit (`inbound_scanned_count: 0`,
+    `n_closed: 0`, `status: "complete"`) that a healthy fire writes when the
+    counterparty simply sent nothing. `validate_inbound_reconcile_ran` then
+    returned ok=True. That is the dead-rail shape the whole receipt contract
+    exists to make impossible, and it was live on one of the two mail rails.
+
+    Deliberately parallel to the sent rail's `_record_blocked_run`, minus the
+    cursor: this rail has none (the module docstring says why — both callers own
+    their own window), so the sentence that matters is "nothing was read, so
+    nothing closed and no confirm was queued" rather than "the cursor stayed
+    where it was". Same three properties otherwise: the audit IS still written
+    (a blocked fire that leaves no trace is indistinguishable from a fire that
+    never happened), it carries `status: "blocked"` + the plain-English reason,
+    and the validator refuses it.
+
+    A blocked run also writes NO `commitment_review_proposed` rows and NO
+    schedule-shift markers, because it never matched anything — the receipt's
+    zeros are honest zeros about a read that did not occur, which is exactly
+    what `status` is for.
+    """
+    from atomic_write import atomic_append_jsonl as _append
+    from cru_match import _now_iso as _audit_ts
+
+    batch_id = batch_id or ("inr_" + _clock_now(workspace_root)
+                            .strftime("%Y%m%dT%H%M%SZ"))
+    # No hand-stamped seq (BUG-8330 item 7) — appender allocates in-lock.
+    audit_event = {
+        "ts": _audit_ts(),
+        "type": "inbound_reconcile",
+        "source_skill": source_skill,
+        "data": {
+            "kind": "reconcile-inbound",
+            "status": "blocked",
+            "blocked_reason": reason,
+            "fired_via": fired_via,
+            "batch_id": batch_id,
+            "inbound_scanned_count": 0,
+            "n_closed": 0,
+            "n_pending": 0,
+            "n_updated": 0,
+            "n_partial_receipts": 0,
+            "mail_provider": provider,
+            "signal_fields": _empty_signal_fields(),
+            "coverage": _empty_coverage(),
+        },
+    }
+    try:
+        # SCHED1 — the shared stamp helper, so the machine token and its
+        # not-persisted flag land the same way here as on every other receipt.
+        from receipts import machine_fields
+
+        audit_event["data"].update(machine_fields())
+    except Exception:
+        pass
+    _append(events_path, [audit_event])
+
+    summary = (f"The inbound check did not run: {reason}. Nothing was read, so "
+               "nothing you were waiting on was closed and no confirm was "
+               "queued — the next run reads the whole window.")
+    print("reconcile-inbound BLOCKED: " + reason, file=sys.stderr)
+    return {
+        "ran": False,
+        "blocked": True,
+        "blocked_reason": reason,
+        "batch_id": batch_id,
+        "n_fetched": 0,
+        "n_open_before": 0,
+        "n_auto_closed": 0,
+        "n_pending": 0,
+        "n_updated": 0,
+        "events_written": 0,
+        "reviews_written": 0,
+        "resolved": [],
+        "pending": [],
+        "updated": [],
+        "n_partial_receipts": 0,
+        "partial": [],
+        "partial_propose_closure": [],
+        # A blocked run read nothing, so it saw no counter-evidence either.
+        "n_reopened_on_counter_evidence": 0,
+        "reopened_on_counter_evidence": [],
+        "counter_evidence_receipt_line": "",
+        "counter_evidence_batch_id": None,
+        "n_counterparty_activity": 0,
+        "n_unrested_on_counterparty_activity": 0,
+        "counterparty_activity_receipt_line": "",
+        "counterparty_activity_batch_id": None,
+        "signal_fields": _empty_signal_fields(),
+        "coverage": _empty_coverage(),
+        "mail_provider": provider,
+        "summary": summary,
+    }
+
+
+def reconcile_inbound(
+    open_commitments,
+    inbound_messages,
+    *,
+    user_person_id,
+    provider=None,
+    exclude_captured_since=None,
+    uncorroborated_thread_ids=None,
+    workspace_root=None,
+    answered_evidence=None,
+):
+    """Match a batch of INBOUND messages to open waiting-on commitments.
+
+    `answered_evidence` (cr1#763) - the `{(commitment_id, evidence key)}`
+    pairs the owner has already answered (`evidence_answered`). A graded row
+    on such a pair is set aside BEFORE the per-commitment best-evidence fold,
+    so a different message about the same commitment still wins its slot.
+    Counted in `signal_fields["n_answered_evidence_skipped"]`. None (every
+    caller before cr1#763) sets nothing aside.
+
+    Returns::
+
+        {
+          "auto_close": [ {commitment_id, score, title, owner_id,
+                           primary_thread_id, message_id, ts, evidence,
+                           close_basis, recommendation} ],
+          "pending":    [ same shape ],   # confirm before close
+          "updated":    [ same shape ],   # the counterparty moved their own date
+          "partial":    [ {commitment_id, title, primary_thread_id, score,
+                           receipts: [...]} ],   # MC1 per-person receipts
+          "held":       [ same shape + held_reason ],  # MAILTRUST1 — see below
+          "signal_fields": { ... },       # did the reply checks actually run?
+        }
+
+    MAILTRUST1 — `uncorroborated_thread_ids`: raw connector thread ids whose
+    reads the caller could NOT corroborate via `mail_absence.
+    corroborate_absence` (the per-thread fetch and a differently-shaped
+    recency sweep disagreed — the 2026-07-29 incident shape, where
+    `get_thread` FULL_CONTENT was itself one message short). Any single read
+    can only prove presence, never absence, so a match whose evidence lives
+    on such a thread lands in `held` instead of auto_close/pending/updated/
+    partial: it neither closes nor declines to close, and the caller
+    surfaces the disagreement. A commitment also matched on a corroborated
+    thread keeps its real bucket and drops out of `held` — good evidence is
+    not poisoned by a flaky sibling read.
+
+    Each commitment appears at most once across auto_close/pending — the
+    strongest evidence wins (a close beats a confirm; within a tier, the higher
+    score).
+
+    THE FENCE (spec §3, non-negotiable in this build). Layer 1 runs in two
+    complementary halves: a caller-side exclusion through `is_same_artifact`
+    (provider-label tolerant — it matches both the resolved backend's key and
+    the legacy `gmail:` anchor, and falls back to native ids when no provider
+    is known) and the matcher's own `commitment_matches_source_ref` on
+    `inbound_source_ref` (ref-shape tolerant — merged_source_refs, structured
+    provenance, the gmail-id field). Layer 2 is `exclude_captured_since`,
+    forwarded from the caller.
+
+    Layer 1 is load-bearing HERE in a way it is not on the sent rail:
+    inbox-triage stamps `data.source_ref: <provider>:<message_id>` on the
+    commitments it extracts from inbound mail, so without it the message that
+    CREATED a waiting-on item is the message that closes it on the next scan.
+
+    `provider` (MAILSEAM item 4) — the provider tag of the mail connector this
+    batch was read from. None is not "Gmail": this function is PURE, so an
+    unresolved provider is normal rather than exceptional, and the identity
+    helpers degrade honestly instead of building `gmail:<id>` keys that match
+    nothing on a Superhuman backend. `reconcile_inbound_and_receipt` resolves
+    it once from the declared backend before calling here.
+
+    THE DIRECTION CHECK (spec §2.3) runs twice, deliberately. Here, so a
+    message from the user is skipped and COUNTED rather than silently dropped;
+    and inside the matcher, as a hard stop, so a caller that reaches Path 4
+    without going through this function still cannot close a waiting-on item
+    with the user's own words.
+
+    `workspace_root` (F-28 post-review F-1) — forwarded to Path 4 so the roster
+    reader can resolve a free-text `counterparty_name` against the entity graph
+    and count one person written as BOTH an id and that person's name once.
+    Without it Path 4 carries a parameter nothing fills — the AUTOAPPLY F-5
+    dead-rail shape, and the exact defect the F-28 fix exists to close. This
+    function still does no I/O of its own; it hands the path down to the one
+    reader that reads the entity graph, and only when a caller supplies it.
+    `None` (the default) is byte-identically pre-F-28.
+
+    Pure: no I/O, no clock. The caller writes the events.
+    """
+    if not user_person_id:
+        # Bug #102 — the pure matcher keeps a safe degrade (empty result, no
+        # raise) so a diagnostic caller is not turned into a crash, but the
+        # SILENT part is what makes the dead rail invisible. The orchestrator
+        # below turns this same condition into a hard abort.
+        print(
+            "reconcile_inbound: no user_person_id — direction cannot be "
+            "established, so every reply basis is inert and this run can only "
+            "return zero. Resolve the user with "
+            "primary_user.resolve_primary_user (Bug #102).",
+            file=sys.stderr,
+        )
+        return {"auto_close": [], "pending": [], "updated": [], "partial": [],
+                "held": [], "signal_fields": _empty_signal_fields()}
+
+    best: dict[str, dict] = {}
+    updated_by_cid: dict[str, dict] = {}
+    partial_by_cid: dict[str, dict] = {}
+    held_by_cid: dict[str, dict] = {}
+    uncorroborated = {str(t) for t in (uncorroborated_thread_ids or []) if t}
+    signals = _empty_signal_fields()
+    # EVORDER — one dict for the whole run; the matcher increments per dropped
+    # candidate and the total folds into the receipt below.
+    _evorder_diag: dict = {}
+
+    for msg in inbound_messages or []:
+        if not isinstance(msg, dict):
+            continue
+        signals["n_fetched"] += 1
+        ts = msg.get("ts")
+        sender = str(msg.get("sender_person_id") or "").strip()
+        if not sender:
+            # An address the workspace has no person for. Real and common; the
+            # matcher cannot attribute the message to anyone, so nothing is
+            # scored. Counted, because "nobody resolved" and "nobody delivered"
+            # produce the identical zero.
+            signals["n_sender_unresolved"] += 1
+            continue
+        if sender == user_person_id:
+            # The user's own message in an inbound batch — a thread they replied
+            # to last, or a Sent row that leaked into an inbox fetch. Skipped
+            # here AND refused by the matcher; counted so a batch that is mostly
+            # the user's own mail is visible rather than mysterious.
+            signals["n_from_user_skipped"] += 1
+            continue
+
+        # MAILSEAM item 4, inbound flavor: identity is compared through
+        # `is_same_artifact`, never a single key built from a literal. The
+        # `provider or "gmail"` this line used to carry built `gmail:<id>`
+        # against commitments stored as `superhuman:<id>`, so the layer-1
+        # self-ref fence matched nothing at all — a guard that had stopped
+        # guarding without failing. It bites HARDER here than on the sent rail:
+        # inbox-triage stamps `data.source_ref: <provider>:<message_id>` on the
+        # commitments it extracts from inbound mail, so an unresolved provider
+        # means the message that CREATED a waiting-on item is the message that
+        # closes it on the next scan.
+        mid = str(msg.get("message_id") or "").strip()
+        own_key = primary_artifact_key(provider, mid)
+        # The CONVERSATION key, derived exactly like the message key above so
+        # one thread never reads as two.
+        tid = str(msg.get("thread_id") or "").strip()
+        own_thread_key = primary_artifact_key(provider, tid)
+        # Count the FETCH, not just the outcome. `in msg` is the presence test
+        # on purpose (see `_empty_signal_fields`).
+        if "thread_id" in msg:
+            signals["n_thread_field_present"] += 1
+        if own_thread_key:
+            signals["n_with_thread_ref"] += 1
+        if "has_attachment" in msg:
+            signals["n_attachment_field_present"] += 1
+        if msg.get("has_attachment"):
+            signals["n_with_attachment"] += 1
+        if attachment_flag(msg) and not attachment_names(msg):
+            signals["n_attachment_unnamed"] += 1
+        signals["n_scored"] += 1
+
+        # MAILSEAM item 4, inbound flavor — the caller-side half of layer 1,
+        # mirroring `reconcile_sent`'s. `is_same_artifact` matches BOTH the
+        # resolved provider's key and the legacy `gmail:` anchor when a
+        # provider is known (a workspace has rows from before and after its
+        # backend was declared), and compares native ids when it is not. The
+        # matcher's own `commitment_matches_source_ref` still runs on
+        # `own_key` below and reaches channels this cannot (merged_source_refs
+        # after a C4 merge, structured provenance, the gmail-id field), so the
+        # two are complementary rather than redundant: this one is provider-
+        # label-tolerant, that one is ref-shape-tolerant.
+        opens_for_msg = open_commitments
+        if mid:
+            opens_for_msg = [
+                c for c in open_commitments
+                if not is_same_artifact(canonical_dedup_key(event=c),
+                                        provider, mid)
+            ]
+        # cr1#763 - an item the owner already answered for THIS message is
+        # set aside before the matcher reads it, and counted. Done here, not
+        # on the matcher's results, because the matcher's own fence (cr1#740:
+        # evidence no newer than the owner's word) drops the pair first and
+        # would leave the count at zero.
+        if answered_evidence and own_key:
+            spent_key = _answered_key(own_key)
+            kept_opens = [c for c in opens_for_msg
+                          if (str(_commitment_id(c)), spent_key) not in answered_evidence]
+            signals["n_answered_evidence_skipped"] += len(opens_for_msg) - len(kept_opens)
+            opens_for_msg = kept_opens
+
+        results = match_inbound_to_commitments(
+            open_commitments=opens_for_msg,
+            sender_person_id=sender,
+            subject=msg.get("subject"),
+            body=msg.get("body"),
+            # REPLYCLOSE — direction. Without it both new bases stay dead and
+            # the matcher's own hard stop is inert.
+            user_person_id=user_person_id,
+            # Fence layer 1 — the ref of the message being scored.
+            inbound_source_ref=own_key,
+            # Fence layer 2 — commitments this same fire captured are not
+            # independent evidence for closing themselves.
+            exclude_captured_since=exclude_captured_since,
+            # R1 — the thread anchor. Inert when the fetch carried no thread id.
+            inbound_thread_ref=own_thread_key,
+            # The fulfillment shape. `attachment_flag` so a provider
+            # reporting an attachment COUNT or a list still reads correctly,
+            # the TEXT "false" reads as False (cr1#764), and an absent key
+            # stays False: no evidence is not weak evidence.
+            has_attachment=attachment_flag(msg),
+            # EVORDER layer 3 — when the reply actually arrived. A reply cannot
+            # be evidence for a promise captured after it. `ts` is already read
+            # above for the cursor-free window; absent → the guard is inert.
+            inbound_ts=ts,
+            diagnostics=_evorder_diag,
+            # F-28 — the entity graph is what tells the roster reader that one
+            # person written as an id AND that person's name is one
+            # counterparty, not two. Absent → the raw union, pre-F-28.
+            workspace_root=workspace_root,
+        )
+        for r in results:
+            rec = r.get("recommendation")
+            cid = r.get("commitment_id")
+            if not cid:
+                continue
+            # cr1#763 - the owner already answered THIS message for THIS
+            # commitment (undid the close it made, dismissed the proposal
+            # it raised): not applied again, counted, never silent.
+            if answered_evidence and own_key and rec in (
+                    "auto_resolve", "pending_review", "commitment_updated",
+                    "partial_received"):
+                if (str(cid), _answered_key(own_key)) in answered_evidence:
+                    signals["n_answered_evidence_skipped"] += 1
+                    continue
+            basis = r.get("close_basis") or ""
+            # MAILTRUST1: evidence from a thread whose reads disagree is
+            # diverted BEFORE any bucket — neither a close, nor a proposal,
+            # nor a receipt may be written from an uncorroborated read.
+            if tid and tid in uncorroborated:
+                if rec in ("auto_resolve", "pending_review",
+                           "commitment_updated", "partial_received"):
+                    signals["n_held_uncorroborated"] += 1
+                    prev = held_by_cid.get(cid)
+                    if prev is None or (r.get("score") or 0) > (prev["score"] or 0):
+                        held_by_cid[cid] = {
+                            "commitment_id": cid,
+                            "score": r.get("score"),
+                            "title": r.get("title") or "",
+                            "owner_id": r.get("owner_id") or sender,
+                            "primary_thread_id": r.get("primary_thread_id") or "",
+                            "message_id": msg.get("message_id") or "",
+                            "thread_id": tid,
+                            "ts": ts or "",
+                            "recommendation": rec,
+                            "close_basis": basis,
+                            "held_reason": "uncorroborated_read",
+                        }
+                continue
+            if basis == _REPLY_BASIS:
+                lede = "they replied on this thread with what you were waiting for"
+            elif basis == _AMBIGUOUS_REPLY_BASIS:
+                lede = ("their reply fits more than one thing you're waiting on")
+            elif basis == _REPLY_PROPOSED_BASIS:
+                lede = "their reply looks like the thing you were waiting for"
+            else:
+                lede = "matched their reply"
+            evidence = (
+                lede
+                + (f" \"{msg.get('subject')}\"" if msg.get("subject") else "")
+                + (f" ({_short_date(ts, workspace_root)})" if _short_date(ts, workspace_root) else "")
+            )
+            if rec == "partial_received":
+                slot = partial_by_cid.setdefault(cid, {
+                    "commitment_id": cid,
+                    "title": r.get("title") or "",
+                    "primary_thread_id": r.get("primary_thread_id") or "",
+                    "score": r.get("score"),
+                    "receipts": [],
+                })
+                if (r.get("score") or 0) > (slot["score"] or 0):
+                    slot["score"] = r.get("score")
+                seen = {x["counterparty_id"] for x in slot["receipts"]}
+                for cp_id in r.get("matched_counterparty_ids") or []:
+                    if cp_id and cp_id not in seen:
+                        slot["receipts"].append({
+                            "counterparty_id": cp_id,
+                            "message_id": msg.get("message_id") or "",
+                            "ts": ts or "",
+                            "evidence": evidence,
+                        })
+                        seen.add(cp_id)
+                continue
+            if rec == "commitment_updated":
+                # The counterparty moved their OWN date. Not a closure and not a
+                # proposal — the item stays open with a note. Unchanged
+                # behavior; it just lands in a named bucket instead of an
+                # inline append at the call site.
+                entry = {
+                    "commitment_id": cid,
+                    "score": r.get("score"),
+                    "title": r.get("title") or "",
+                    "owner_id": r.get("owner_id") or sender,
+                    "primary_thread_id": r.get("primary_thread_id") or "",
+                    "message_id": msg.get("message_id") or "",
+                    "ts": ts or "",
+                    "recommendation": rec,
+                    "close_basis": basis,
+                    "evidence": evidence,
+                }
+                # The best message moves the row; the others stay beside it
+                # under `others`, so a message already moved (cr1#740, a held
+                # window offers it again) gives way to the next one.
+                prev = updated_by_cid.get(cid)
+                if prev is None:
+                    updated_by_cid[cid] = entry
+                elif (r.get("score") or 0) > (prev["score"] or 0):
+                    entry["others"] = [prev] + prev.pop("others", [])
+                    updated_by_cid[cid] = entry
+                else:
+                    prev.setdefault("others", []).append(entry)
+                continue
+            if rec not in ("auto_resolve", "pending_review"):
+                continue  # no_action
+            proposal = {
+                "commitment_id": cid,
+                "score": r.get("score"),
+                "title": r.get("title") or "",
+                # The sender IS the owner on this path (Path 4's candidacy
+                # gate), so the closure is attributed to whoever delivered.
+                "owner_id": r.get("owner_id") or sender,
+                "primary_thread_id": r.get("primary_thread_id") or "",
+                "message_id": msg.get("message_id") or "",
+                "ts": ts or "",
+                "recommendation": rec,
+                "close_basis": basis,
+                "evidence": evidence,
+                # WATCHGATE N-2 — the matcher's OWN fulfillment finding, carried
+                # instead of dropped. `match_inbound_to_commitments` has always
+                # returned it; nothing read it here, so the proposal this rail
+                # persisted could never say whether completion language was
+                # found, and the bulk-accept fence had nothing to weigh.
+                "has_completion_signal": r.get("has_completion_signal"),
+                "has_schedule_shift_signal": r.get("has_schedule_shift_signal"),
+            }
+            prev = best.get(cid)
+            if prev is None:
+                best[cid] = proposal
+            else:
+                prev_auto = prev["recommendation"] == "auto_resolve"
+                new_auto = rec == "auto_resolve"
+                if (new_auto and not prev_auto) or (
+                    new_auto == prev_auto
+                    and (proposal["score"] or 0) > (prev["score"] or 0)
+                ):
+                    best[cid] = proposal
+
+    auto_close = [p for p in best.values()
+                  if p["recommendation"] == "auto_resolve"]
+    partial = [p for p in partial_by_cid.values() if p["receipts"]]
+    partial_cids = {p["commitment_id"] for p in partial}
+    pending = [p for p in best.values()
+               if p["recommendation"] == "pending_review"
+               and p["commitment_id"] not in partial_cids]
+    updated = [u for u in updated_by_cid.values()
+               if u["commitment_id"] not in {p["commitment_id"]
+                                             for p in auto_close}]
+
+    # MAILTRUST1: a commitment that ALSO matched on a corroborated thread
+    # keeps its real bucket — held only lists items whose ONLY evidence came
+    # from a disagreed-upon read.
+    written_cids = ({p["commitment_id"] for p in auto_close}
+                    | {p["commitment_id"] for p in pending}
+                    | {p["commitment_id"] for p in updated}
+                    | partial_cids)
+    held = [h for h in held_by_cid.values()
+            if h["commitment_id"] not in written_cids]
+
+    auto_close.sort(key=lambda p: p["score"] or 0, reverse=True)
+    pending.sort(key=lambda p: p["score"] or 0, reverse=True)
+    updated.sort(key=lambda p: p["score"] or 0, reverse=True)
+    partial.sort(key=lambda p: p["score"] or 0, reverse=True)
+    held.sort(key=lambda p: p["score"] or 0, reverse=True)
+
+    # Close the loop from field to outcome. Read from this function's FINAL
+    # lists — after the ambiguity downgrade and the MC1 split — so this is the
+    # matcher's settled GRADE. It is still a grade: nothing here has been
+    # written, and `reconcile_inbound_and_receipt` can still lose a row to
+    # `close_commitments`. The caller fills `n_closed_on_reply` /
+    # `n_proposed_on_reply` from what survived; see `_empty_signal_fields`.
+    for p in auto_close:
+        if p.get("close_basis") == _REPLY_BASIS:
+            signals["n_graded_on_reply"] += 1
+
+    # EVORDER — fold layer 3's drop count into the receipt, same as the sent rail.
+    signals["n_stale_evidence_skipped"] = int(
+        _evorder_diag.get("stale_evidence_dropped", 0))
+
+    return {"auto_close": auto_close, "pending": pending, "updated": updated,
+            "partial": partial, "held": held, "signal_fields": signals}
+
+
+def reconcile_inbound_and_receipt(
+    workspace_root,
+    inbound_messages,
+    *,
+    user_person_id,
+    source_skill="inbox",
+    fired_via="scheduled",
+    provider=None,
+    exclude_captured_since=None,
+    batch_id=None,
+    uncorroborated_thread_ids=None,
+    fetch_blocked=None,
+    thread_participants=None,
+    close_mode=None,
+):
+    """Run inbound→commitment reconciliation end-to-end and return a receipt.
+
+    The caller's ONLY job before this: fetch the inbound batch and resolve each
+    sender's email → `person_id` (MCP calls a script cannot make). Everything
+    else — load opens, match, close through `commitment_state.close_commitments`,
+    persist the confirm proposals, record schedule-shift updates, emit the
+    `inbound_reconcile` audit event — happens here.
+
+    RAISES `PrimaryUserUnresolvedError` when `user_person_id` is falsy (Bug
+    #102, inherited from the sent rail and MORE important here: on this path the
+    user id is not only the owner gate, it is the DIRECTION check. Unresolved,
+    the direction check cannot run, every reply basis is inert, and a clean
+    audit would report that as a healthy quiet day). Nothing is read, nothing is
+    written, and no audit event exists for the run — so
+    `validate_inbound_reconcile_ran` reports the run as not-having-happened,
+    which is the truth.
+
+    Returns::
+
+        {"ran": True, "batch_id": str, "n_fetched": int, "n_open_before": int,
+         "n_auto_closed": int, "n_pending": int, "n_updated": int,
+         "events_written": int, "reviews_written": int,
+         "resolved": [...], "pending": [...], "updated": [...],
+         "n_partial_receipts": int, "partial": [...],
+         "n_held_uncorroborated": int, "held": [...],   # MAILTRUST1
+         "n_reopened_on_counter_evidence": int,         # SPEC_FLOW1 Lane B 4
+         "reopened_on_counter_evidence": [...],
+         "counter_evidence_receipt_line": str,
+         "counter_evidence_batch_id": str|None,
+         "n_counterparty_activity": int,                # review R-5
+         "n_unrested_on_counterparty_activity": int,
+         "counterparty_activity_receipt_line": str,
+         "signal_fields": {...}, "coverage": {...},
+         "mail_provider": str|None, "summary": str}
+
+    COUNTER-EVIDENCE (SPEC_FLOW1 Lane B item 4). Three rails close rows on an
+    argument — the customer's own word, a fact on file, six weeks of silence.
+    Their reply outranks all three, and this is the only rail that reads their
+    replies. A message from the counterparty that arrives on a closed row's
+    own conversation, or that names it from someone the row puts on the other
+    side, puts the row back with a receipt and the word `undo`. A reply on a
+    row that is still open does nothing (it is not in the closed set), and a
+    row the CUSTOMER closed is never touched (only the three rails' closes
+    are eligible).
+
+    MAILTRUST1 — pass `uncorroborated_thread_ids` (thread ids whose reads
+    disagreed per `mail_absence.corroborate_absence`) and every match on
+    those threads is HELD: no close, no confirm proposal, no receipt, no
+    date-shift marker — the receipt and summary name the disagreement
+    instead. A wrong hold is recoverable; a wrong close is not.
+
+    `batch_id` is the undo handle. Every closure is stamped
+    `data.brain_batch_id` + `data.brain_change_class`, which is the shape
+    `brain_undo.recent_auto_batches` lists and `brain_undo.undo_batch` reverses
+    — so a run this rail narrates is reversible by the same `undo` the sent rail
+    advertises, with no new reverser and no new batch kind.
+
+    `thread_participants` (SPEC_FLOW1 Lane F rule 1, the MAIL-THREAD half) —
+    the name+address pairs the caller already read off the threads it fetched,
+    in any shape `attendee_evidence.normalize_attendee_records` accepts. When
+    supplied, every participant at a COMPANY domain who is not on file gets a
+    record created before matching runs, receipted and undoable — never a
+    question. That closes this rail's single most common way of going quiet:
+    `n_sender_unresolved` counts a message whose sender has no record, and a
+    sender with no record was, until now, a proposal nobody answered.
+
+    The payoff lands in the SAME fire, not the next one: a message carrying
+    `sender_email` and no `sender_person_id` is re-pointed at the record this
+    pass just created, so the reply that proves a promise done is matched
+    today. `sender_email` is optional and absent means unchanged — the caller
+    still resolves what it can, and this only fills what it could not.
+
+    `None` (the default, and every shipped caller) is BYTE-IDENTICAL: nothing
+    is read, no writer is imported, no message is touched.
+
+    `fetch_blocked` (TRAINFIX F-4 — the inbound mirror of MAILSEAM item 8) — a
+    plain-English reason the INBOUND read could not happen (no mail connector,
+    connector budget exhausted, an unclassified account). Passing it records the
+    run as BLOCKED: the audit event carries `status: "blocked"` + the reason,
+    `validate_inbound_reconcile_ran` refuses it, and the summary says what was
+    missing. Without it, a fire that never read anything wrote the identical
+    clean `inbound_scanned_count: 0` audit as a fire that read everything and
+    found nothing — the dead-rail shape this receipt contract exists to make
+    impossible, and it was live on this rail while the sent rail was covered. A
+    blocked run closes nothing and queues no confirm.
+
+    `close_mode` (cr1#664, the cr1#609 ruling of 2026-11-03) - how a graded
+    close lands: `close` keeps it only when the message carries the
+    deliverable (`carries_deliverable`) and sends an acknowledgement to the
+    confirm list; `propose` sends every graded close there. The demotion
+    runs before the policy gate and the closure path, on the matcher's own
+    grades, and moves no threshold. None (the default, and every caller
+    before cr1#664) is byte-identical: nothing is demoted and the audit and
+    the return carry no new key. `dial` (cr1#1121, what the on-demand
+    Commitments run passes) reads the mail connector's own dial, and an unset
+    dial proposes (`resolve_dial_mode`); the audit then carries the mode it
+    resolved to.
+    """
+    if not user_person_id:
+        msg = (
+            "inbound reconciliation ABORTED: the primary user is unresolved "
+            "(resolve_primary_user returned None/empty). Direction is derived "
+            "from owner_id vs the primary user, so with no user the reply "
+            "bases are inert and this run would write a clean audit claiming "
+            "zero to close. No audit event written. Fix: pass the WORKSPACE "
+            "ROOT (not _hq) to resolve_primary_user, or set "
+            "workspace.user_id in entities.json (Bug #102)."
+        )
+        print(msg, file=sys.stderr)
+        raise PrimaryUserUnresolvedError(msg)
+
+    # MAILSEAM: resolve the provider ONCE, here, and use it for every ref this
+    # run compares. An explicit argument wins; otherwise the declared email
+    # backend answers. Unresolved stays unresolved — `is_same_artifact` then
+    # compares native ids rather than inventing a label, and the receipt says
+    # which provider (if any) this run was reading as.
+    provider = resolve_mail_provider(workspace_root, provider)
+
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+
+    # TRAINFIX F-4 — a read that never happened is not a read that found
+    # nothing. Record the run as blocked and stop: no matching (there is nothing
+    # to match), no closure, no queued confirm. Checked AFTER the Bug #102 abort
+    # and the provider resolve, in the same order as the sent rail — an
+    # unresolved primary user is a worse failure than a blocked read and must
+    # still raise, and the receipt should name the provider it would have read
+    # as even when the read never happened.
+    blocked = str(fetch_blocked or "").strip()
+    if blocked:
+        return _record_blocked_run(
+            workspace_root, events_path, reason=blocked,
+            source_skill=source_skill, fired_via=fired_via, provider=provider,
+            batch_id=batch_id,
+        )
+
+    # §7 precedent (efb_/idr_/pbs_/rcc_): ONE batch per RUN, timestamped. A
+    # per-SKILL constant would group every close this skill ever applied into
+    # one undoable batch, so a single `undo` would reach back across days.
+    batch_id = batch_id or ("inr_" + _clock_now(workspace_root)
+                            .strftime("%Y%m%dT%H%M%SZ"))
+
+    # SPEC_FLOW1 Lane F rule 1, the MAIL-THREAD half. It runs BEFORE the
+    # opens are loaded and before matching, because the record it creates is
+    # what `sender_person_id` needs to point at — created after the match, it
+    # would help only the next fire, and "next fire" is how a person sits
+    # unresolved for four passes.
+    inbound_messages = list(inbound_messages or [])
+    contacts_seeded = None
+    if thread_participants is not None:
+        try:
+            from attendee_evidence import (INVITE_ORIGIN_THREAD,
+                                           seed_people_from_participants)
+            from contact_capture import own_addresses as _own_addresses
+
+            # The own-address fence: an empty set means clause 4 of the bar
+            # ("never the user's own address") cannot be judged, and on a mail
+            # thread the user is the one participant guaranteed to be there.
+            # Empty stands the pass down rather than minting a duplicate
+            # record of the CEO.
+            _mine = _own_addresses(workspace_root)
+            if _mine:
+                # §7 AGAIN, and it is the same rule twelve lines up: ONE batch
+                # per RUN. Handing the identity pass no batch and no clock
+                # reading let it mint `new_batch_id("")` — a CONSTANT — so
+                # every person this rail ever filed shared one undo handle and
+                # a single `undo` reached back across days. The run's own
+                # `inr_` batch is minted immediately above; the identity leg
+                # rides it, so the create, the drained rows and the closes all
+                # come back together and nothing older does.
+                contacts_seeded = seed_people_from_participants(
+                    workspace_root, thread_participants,
+                    source_ref=f"inbound:{batch_id}",
+                    origin=INVITE_ORIGIN_THREAD,
+                    source_skill=source_skill,
+                    own_addresses=_mine,
+                    batch_id=batch_id,
+                    now_iso=_clock_now(workspace_root)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+        except Exception as exc:  # never sink the reconciliation
+            print(f"inbound reconcile: identity pass skipped: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            contacts_seeded = None
+    if contacts_seeded and (contacts_seeded["created"] or contacts_seeded["split"]):
+        by_addr = {str(e.get("email") or "").lower(): e.get("person_id")
+                   for e in (list(contacts_seeded["created"])
+                             + list(contacts_seeded["split"]))
+                   if e.get("email") and e.get("person_id")}
+        repointed = []
+        for msg in inbound_messages:
+            if not isinstance(msg, dict):
+                repointed.append(msg)
+                continue
+            if str(msg.get("sender_person_id") or "").strip():
+                repointed.append(msg)
+                continue
+            pid = by_addr.get(str(msg.get("sender_email") or "").strip().lower())
+            if not pid:
+                repointed.append(msg)
+                continue
+            # A shallow COPY — the caller's dicts are never mutated.
+            fixed = dict(msg)
+            fixed["sender_person_id"] = pid
+            repointed.append(fixed)
+        inbound_messages = repointed
+
+    # F-28 — same reasoning as the sent driver: one workspace per fire, so the
+    # projection's all-received stamp and the roster reader agree.
+    opens = load_open_commitments(str(events_path), workspace_root=workspace_root)
+    n_open_before = len(opens)
+    coverage = _coverage_for(opens, user_person_id)
+
+    # cr1#763 - evidence the owner has already answered is not applied
+    # again. The same message is re-read at every fire; once the owner has
+    # undone the close it made or dismissed the proposal it raised, that
+    # message is spent for that commitment. Read once per run off the
+    # ledger; the matcher sets the pair aside and counts it.
+    try:
+        from evidence_answered import answered_evidence
+        _answered = answered_evidence(workspace_root)
+    except Exception:  # noqa: BLE001 - the ledger of answers never takes the run down
+        _answered = set()
+
+    res = reconcile_inbound(opens, inbound_messages,
+                            user_person_id=user_person_id,
+                            provider=provider,
+                            exclude_captured_since=exclude_captured_since,
+                            # MAILTRUST1 — threads whose reads the caller
+                            # could not corroborate (mail_absence): matches
+                            # there are held, never written.
+                            uncorroborated_thread_ids=uncorroborated_thread_ids,
+                            # F-28 — this wrapper HOLDS the workspace and used
+                            # to keep it, leaving Path 4's roster fix
+                            # unreachable on the rail that fires daily.
+                            workspace_root=workspace_root,
+                            answered_evidence=_answered)
+    auto_close = res["auto_close"]
+    pending = list(res["pending"])
+    updated = res["updated"]
+    partial = res["partial"]
+    held = res["held"]
+    signal_fields = res["signal_fields"]
+
+    # cr1#664 - the close mode, on the matcher's own grades and before the
+    # policy gate: a demoted row joins the confirm list like any other.
+    n_close_mode_proposed = 0
+    n_close_mode_promoted = 0
+    if close_mode == CLOSE_MODE_DIAL:
+        close_mode = resolve_dial_mode(workspace_root)
+    if close_mode is not None:
+        # cr1#764 - the parties' names on file, set aside when the content
+        # rule asks whether a reply's words are about the item.
+        try:
+            from people_names import people_names as _read_people
+            _people = _read_people(workspace_root)
+        except Exception:  # noqa: BLE001
+            _people = {}
+        # cr1#764 - a message a proposal already rests on stays a proposal.
+        try:
+            from evidence_answered import messages_used_for_proposals
+            _used = messages_used_for_proposals(workspace_root)
+        except Exception:  # noqa: BLE001
+            _used = set()
+        # cr1#1119 (#903 case 8) - the items already closed, so a sibling
+        # does not close on a message that tied it with one of them.
+        try:
+            _closed = closed_items(workspace_root, opens)
+        except Exception:  # noqa: BLE001 - unreadable: nothing closes on a sibling check
+            _closed = None
+        # cr1#764 - the genuine delivery whose words also match the title
+        # was graded a proposal by the title path; in close mode it closes
+        # when the message carries the item on the item's own thread.
+        _promoted, pending = promote_deliveries(
+            pending, inbound_messages, opens, close_mode=close_mode,
+            provider=provider, people_names=_people,
+            user_person_id=user_person_id, workspace_root=workspace_root,
+            used_messages=_used, closed=_closed)
+        n_close_mode_promoted = len(_promoted)
+        auto_close = list(auto_close) + _promoted
+        auto_close, _mode_demoted = apply_close_mode(
+            auto_close, inbound_messages, opens, close_mode=close_mode,
+            provider=provider, people_names=_people, used_messages=_used,
+            closed=_closed)
+        pending.extend(_mode_demoted)
+        partial, _receipts_demoted = apply_close_mode_to_receipts(
+            partial, inbound_messages, opens, close_mode=close_mode,
+            provider=provider, people_names=_people, used_messages=_used,
+            closed=_closed)
+        pending.extend(_receipts_demoted)
+        n_close_mode_proposed = len(_mode_demoted) + len(_receipts_demoted)
+
+    events_written = 0
+    # POLICY1-A D8 — the close leg passes through `decide` (see the sent
+    # rail): a thread-anchored reply (REPLYCLOSE R1) and completion at the
+    # bar close; a title echo without completion and a pending target are
+    # demoted to the propose list with the policy's reason.
+    if auto_close:
+        from commitment_policy_pass import policy_gate_closes
+        from cru_match import _is_pending_review as _pending_flag
+        _pending_ids = {str(_commitment_id(c)) for c in opens if _pending_flag(c)}
+        auto_close, _demoted = policy_gate_closes(
+            auto_close, rail="inbound", pending_ids=_pending_ids,
+            workspace_root=workspace_root)
+        for _row in _demoted:
+            pending.append(_row)
+            signal_fields["n_graded_close_refused"] += 1
+            refusals = signal_fields["close_refusals"]
+            _why = _row.get("policy_refusal") or "PolicyGate"
+            refusals[_why] = refusals.get(_why, 0) + 1
+    if auto_close:
+        from commitment_state import close_commitments
+        results = close_commitments(
+            workspace_root,
+            [{
+                "commitment_id": c["commitment_id"],
+                # Person-shaped, NOT a skill string: on this rail the closure
+                # really was performed by the counterparty, and `resolved_by`
+                # is the only place that fact is recorded. (The sent rail's
+                # `resolved_by="sent_reconcile"` is the odd one out — it is
+                # load-bearing there only because its undo batch is keyed off
+                # that literal; this rail is keyed off `brain_batch_id`, so it
+                # is free to be honest.)
+                "resolved_by": c.get("owner_id") or "",
+                "evidence": c.get("evidence") or "matched their reply",
+                "primary_thread_id": c.get("primary_thread_id") or "",
+                # PROV1 — the INBOUND message that delivered. Same key shape
+                # the matcher compared on (`primary_artifact_key`), so the
+                # close points at the reply a reader can open, not at the
+                # sweep that noticed it.
+                "source_ref": primary_artifact_key(provider,
+                                                   c.get("message_id")),
+                "extra_data": {"brain_batch_id": batch_id,
+                               "brain_change_class": CHANGE_CLASS},
+            } for c in auto_close],
+            source_skill=source_skill,
+        )
+        by_id = {str(c["commitment_id"]): c for c in auto_close}
+        closed_or_already: set = set()
+        for r in results:
+            rid = str(r.get("commitment_id"))
+            if r["status"] == "closed":
+                events_written += 1
+                closed_or_already.add(rid)
+            elif r["status"] == "already_resolved":
+                closed_or_already.add(rid)
+            elif r.get("error") == "PendingReviewError" and rid in by_id:
+                # A pending_review commitment is never auto-resolved — demote it
+                # to the confirm list instead of closing it.
+                pending.append(by_id[rid])
+            if r.get("status") == "error":
+                # Name the refusal, keyed by the exception class — the sent
+                # rail's twin. Unreachable on this rail today; recorded so a
+                # future one is visible the first time it happens rather than
+                # inferred from a discrepancy weeks later.
+                reason = str(r.get("error") or "UnknownError")
+                refusals = signal_fields.setdefault("close_refusals", {})
+                refusals[reason] = refusals.get(reason, 0) + 1
+                signal_fields["n_graded_close_refused"] += 1
+        auto_close = [c for c in auto_close
+                      if str(c["commitment_id"]) in closed_or_already]
+
+    # THE POST-WRITE COUNTS. `auto_close` is what survived the closure path and
+    # `pending` now carries anything demoted into it, so both counters describe
+    # what this run actually did rather than what its matcher proposed.
+    for c in auto_close:
+        if c.get("close_basis") == _REPLY_BASIS:
+            signal_fields["n_closed_on_reply"] += 1
+    for p in pending:
+        # A demoted R1 row keeps `_REPLY_BASIS` and really did become a queued
+        # proposal, so it counts as one here — the three reply bases together
+        # are exactly "this run asked the user about a reply".
+        if p.get("close_basis") in (_REPLY_BASIS, _REPLY_PROPOSED_BASIS,
+                                    _AMBIGUOUS_REPLY_BASIS):
+            signal_fields["n_proposed_on_reply"] += 1
+
+    # COUNTER-EVIDENCE (SPEC_FLOW1 Lane B item 4; wired in EXIT1 FIX ROUND 1,
+    # F-1). The three exit rails close rows on an argument — your own word, a
+    # fact on file, or six weeks of silence. Their reply is the one thing that
+    # outranks all three, and this rail is the ONLY place their replies are
+    # read. Loaded ONCE per run, before the receipts loop, so a run with no
+    # recent exit close pays nothing.
+    #
+    # Never raises into the rail: the reopen is a safety net, and a safety net
+    # that can take the mail run down is worse than no net.
+    _exit_closed: list = []
+    try:
+        from exit_doors import exit_closed_rows
+        _exit_closed = exit_closed_rows(workspace_root)
+    except Exception:  # noqa: BLE001
+        _exit_closed = []
+
+    # FIX ROUND 2 (review R-7) — the automated-mail gate both legs below use.
+    try:
+        from exit_doors import is_automated_message as _is_automated
+    except Exception:  # noqa: BLE001 — never take the mail run down
+        def _is_automated(_msg):
+            return False
+
+    # MC1 per-person receipts, same contract as the sent rail: informational,
+    # never a closure, idempotent per (commitment, counterparty).
+    n_partial_receipts = 0
+    partial_recorded: list = []
+    partial_propose_closure: list = []
+    if partial:
+        from commitment_parties import received_from_ids as _rcv_ids
+        from commitment_state import mark_partial_received
+        already_by_cid = {str(_commitment_id(c)): set(_rcv_ids(c))
+                          for c in opens}
+        for p in partial:
+            already = already_by_cid.get(str(p["commitment_id"]), set())
+            recorded_cps: list = []
+            proposed = False
+            for r in p["receipts"]:
+                cp_id = r["counterparty_id"]
+                if cp_id in already:
+                    continue
+                try:
+                    result = mark_partial_received(
+                        workspace_root,
+                        p["commitment_id"],
+                        # The counterparty delivered, so the receipt is theirs.
+                        received_by=cp_id,
+                        counterparty_id=cp_id,
+                        evidence=r.get("evidence") or "delivered in their reply",
+                        source_skill=source_skill,
+                        # PROV1 — the inbound message this counterparty
+                        # delivered in.
+                        source_ref=primary_artifact_key(provider,
+                                                        r.get("message_id")),
+                    )
+                except Exception:
+                    continue
+                if result.get("status") == "received":
+                    n_partial_receipts += 1
+                    recorded_cps.append(cp_id)
+                    already.add(cp_id)
+                    if result.get("propose_closure"):
+                        proposed = True
+            if recorded_cps:
+                partial_recorded.append({
+                    "commitment_id": p["commitment_id"],
+                    "title": p.get("title") or "",
+                    "counterparty_ids": recorded_cps,
+                })
+            if proposed:
+                partial_propose_closure.append({
+                    "commitment_id": p["commitment_id"],
+                    "title": p.get("title") or "",
+                })
+
+    # COUNTER-EVIDENCE, part two: which of this batch's messages is THEM
+    # coming back about a row one of the exit rails closed.
+    #
+    # ONE matcher, not a second one: `cru_match.score_match` is the same
+    # scorer `match_inbound_to_commitments` grades every open row with, and
+    # the bar is the rail's own `pending_review` threshold (the CONFIRM bar,
+    # not the close bar — putting a row back is the reversible direction, and
+    # the customer sees a receipt and the word `undo` either way).
+    #
+    # A message reopens a closed row when it arrives on THAT ROW'S OWN
+    # conversation, or when it comes from someone the row names on the other
+    # side AND reads as being about it. A row the customer closed themselves
+    # is not here (only the three rails' closes are), and a row that is still
+    # open is not here either — so a reply on an open row does nothing.
+    reopen_out = {"n_reopened": 0, "reopened": [], "errors": [],
+                  "receipt_line": "", "batch_id": None}
+    # cr1#748 - a message can only put an item back if it ARRIVED AFTER the
+    # close, and the message that created an item is never its
+    # counter-evidence. The job re-reads the day's mail at every fire, so
+    # without the time check the message that opened an item put it back
+    # at the fire after the owner closed it by their own word.
+    n_counter_evidence_stale = 0
+    if _exit_closed:
+        from cru_match import (_match_thresholds, _parse_ts as _ce_parse_ts,
+                               commitment_matches_thread_ref, score_match)
+        _, _reopen_bar = _match_thresholds(workspace_root)
+        _seen_cids: set = set()
+        _matches: list = []
+        for msg in inbound_messages or []:
+            if not isinstance(msg, dict):
+                continue
+            _sender = str(msg.get("sender_person_id") or "").strip()
+            if not _sender or _sender == user_person_id:
+                continue
+            # FIX ROUND 2 (review R-7) — an out-of-office echoes the subject
+            # line back, so it scored against the row's own words and put
+            # closed items back. A machine talking is not them coming back.
+            if _is_automated(msg):
+                continue
+            _tid = str(msg.get("thread_id") or "").strip()
+            _thread_key = primary_artifact_key(provider, _tid)
+            _text = " ".join(str(msg.get(f) or "")
+                             for f in ("subject", "body")).strip()
+            _msg_at = _message_instant(msg.get("ts"))
+            _msg_mid = str(msg.get("message_id") or "").strip()
+            for row in _exit_closed:
+                cid = row.get("commitment_id") or ""
+                if not cid or cid in _seen_cids:
+                    continue
+                _cap = row.get("capture_event")
+                on_thread = bool(_thread_key) and bool(_cap) and \
+                    commitment_matches_thread_ref(_cap, _thread_key)
+                theirs = _sender in set(row.get("counterparty_ids") or [])
+                if not on_thread:
+                    if not theirs:
+                        continue
+                    if score_match(_text, row.get("title") or "") < _reopen_bar:
+                        continue
+                # cr1#748 - it would put the row back; now the time. Older
+                # than the close, or no readable time at all, is not them
+                # coming back about it; neither is the message the item was
+                # captured from (the matcher's own layer-1 identity compare).
+                _closed_at = _ce_parse_ts(row.get("closed_ts"))
+                if _msg_at is None or _closed_at is None or _msg_at <= _closed_at:
+                    n_counter_evidence_stale += 1
+                    continue
+                if _msg_mid and _cap is not None and is_same_artifact(
+                        canonical_dedup_key(event=_cap), provider, _msg_mid):
+                    n_counter_evidence_stale += 1
+                    continue
+                _seen_cids.add(cid)
+                _matches.append({
+                    "commitment_id": cid,
+                    # Plain words, no id and no rail name (Rule 4).
+                    "why": "they came back about it after it was closed",
+                    "source_ref": primary_artifact_key(provider,
+                                                       msg.get("message_id")),
+                    # FIX ROUND 2 (review R-4) — what the closure said, so
+                    # the put-back's own `undo` can close it again exactly
+                    # as it was closed rather than on invented evidence.
+                    "resolved_by": row.get("resolved_by") or "",
+                    "evidence": row.get("evidence") or "",
+                    "resolution": row.get("resolution") or "done",
+                    "closed_source_ref": row.get("closed_source_ref"),
+                    "closed_source_skill": row.get("closed_source_skill") or "",
+                    # FIX ROUND 3 (review L-1) — which route closed it, so
+                    # the re-close on `undo` is filed where the first close
+                    # was rather than under "other".
+                    "exit_route": row.get("route") or "",
+                })
+        if _matches:
+            try:
+                from exit_doors import reopen_on_counter_evidence
+                reopen_out = reopen_on_counter_evidence(
+                    workspace_root, matches=_matches,
+                    # The RAIL owns the reversal, not the customer and not
+                    # the exit rail that closed it (ATTRIB2: `resolved_by`
+                    # and `source_skill` are the same string, so this lands
+                    # as a machine act).
+                    source_skill=source_skill)
+            except Exception:  # noqa: BLE001
+                reopen_out = {"n_reopened": 0, "reopened": [], "errors": [],
+                              "receipt_line": "", "batch_id": None}
+
+    # COUNTERPARTY ACTIVITY (SPEC_FLOW1 Lane B; wired in EXIT1 FIX ROUND 2,
+    # review R-5). Route 3 rests rows saying "nobody has touched this in six
+    # weeks". The other side's own move is one of the things that counts as
+    # touching it, and the event the movement baseline names for it
+    # (`email_received`) had NO WRITER anywhere in the product — so a row the
+    # counterparty chased two days ago still rested, under a sentence that
+    # was false. This is that writer, and it un-rests a row this rail had
+    # already rested. No close, no proposal, no question.
+    activity_out = {"n_marked": 0, "n_unrested": 0, "marked": [],
+                    "unrested": [], "receipt_line": "", "batch_id": None}
+    try:
+        from exit_doors import record_counterparty_activity
+        activity_out = record_counterparty_activity(
+            workspace_root, opens=opens, messages=inbound_messages or [],
+            user_person_id=user_person_id, source_skill=source_skill,
+            provider=provider)
+    except Exception:  # noqa: BLE001 — a marker never takes the mail run down
+        pass
+
+    # The confirm band MUST NOT evaporate — persist each proposal as a
+    # `commitment_review_proposed` so the next Waiting On chat surfaces it for
+    # one-click confirm. Deduped against the OPEN proposal set.
+    #
+    # WATCHGATE N-2 (RIDERS1 item 5): through `build_pending_review_event`, THE
+    # writer for this type — the only thing that persists the two fields the
+    # shared bulk-accept fence weighs. Hand-built, this rail's rows were STRONG
+    # by construction: the matcher's completion finding and the reply's own time
+    # were both in hand and neither reached the event.
+    reviews_written = 0
+    if pending:
+        from cru_match import (build_pending_review_event,
+                               load_open_review_proposals)
+        from event_gate import append_event
+        already_proposed = {
+            (p.get("data") or {}).get("commitment_id")
+            for p in load_open_review_proposals(str(events_path))
+        }
+        for p in pending:
+            if p["commitment_id"] in already_proposed:
+                continue
+            ev = build_pending_review_event(
+                commitment_id=p["commitment_id"],
+                primary_thread_id=p.get("primary_thread_id") or "",
+                source_skill=source_skill,
+                proposed_resolution="auto_resolve",
+                score=p.get("score") or 0,
+                evidence=p.get("evidence") or "matched their reply",
+                next_seq=None,   # the gate stamps seq inside the writer lock
+                title=p.get("title") or "",
+                # The reply's own time (EVORDER layer 3's input, now also the
+                # fence's) and the matcher's fulfillment finding. `None` on
+                # either means "not assessed" and weakens nothing.
+                evidence_ts=p.get("ts") or None,
+                has_completion_signal=p.get("has_completion_signal"),
+            )
+            ev["data"].update({
+                "ttl_days": REVIEW_PROPOSAL_TTL_DAYS,
+                "ambiguous": p.get("close_basis") == _AMBIGUOUS_REPLY_BASIS,
+                # cr1#763 - the message this proposal rests on, so the
+                # owner's dismissal of it is remembered against that
+                # message and the next fire does not raise it again. Never
+                # `source_ref`: on a proposal that key arms the chip timeout
+                # (`resolve_stale_chips`), and an "ask before closing"
+                # proposal must not close itself.
+                "evidence_ref": primary_artifact_key(provider, p.get("message_id")),
+            })
+            append_event(events_path, [ev], holder=source_skill)
+            reviews_written += 1
+
+    # cr1#740: one message moves a row once. A held window offers it again, and
+    # a replayed update would also reset the row's quiet clock
+    # (`derive_commitment_movement`).
+    if updated:
+        from connector_adapters.provenance import dedup_key_of
+        from events_io import iter_events
+        moved = {(str((e.get("data") or {}).get("commitment_id")),
+                  dedup_key_of((e.get("data") or {}).get("source_ref")))
+                 for e in iter_events(workspace_root)
+                 if e.get("type") == "commitment_updated"}
+        unmoved = []
+        for u in updated:
+            for one in [u] + list(u.get("others") or []):
+                if (str(one["commitment_id"]), dedup_key_of(
+                        primary_artifact_key(provider, one.get("message_id")))
+                    ) not in moved:
+                    unmoved.append(one)
+                    break
+        updated = unmoved
+    for u in updated:
+        u.pop("others", None)
+
+    # Schedule-shift markers — the counterparty moved their own date. Same
+    # builder the prose call sites used; only the loop moved.
+    if updated:
+        from atomic_write import atomic_append_jsonl as _append_upd
+        # next_seq=None — the appender stamps inside the writer lock
+        # (BUG-8330 item 7; the peek-then-append pattern was racy).
+        rows = [build_commitment_updated_event(
+            commitment_id=u["commitment_id"],
+            primary_thread_id=u.get("primary_thread_id") or "",
+            source_skill=source_skill,
+            change_summary="Counter-party shifted their own deadline (inbound mail)",
+            evidence=u.get("evidence") or "matched their reply",
+            next_seq=None,
+            source_ref=primary_artifact_key(provider, u.get("message_id")),
+        ) for u in updated]
+        _append_upd(events_path, rows)
+
+    n_auto = len(auto_close)
+    n_pend = len(pending)
+    n_upd = len(updated)
+    n_fetched = signal_fields["n_fetched"]
+
+    # ALWAYS emit the audit event — even on a 0-scan run — so every fire leaves
+    # a verifiable trace in events.jsonl. Enforcement points at THIS event, not
+    # at a printed sentence: a model can narrate "checked the inbox" without
+    # checking anything; it cannot fabricate a row that carries the counts.
+    from atomic_write import atomic_append_jsonl as _append
+    from cru_match import _now_iso as _audit_ts
+    # No hand-stamped seq (BUG-8330 item 7) — appender allocates in-lock.
+    audit_event = {
+        "ts": _audit_ts(),
+        "type": "inbound_reconcile",
+        "source_skill": source_skill,
+        "data": {
+            "kind": "reconcile-inbound",
+            "status": "complete",
+            "fired_via": fired_via,
+            "batch_id": batch_id,
+            "inbound_scanned_count": n_fetched,
+            "n_closed": n_auto,
+            "n_pending": n_pend,
+            "n_updated": n_upd,
+            "n_held_uncorroborated": len(held),
+            "n_partial_receipts": n_partial_receipts,
+            # SPEC_FLOW1 Lane B item 4 — rows one of the exit rails had
+            # closed that their reply put back on this run.
+            "n_reopened_on_counter_evidence": reopen_out["n_reopened"],
+            # cr1#748 - (row, message) pairs refused as counter-evidence
+            # because the message is older than the close or is the
+            # message the item came from.
+            "n_counter_evidence_stale": n_counter_evidence_stale,
+            # R-5 — how many rows the other side's own move touched, and how
+            # many rests that undid.
+            "n_counterparty_activity": activity_out["n_marked"],
+            "n_unrested_on_counterparty_activity": activity_out["n_unrested"],
+            # MAILSEAM — the provider every ref this run compared was built
+            # under. None means the run could not establish one, which is a
+            # fact worth reading back off the trace rather than a silent
+            # fallback to a literal.
+            "mail_provider": provider,
+            # Did the reply checks RUN, or was there nothing to find? Folded
+            # into the SAME audit event as the counts: one fire, one verifiable
+            # trace, free-form `data`, no schema change.
+            "signal_fields": signal_fields,
+            # How much of the open set this rail can reach at all.
+            "coverage": coverage,
+        },
+    }
+    if close_mode is not None:
+        # cr1#664 - only when a mode was asked for, so the default audit is
+        # byte-identical to the rail before it.
+        audit_event["data"]["close_mode"] = close_mode
+        audit_event["data"]["n_close_mode_proposed"] = n_close_mode_proposed
+        # cr1#764 - title-path proposals that closed because the message
+        # carried the item on its own thread.
+        audit_event["data"]["n_close_mode_promoted"] = n_close_mode_promoted
+    try:
+        # SCHED1 — the shared stamp helper, so the machine token and its
+        # not-persisted flag land the same way here as on every other receipt.
+        from receipts import machine_fields
+        audit_event["data"].update(machine_fields())
+    except Exception:
+        pass
+    _append(events_path, [audit_event])
+
+    if n_fetched == 0:
+        summary = "No new inbound mail to check against what you're waiting on."
+    elif n_auto == 0:
+        summary = (f"Checked {n_fetched} inbound message"
+                   f"{'s' if n_fetched != 1 else ''} — nothing you're waiting "
+                   f"on came in.")
+    else:
+        tail = f", {n_pend} to confirm" if n_pend else ""
+        summary = (f"Closed {n_auto} thing{'s' if n_auto != 1 else ''} you were "
+                   f"waiting on — they came in by email{tail}.")
+    if n_upd:
+        summary += (f" {n_upd} moved to a new date on their side.")
+    # Counter-evidence: their word outranks every argument the exit rails
+    # close on, and the customer is told in the same breath as the rest.
+    if reopen_out["receipt_line"]:
+        summary += " " + reopen_out["receipt_line"]
+    # R-5 — a row they came back about is a row that stops resting.
+    if activity_out["receipt_line"]:
+        summary += " " + activity_out["receipt_line"]
+    # MAILTRUST1 — the held caveat is user-facing on purpose: a hold with no
+    # sentence is a silent wrong answer wearing a different hat.
+    if held:
+        summary += (
+            f" {len(held)} match{'es' if len(held) != 1 else ''} came from"
+            f" conversation{'s' if len(held) != 1 else ''} where my two mail"
+            f" reads disagreed, so I held {'them' if len(held) != 1 else 'it'}"
+            f" instead of closing anything — check"
+            f" {'those threads' if len(held) != 1 else 'that thread'} directly."
+        )
+
+    # The counters are for a validator; this sentence is for the HUMAN, and it
+    # goes LAST because it is a caveat on everything above it. It fires only in
+    # the dead-rail state — the fetch carried NEITHER field on ANY message, so
+    # the reply checks could not run at all and the zero above means nothing.
+    # A fetch that carried the fields and found no deliveries says nothing
+    # extra: that is an honest zero, and a warning that always fires is as
+    # useless as one that never does. Plain language, no field names (Rule 4).
+    if signal_fields["n_scored"] and not (
+            signal_fields["n_thread_field_present"]
+            or signal_fields["n_attachment_field_present"]):
+        summary += (
+            " Heads up: none of those messages came through with conversation"
+            " or attachment details, so the checks that recognize a reply as"
+            " the thing you were waiting for could not run — only the wording"
+            " was compared."
+        )
+    # The other way this rail goes quiet: every message was skipped before it
+    # was ever scored. Two different defects (nobody resolvable / the batch was
+    # the user's own mail) and both produce the same clean zero without this.
+    if n_fetched and not signal_fields["n_scored"]:
+        summary += (
+            f" Heads up: none of the {n_fetched} message"
+            f"{'s' if n_fetched != 1 else ''} could be checked — "
+            + ("they were all from you"
+               if signal_fields["n_from_user_skipped"] >= n_fetched
+               else "the senders could not be matched to anyone on file")
+            + "."
+        )
+
+    def _slim(items):
+        # `message_id` rides the slim rows so the caller can answer "did THIS
+        # message close anything?" without re-running the matcher. Phase 2.6's
+        # resolution-miss telemetry asks exactly that, per message, and the
+        # first cut of these rows dropped the id — leaving an instruction in
+        # the orchestrator that the shape could not satisfy. The alternative
+        # (have the rider call `reconcile_inbound` itself for the non-slim
+        # proposals) would run the matcher twice per fire and give the same
+        # question two answers; one additive field is the cheaper truth.
+        #
+        # DELIBERATE ASYMMETRY with the sent rail (review F-3): the two `_slim`
+        # shapes now differ — `reconcile_sent_commitments`' rows carry no
+        # `message_id`, because nothing downstream of the sent receipt asks a
+        # per-message question. Added there it would be an unread field, and an
+        # unread field is the thing that later reads as a contract. If the sent
+        # rail ever grows the same telemetry, match it then.
+        return [{"commitment_id": c["commitment_id"],
+                 "title": c.get("title") or "", "ts": c.get("ts") or "",
+                 "message_id": c.get("message_id") or ""}
+                for c in items]
+
+    out = {
+        "ran": True,
+        "batch_id": batch_id,
+        "n_fetched": n_fetched,
+        "n_open_before": n_open_before,
+        "n_auto_closed": n_auto,
+        "n_pending": n_pend,
+        "n_updated": n_upd,
+        "events_written": events_written,
+        "reviews_written": reviews_written,
+        "resolved": _slim(auto_close),
+        "pending": _slim(pending),
+        "updated": _slim(updated),
+        "n_partial_receipts": n_partial_receipts,
+        "partial": partial_recorded,
+        "partial_propose_closure": partial_propose_closure,
+        "n_held_uncorroborated": len(held),
+        "held": held,
+        "n_reopened_on_counter_evidence": reopen_out["n_reopened"],
+        "reopened_on_counter_evidence": reopen_out["reopened"],
+        "counter_evidence_receipt_line": reopen_out["receipt_line"],
+        # R-4 — the batch a bare `undo` names to close them again.
+        "counter_evidence_batch_id": reopen_out.get("batch_id"),
+        # R-5 — their own move, recorded against the rows it is about, and
+        # the rests it undid.
+        "n_counterparty_activity": activity_out["n_marked"],
+        "n_unrested_on_counterparty_activity": activity_out["n_unrested"],
+        "counterparty_activity_receipt_line": activity_out["receipt_line"],
+        "counterparty_activity_batch_id": activity_out.get("batch_id"),
+        "signal_fields": signal_fields,
+        "coverage": coverage,
+        "mail_provider": provider,
+        # SPEC_FLOW1 Lane F rule 1 — the identity pass's own receipt, or None
+        # when no participants were handed in. `receipt_lines` is what the
+        # surface renders: an auto-creation with no receipt is a silent write.
+        "contacts": contacts_seeded,
+        "summary": summary,
+    }
+    if close_mode is not None:
+        # cr1#664 - the mode and how many graded closes it sent to the
+        # confirm list; absent on the default path, byte for byte.
+        out["close_mode"] = close_mode
+        out["n_close_mode_proposed"] = n_close_mode_proposed
+    return out
+
+
+def validate_inbound_reconcile_ran(workspace_root, *, since_ts=None) -> dict:
+    """Read events.jsonl back and confirm a REAL inbound reconciliation ran.
+
+    The ungameable half of the contract: a printed "checked your inbox" line
+    with no `inbound_reconcile` audit event in the log returns ok=False. Looks
+    at the LATEST audit. With `since_ts` given, that audit's own `ts` must be at
+    or after it, so a stale prior audit cannot pass for the current run — the
+    role `cursor_from` plays on the sent rail, without inventing a second
+    window cursor for a caller that already owns one.
+
+    A 0-scan run is still a valid run (ok=True): it ran and found nothing, and
+    the audit event proves the pass happened.
+
+    TRAINFIX F-4 — EXCEPT when the audit says `status: "blocked"`: the inbound
+    read never happened, so the zero means nothing, and ok=False carries the
+    recorded reason. Without this the blocked audit would be read back as a
+    healthy empty run, which is the exact dead rail the blocked status exists to
+    expose (a clean audit over a skipped read). Mirrors
+    `reconcile_sent_commitments.validate_reconcile_ran`.
+    """
+    from cru_match import load_events_defensively
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    if not events_path.exists():
+        return {"ok": False, "ran": False, "reason": "no events.jsonl"}
+    latest = None
+    # EVGUARD — the hand-rolled loop that used to live here wrapped only the
+    # parse in `except Exception`, so a bare-string line reached `e.get()` and
+    # raised AttributeError out of the validator (Sub-bug #14b, second half):
+    # one junk line and the ungameable-reconcile check stopped answering at
+    # all. The canonical loader skips both malformed shapes and is
+    # shard-transparent; since_ts=None = full history.
+    # Kept BYTE-FOR-BYTE parallel with reconcile_sent_commitments.
+    # validate_reconcile_ran — the two are copy-clones by design.
+    events, _skipped = load_events_defensively(events_path, since_ts=None)
+    for e in events:
+        if e.get("type") == "inbound_reconcile":
+            latest = e  # append-ordered → keep the last one seen
+    if latest is None:
+        return {"ok": False, "ran": False,
+                "reason": "no inbound_reconcile audit event — the inbound "
+                          "pass did not actually run"}
+    d = latest.get("data") or {}
+    if d.get("status") == "blocked":
+        return {"ok": False, "ran": False,
+                "reason": ("the inbound read did not happen — "
+                           + (d.get("blocked_reason") or "recorded as blocked")),
+                "batch_id": d.get("batch_id"),
+                "inbound_scanned_count": d.get("inbound_scanned_count"),
+                "n_closed": d.get("n_closed")}
+    if since_ts is not None:
+        # Parsed, never string-compared. The audit stamps `...Z` and a caller's
+        # `_clock_now().isoformat()` stamps `...+00:00`; those two
+        # spellings of the same instant do not order lexicographically, and a
+        # validator that silently mis-orders them is worse than no validator.
+        from event_time import parse_ts as _parse
+        seen, want = _parse(latest.get("ts")), _parse(since_ts)
+        stale = (seen is None or want is None) or seen < want
+        if stale:
+            return {"ok": False, "ran": True,
+                    "reason": f"latest audit is not this run's (ts="
+                              f"{latest.get('ts')!r}, expected at or after "
+                              f"{since_ts!r})",
+                    "batch_id": d.get("batch_id")}
+    return {
+        "ok": True, "ran": True,
+        "batch_id": d.get("batch_id"),
+        "inbound_scanned_count": d.get("inbound_scanned_count"),
+        "n_closed": d.get("n_closed"),
+        "n_pending": d.get("n_pending"),
+        "signal_fields": d.get("signal_fields"),
+        "coverage": d.get("coverage"),
+    }
+
+
+__all__ = ["reconcile_inbound", "reconcile_inbound_and_receipt",
+           "validate_inbound_reconcile_ran", "PrimaryUserUnresolvedError",
+           "CHANGE_CLASS", "CLOSE_MODES", "CLOSE_MODE_CLOSE",
+           "CLOSE_MODE_PROPOSE", "carries_deliverable", "apply_close_mode",
+           "apply_close_mode_to_receipts", "CLOSE_MODE_DIAL",
+           "resolve_dial_mode"]

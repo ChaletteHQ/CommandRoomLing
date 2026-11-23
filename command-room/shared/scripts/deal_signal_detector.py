@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""Deal-signal detector — observed stage/value/creation signals, proposed
+through the Living Brain rails (SPEC LB1 D7; absorbs PIPE1 Part 2).
+
+WHY THIS EXISTS
+PIPE1 shipped the deal object + the single writer (`deal_state.py`) and
+reserved `deal_update_proposed`/`deal_update_dismissed` for the observed
+lane. This detector is that lane: it scans recent events on prospect/client
+orgs for stage markers, verbal-agreement language, won language, money
+amounts near a deal thread, and deal-shaped signal on orgs with NO open deal
+thread (M's Part 2 scope addition: propose deal CREATION — propose-and-
+confirm only, never silent). PIPE1 D9.1 widens the creation lane: a
+sales-typed `meeting` event on an uncovered org is genesis signal on its
+own, no marker phrase required — the two-"prospect"-systems reconciliation
+(org relationship_type vs deal object) that kept marker-less live prospects
+off every pipeline view. Emission is ONLY through
+`brain_proposals.propose(tier="confirm")` — observed signals never auto-flip
+(PIPE1 D6 / Bug #92); confirmation routes through apply-choices →
+`deal_state`, the only deal writer.
+
+STRUCTURE mirrors `prospect_conversion_detector.py`: pure detection returns
+candidate dicts with ready-to-render `render_line`s (Bug #92b — surfaces
+render verbatim, never re-decide inclusion); a separate job entry point does
+the propose() emission + receipt for the `deal-signals` MAINTENANCE_JOBS row.
+
+Won-language markers come from prospect_conversion_detector via its
+``_conversion_markers()`` accessor — one vocabulary, never forked. The
+accessor (not the raw ``CONVERSION_MARKERS`` constant) is the contract:
+it carries the bilingual overlay when a workspace activates one, so the
+won lane here and the conversion lane there always read the same list.
+
+Pure / substrate-only / no connectors. stdlib only.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import re
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import event_refs  # noqa: E402
+from entities_io import entities_collection  # noqa: E402
+from text_clip import PROPOSAL_EVIDENCE_MAX_CHARS, clip  # noqa: E402
+from prospect_conversion_detector import (  # noqa: E402
+    _conversion_markers,
+    _event_org_ids,
+    _event_text,
+)
+
+# Look-back for textual signals (matches the prospect detector's window).
+TEXT_WINDOW_DAYS = 120
+
+# Observed stage markers — lowercased substring match, mapped to the ACTIVE
+# stage the signal suggests (won/lost are never stages; won-language routes
+# through close_deal on confirm).
+STAGE_MARKERS: dict[str, tuple[str, ...]] = {
+    "proposal_sent": (
+        "sent the proposal", "proposal sent", "sent over the proposal",
+        "sent our proposal", "proposal is out", "submitted the proposal",
+        "sent them the quote", "quote sent",
+    ),
+    "negotiating": (
+        "verbal agreement", "verbally agreed", "agreed verbally",
+        "negotiating", "redlines", "redlining", "contract review",
+        "reviewing the contract", "handshake deal",
+    ),
+}
+
+# Deal-shaped language that qualifies an org with NO open deal thread for a
+# CREATION proposal (weaker than a stage marker on purpose — creation needs
+# pursuit signal, not progress signal).
+CREATION_MARKERS = (
+    "proposal", "pricing", "quote", "scope of work", "discovery call",
+    "pitch", "rfp", "budget for", "engagement letter",
+)
+
+# PIPE1 D9.1 (deal genesis) — a `meeting` event typed sales qualifies an
+# uncovered org for a CREATION proposal even with ZERO pursuit language in
+# the text. This is the two-"prospect"-systems reconciliation: the live gap
+# case had a sales meeting, a follow-up, and an open closing-email
+# commitment but no marker phrase anywhere, so the text lane never fired and
+# the org was invisible on every pipeline view. `meeting_type` is stamped by
+# past-meetings on the canonical `meeting` event (verified on live substrate
+# 2026-07-19; shape documented in event-payloads.schema.json) — the read is
+# defensive: an untyped meeting simply contributes no genesis signal.
+SALES_MEETING_TYPE = "sales"
+
+# Money amounts near a deal thread ($12,000 / $12k / 12,000 dollars).
+_MONEY_RE = re.compile(
+    r"(?:\$\s?(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s?(k|m)?)"
+    r"|(?:(\d{1,3}(?:,\d{3})+|\d+)\s?(?:dollars|usd))",
+    re.IGNORECASE,
+)
+
+_DETECTOR = "deal-signals"
+TASK_ID = "deal-signals"
+
+
+def _clock_now(workspace_root=None):
+    """CLOCK1 - the corroborated UTC instant this module stamps from.
+
+    Swaps the CLOCK SOURCE only: every window, cutoff, threshold and output
+    format around it is unchanged. A machine clock that has not synced used to
+    write its own wrong reading straight into the permanent record; this reads
+    the same clock, cross-checked against the newest timestamp the workspace
+    already holds. Falls back to the raw machine clock if the helper is
+    unavailable, so a stamp can never fail for want of corroboration.
+
+    `workspace_root` is threaded in wherever the calling function already
+    has one, because a helper that has to GUESS which workspace it is in
+    guesses wrong exactly when it matters: a fire's early phases run in
+    their own subprocesses, before anything has registered a root.
+    """
+    try:
+        from trusted_now import trusted_now_utc
+
+        return trusted_now_utc(workspace_root)
+    except Exception:
+        import datetime as _clock_dt
+
+        return _clock_dt.datetime.now(_clock_dt.timezone.utc)
+
+
+def _entities(workspace_root: Path) -> dict:
+    p = workspace_root / "_hq" / "data" / "entities.json"
+    d = json.loads(p.read_text(encoding="utf-8"))
+    return d["entities"] if isinstance(d.get("entities"), dict) else d
+
+
+def _parse_money(text: str):
+    m = _MONEY_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1) or m.group(3)
+    if not raw:
+        return None
+    try:
+        val = float(raw.replace(",", ""))
+    except ValueError:
+        return None
+    suffix = (m.group(2) or "").lower()
+    if suffix == "k":
+        val *= 1_000
+    elif suffix == "m":
+        val *= 1_000_000
+    return val
+
+
+_MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _source_phrase(ev) -> str:
+    """FS-10 — a short, dated, provenance-honest source phrase for the row
+    evidence line ("your Jul 8 sent mail"). Never invents a date: if the event
+    has no parseable ts, the phrase is date-free. The source noun comes from
+    the event's own type / source_skill, never guessed."""
+    if not isinstance(ev, dict):
+        return ""
+    ts = str(ev.get("ts") or "")
+    date_str = ""
+    if len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
+        try:
+            mo, day = int(ts[5:7]), int(ts[8:10])
+            date_str = f"{_MONTHS[mo]} {day}"
+        except (ValueError, IndexError):
+            date_str = ""
+    etype = str(ev.get("type") or "")
+    skill = str(ev.get("source_skill") or "")
+    tag = f"{etype} {skill}".lower()
+    if "sent" in tag or "reconcile" in tag or "email_sent" in etype:
+        noun = "sent mail"
+        owned = "your "
+    elif "email" in tag or "inbox" in tag or "thread" in tag:
+        noun, owned = "email thread", "a "
+    elif "meeting" in tag or "granola" in tag or "transcript" in tag:
+        noun, owned = "meeting notes", "your "
+    elif "slack" in tag:
+        noun, owned = "Slack message", "a "
+    else:
+        noun, owned = "activity", ""
+    if date_str:
+        return f"{owned}{date_str} {noun}"
+    return f"{owned}recent {noun}".strip()
+
+
+def detect_deal_signals(workspace_root: str | Path, *,
+                        org_ids=None) -> list[dict]:
+    """Return observed deal-signal candidates, each as:
+        {kind: 'deal_update'|'deal_creation', org_id, org_name, thread_id?,
+         proposal_kind: 'stage'|'value'|'won', proposed_stage?,
+         proposed_value?, evidence, fingerprint, render_line, nudge_line}
+
+    Detection only — never writes. `render_line` is verbatim-render (Bug
+    #92b): the surface MUST NOT re-decide inclusion. One candidate per
+    (target, proposal_kind) — first qualifying event wins.
+
+    `org_ids` (optional) restricts detection to those orgs — the scoped
+    form the meeting-notes / follow-up-ritual post-step hook uses ("only the
+    orgs THIS meeting touched"). Scoping in code keeps the Bug #92b line:
+    the surface passes the meeting's orgs and renders what comes back; it
+    never filters the candidate list itself.
+
+    `nudge_line` is the chat teach-the-phrase form (D11: features teach
+    themselves at the moment of relevance) — every taught command is a live
+    pipeline-tracker trigger, G6-checked where a SKILL.md quotes the shape.
+    `render_line` stays the FS-10 widget-row form; the two surfaces differ
+    on purpose."""
+    workspace_root = Path(workspace_root)
+    ent = _entities(workspace_root)
+    orgs = ent.get("orgs") or []
+    threads = entities_collection(ent, "projects")
+
+    tracked = {
+        o["id"]: o for o in orgs
+        if o.get("id") and o.get("relationship_type") in ("prospect", "client")
+    }
+    if org_ids is not None:
+        scope = set(org_ids)
+        tracked = {oid: o for oid, o in tracked.items() if oid in scope}
+    if not tracked:
+        return []
+
+    # Open deal threads per org (deal_state doctrine: kind == "deal",
+    # non-terminal status).
+    open_deals: dict[str, dict] = {}
+    thread_org: dict[str, str] = {}
+    for t in threads:
+        oid = t.get("org") or t.get("org_id") or t.get("affiliation_id") \
+            or (t.get("affiliation_ids") or [None])[0]
+        if t.get("id") and oid:
+            thread_org[t["id"]] = oid
+        if t.get("kind") != "deal":
+            continue
+        if t.get("status") in ("resolved", "archived"):
+            continue
+        if oid in tracked:
+            open_deals.setdefault(oid, t)
+
+    # FS-18b — the no-tracked-deal predicate is SHARED with the confirm
+    # handler (deal_state.org_deal_coverage, one helper never forked): an org
+    # with an ACTIVE ENGAGEMENT THREAD is covered too. Pre-T2.2 the detector
+    # checked only kind='deal' threads, so it proposed deal CREATION for orgs
+    # whose confirm the create path then refused — an unconfirmable zombie
+    # proposal (the live Summit case, RV-5).
+    from deal_state import org_deal_coverage
+
+    covered: set[str] = set()
+    for oid in tracked:
+        if org_deal_coverage(threads, oid) is not None:
+            covered.add(oid)
+
+    events_path = workspace_root / "_hq" / "data" / "events.jsonl"
+    if not events_path.exists():
+        return []
+    events = event_refs.load_events(events_path)
+
+    # DEALNAG1 — a SETTLED org (a won deal thread, or a paid / signed
+    # event on file) is never a creation candidate. `org_deal_coverage`
+    # reads a terminal deal as "no coverage" — correct for the confirm
+    # handler, wrong as a creation premise: a deal that was WON is a
+    # pipeline record, not the lack of one, and the live brief re-proposed
+    # two just-won clients as "likely deal · no pipeline record" the Sunday
+    # after their wins. The predicate is shared with the conversion nudge
+    # (deal_signal_retire.settled_orgs — one helper, never forked).
+    from deal_signal_retire import settled_orgs
+
+    settled = settled_orgs(ent, events)
+    covered |= set(settled)
+    # CUTB item 1(a) (v5.28.0 attended test B2.1 / B4.1) — a CLIENT org is
+    # never a creation target. The genesis lane below fires on any
+    # sales-typed meeting on an uncovered tracked org, and `tracked` holds
+    # clients for the UPDATE lane (a client's open deal is real pipeline);
+    # nothing excluded a client from genesis, so a client whose won deal
+    # thread had been archived, or who was converted by hand with no deal
+    # thread at all, was "likely deal · no pipeline record" the next Sunday.
+    # A client relationship is a coverage premise beside won / paid / signed.
+    covered |= {oid for oid, o in tracked.items()
+                if o.get("relationship_type") == "client"}
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    def _push(kind, oid, *, proposal_kind, evidence, thread=None,
+              proposed_stage=None, proposed_value=None, source_ev=None):
+        org = tracked[oid]
+        # LEAK2 — a company with no name on file renders the honest
+        # label, never its id (the B3.4 fallback class).
+        from narration_names import safe_name
+        name = safe_name(org.get("canonical_name"))
+        tid = thread.get("id") if thread else None
+        fingerprint = f"deal:{tid or oid}:{proposal_kind}" + (
+            f":{proposed_stage}" if proposed_stage else "")
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        deal_name = (thread.get("display_name") if thread else None) or name
+        # FS-10 row shape: title = the org/deal name (the row's own header);
+        # render_line = "{kind badge} · {evidence with date} · {consequence}".
+        # Brand-clean (no emoji, no em dash); the `·` separators match the
+        # agreed shape "Acme Co — likely deal · proposal language in
+        # your Jul 8 sent mail · no pipeline record".
+        src = _source_phrase(source_ev)
+        ev_dated = f"{evidence} in {src}" if src else evidence
+        if kind == "deal_creation":
+            badge, consequence = "likely deal", "no pipeline record"
+            taught = f"new deal {deal_name} with {name}"
+        elif proposal_kind == "won":
+            badge, consequence = "sounds won", "still open in your pipeline"
+            taught = f"mark {deal_name} won"
+        elif proposal_kind == "value":
+            badge, consequence = "has a number attached", "value not recorded"
+            taught = "pipeline"  # value edits ride the report widget; bare 'update' stays unclaimed
+        else:
+            badge = f"looks moved to {proposed_stage.replace('_', ' ')}"
+            consequence = "pipeline stage is behind"
+            taught = f"move {deal_name} to {proposed_stage}"
+        line = f"{badge} · {ev_dated} · {consequence}"
+        nudge = f"{deal_name} {badge} ({ev_dated}) — say `{taught}`"
+        cand = {
+            "kind": kind,
+            "org_id": oid,
+            "org_name": name,
+            "title": deal_name,
+            "proposal_kind": proposal_kind,
+            "evidence": ev_dated,
+            "fingerprint": fingerprint,
+            "render_line": line,
+            "nudge_line": nudge,
+        }
+        if tid:
+            cand["thread_id"] = tid
+        if proposed_stage:
+            cand["proposed_stage"] = proposed_stage
+        if proposed_value is not None:
+            cand["proposed_value"] = proposed_value
+        candidates.append(cand)
+
+    # D9.1 name-lane fallback, genesis only: live meeting events for a
+    # not-yet-tracked counterparty often carry NO org reference at all —
+    # past-meetings resolves primary_thread_id to the CEO's OWN product
+    # thread and creates the prospect org separately, so the exact meeting
+    # that should seed the pipeline is structurally unattributed (the live
+    # gap case verified 2026-07-19). Tightly bounded: only sales-typed
+    # meeting events, only UNCOVERED tracked orgs, word-boundary match on
+    # the org's canonical name (>= 4 chars) in the event text. Structural
+    # refs stay the primary lane; step 8 of the past-meetings orchestrator
+    # now stamps org_ids so future events attribute directly.
+    name_pat: dict[str, re.Pattern] = {}
+    for oid, org in tracked.items():
+        if oid in covered or oid in open_deals:
+            continue
+        nm = str(org.get("canonical_name") or "").strip().lower()
+        if len(nm) >= 4:
+            name_pat[oid] = re.compile(r"\b" + re.escape(nm) + r"\b")
+
+    cutoff = (_clock_now(workspace_root)
+              - _dt.timedelta(days=TEXT_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    for ev in events:
+        ts = str(ev.get("ts") or "")
+        if ts and ts[:10] < cutoff:
+            continue  # review F4: the window is enforced, not decorative
+        text = _event_text(ev)
+        if not text:
+            continue
+        d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        sales_meeting = (ev.get("type") == "meeting"
+                         and d.get("meeting_type") == SALES_MEETING_TYPE)
+        refs = set(_event_org_ids(ev))
+        for tid in event_refs.threads_of(ev):
+            if tid in thread_org:
+                refs.add(thread_org[tid])
+        refs &= set(tracked)
+        if sales_meeting:
+            for oid, pat in name_pat.items():
+                if oid not in refs and pat.search(text):
+                    refs.add(oid)
+        if not refs:
+            continue
+        for oid in refs:
+            thread = open_deals.get(oid)
+            if thread is not None:
+                # Progress signals on an OPEN deal.
+                for stage, markers in STAGE_MARKERS.items():
+                    hit = next((m for m in markers if m in text), None)
+                    if hit and (thread.get("deal") or {}).get("stage") != stage:
+                        _push("deal_update", oid, proposal_kind="stage",
+                              proposed_stage=stage, thread=thread,
+                              evidence=f'"{hit}" language', source_ev=ev)
+                won_hit = next((m for m in _conversion_markers() if m in text), None)
+                if won_hit:
+                    _push("deal_update", oid, proposal_kind="won",
+                          thread=thread,
+                          evidence=f'"{won_hit.strip()}" language', source_ev=ev)
+                money = _parse_money(text)
+                if money is not None and not (thread.get("deal") or {}).get("value"):
+                    _push("deal_update", oid, proposal_kind="value",
+                          proposed_value=money, thread=thread,
+                          evidence="a money amount", source_ev=ev)
+            elif oid not in covered:
+                # NO coverage at all — no open deal thread AND no active
+                # engagement thread (FS-18b) — creation signal (M's Part 2
+                # scope addition; propose-and-confirm only, never silent).
+                hit = next((m for m in CREATION_MARKERS if m in text), None)
+                stage_hit = any(m in text
+                                for ms in STAGE_MARKERS.values() for m in ms)
+                # D9.1 deal genesis: a sales-typed meeting on an uncovered
+                # org is genesis signal on its own — no marker phrase
+                # required (the text lane misses warm-in-conversation
+                # prospects for weeks). Defensive read: untyped or non-sales
+                # meetings contribute nothing here.
+                if hit or stage_hit or sales_meeting:
+                    if hit or stage_hit:
+                        evidence = f'{hit or "deal-shaped"} language'
+                    else:
+                        evidence = "a sales-typed meeting"
+                    _push("deal_creation", oid, proposal_kind="creation",
+                          evidence=evidence, source_ev=ev)
+    return candidates
+
+
+def _asked_before(workspace_root: str | Path) -> set[tuple[str, str]]:
+    """(fingerprint, evidence) pairs this detector has EVER proposed — open,
+    tombstoned (answered / expired / retired) or computationally lapsed.
+    Org-scoped full-history read through events_io (the projector's own
+    seam).
+
+    CUTB item 2 (v5.28.0 attended test B4.2: a proposal "had already
+    expired once and re-fired" on the same Aug 6 evidence). The DEALNAG1
+    form keyed on TOMBSTONED proposals only, and `brain_proposal_expired`
+    is written by `expire_stale`, which runs only inside `cleanup` — so a
+    row that aged out with no cleanup fire was neither open (the projector
+    drops it past TTL) nor asked (no tombstone), and the next Sunday
+    re-proposed it on identical evidence. Every prior proposal counts now:
+    one ask per (item, evidence) EVER, whatever the ledger got round to
+    saying about it. An open twin is already caught by `propose()`'s own
+    open-fingerprint dedup; listing it here changes nothing.
+
+    The evidence is compared CLIPPED-to-clipped: `propose()` stores
+    `clip(evidence, PROPOSAL_EVIDENCE_MAX_CHARS)`, and a candidate longer
+    than the budget never matched its own stored row (the second hole)."""
+    from events_io import load_events_org_scoped
+
+    ws = Path(workspace_root)
+    if not (ws / "_hq" / "data" / "events.jsonl").exists():
+        return set()
+    events, _skipped = load_events_org_scoped(ws)
+    out: set[tuple[str, str]] = set()
+    for ev in events:
+        if ev.get("type") != "brain_proposal":
+            continue
+        d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        if d.get("detector") != _DETECTOR:
+            continue
+        out.add((str(d.get("fingerprint") or ""),
+                 clip(str(d.get("evidence") or ""), PROPOSAL_EVIDENCE_MAX_CHARS)))
+    return out
+
+
+def propose_candidates(workspace_root: str | Path, candidates: list[dict]) -> dict:
+    """Propose each detected candidate through the Living Brain rails
+    (tier=confirm; ledger cooldown + open-fingerprint dedup enforced inside
+    propose()). Shared by the Sunday `deal-signals` job AND the scoped
+    meeting-time hook (meeting-notes / follow-up-ritual post-step) — the
+    hook must NOT call run_deal_signal_job, whose pack_run receipt belongs
+    to the scheduled job alone (a meeting fire minting a deal-signals
+    receipt would satisfy the job's due-ness/validator falsely).
+    Returns {n_proposed, n_suppressed}. Never writes a deal field."""
+    import brain_proposals
+
+    asked = _asked_before(workspace_root)
+    n_proposed = 0
+    n_suppressed = 0
+    for c in candidates:
+        # DEALNAG1 / POLICY1 D3 — one proposal per (item, evidence) EVER.
+        # Expiry writes no cooldown, so the Sunday after a row expired the
+        # detector re-proposed the same fingerprint on the same dated
+        # evidence (live: expired and re-proposed the same day). A row that
+        # was already asked — answered, expired or retired — comes back
+        # only with NEW evidence (the evidence string carries its source
+        # date, so a fresh signal is a fresh ask).
+        if (c["fingerprint"],
+                clip(c["evidence"], PROPOSAL_EVIDENCE_MAX_CHARS)) in asked:
+            n_suppressed += 1
+            continue
+        action_tuples = [
+            {"action": "confirm proposal"},
+            {"action": "dismiss proposal"},
+            {"action": "snooze proposal 7d"},
+        ]
+        extra = {"proposal_kind": c["proposal_kind"]}
+        for k in ("proposed_stage", "proposed_value", "org_name", "title"):
+            if c.get(k) is not None:
+                extra[k] = c[k]
+        result = brain_proposals.propose(
+            workspace_root,
+            kind=c["kind"],
+            fingerprint=c["fingerprint"],
+            evidence=c["evidence"],
+            action_tuples=action_tuples,
+            tier="confirm",
+            detector=_DETECTOR,
+            render_line=c["render_line"],
+            thread_id=c.get("thread_id"),
+            org_id=c["org_id"],
+            extra=extra,
+        )
+        if result["status"] == "proposed":
+            n_proposed += 1
+        else:
+            n_suppressed += 1
+    return {"n_proposed": n_proposed, "n_suppressed": n_suppressed}
+
+
+
+def _effective_fired_via(explicit):
+    """`receipts.effective_fired_via`, behind an import that cannot break."""
+    try:
+        from receipts import effective_fired_via
+    except Exception:  # noqa: BLE001 - a resolver that raises is worse
+        return explicit if explicit is not None else "scheduled"
+    try:
+        return effective_fired_via(explicit)
+    except Exception:  # noqa: BLE001
+        return explicit if explicit is not None else "scheduled"
+
+
+def run_deal_signal_job(workspace_root: str | Path, *, fired_via=None) -> dict:
+    """The `deal-signals` MAINTENANCE_JOBS entry point: retire settled nags →
+    promote every settled prospect (M ruling 4 — automatic, receipted,
+    undoable) → detect → propose each
+    candidate through the Living Brain rails (tier=confirm, ledger cooldown +
+    open-dedup enforced inside propose()) → write the job's pack_run receipt.
+    Returns {n_candidates, n_proposed, n_suppressed, receipt}."""
+    # FIX3 F3-6: a literal default IS an explicit value by the time the
+    # resolver sees it (the FIX2 M-3 lesson), so this signature says
+    # nothing and the seat answers. A legacy or local seat still reads
+    # `scheduled`, byte for byte; a merged seat with nothing forwarded
+    # reads `manual`, which is what a typed brief actually is.
+    # MAINTJOBS1 MUST 3 - THE WRITER IS NAMED FIRST. Retire, promote and
+    # propose all write before the pack_run does, so on a merged seat with no
+    # forwarded identity the refusal has to come here, before any of them.
+    from receipts import log_receipt, require_writer_identity
+
+    require_writer_identity(workspace_root=workspace_root)
+    fired_via = _effective_fired_via(fired_via)
+    from deal_signal_retire import retire_settled
+    from org_promotion import promote_settled_prospects
+
+    # DEALNAG1 — retire FIRST: every standing row whose premise the
+    # substrate already contradicts (a won / lost thread, a settled org)
+    # goes before the detector looks for new signal, and the counts ride
+    # this job's own pack_run receipt (the honesty artifact for the sweep).
+    retired = retire_settled(workspace_root, source_skill=_DETECTOR)
+    # DEALNAG1 (M ruling 4) — then PROMOTE: every prospect carrying a paid
+    # or signed fact becomes a client here, automatically, with a receipt
+    # (`org_promoted`), one CHANGED line and an undo. It runs BEFORE
+    # detection so the creation lane sees the settled substrate, and it is
+    # the backlog / other-door path — a won close promotes on the spot
+    # inside `deal_state.close_deal`.
+    promoted = promote_settled_prospects(workspace_root,
+                                         source_skill=_DETECTOR)
+    candidates = detect_deal_signals(workspace_root)
+    counts = propose_candidates(workspace_root, candidates)
+    n_proposed = counts["n_proposed"]
+    n_suppressed = counts["n_suppressed"]
+    receipt = log_receipt(
+        workspace_root, TASK_ID,
+        receipt_type="pack_run",
+        fired_via=fired_via,
+        surfaced=n_proposed,
+        extra_data={"n_candidates": len(candidates),
+                    "n_suppressed": n_suppressed,
+                    "n_retired": retired["n_retired"],
+                    "retired_by_reason": retired["by_reason"],
+                    "n_promoted": promoted["n_promoted"],
+                    "promotion_batch_id": promoted["batch_id"],
+                    "n_promotions_skipped": len(promoted["skipped"])},
+    )
+    return {"n_candidates": len(candidates), "n_proposed": n_proposed,
+            "n_suppressed": n_suppressed, "n_retired": retired["n_retired"],
+            "retired_by_reason": retired["by_reason"],
+            "n_promoted": promoted["n_promoted"],
+            "promoted": promoted["promoted"],
+            "promotions_skipped": promoted["skipped"],
+            "promotion_batch_id": promoted["batch_id"], "receipt": receipt}
+
+
+def validate_deal_signals_ran(workspace_root: str | Path) -> dict:
+    """Enforcement binds to the receipt artifact, never narration (the
+    reconcile-sent doctrine). ok=True when a deal-signals pack_run exists."""
+    from receipts import iter_receipts
+
+    latest = None
+    for r in iter_receipts(workspace_root, task_ids=[TASK_ID]):
+        latest = r
+    if latest is None:
+        return {"ok": False, "ran": False,
+                "reason": "no deal-signals receipt on file"}
+    return {"ok": True, "ran": True, "receipt": latest}
+
+
+__all__ = [
+    "STAGE_MARKERS",
+    "CREATION_MARKERS",
+    "SALES_MEETING_TYPE",
+    "TASK_ID",
+    "detect_deal_signals",
+    "propose_candidates",
+    "run_deal_signal_job",
+    "validate_deal_signals_ran",
+]
+
+
+def main(argv=None) -> int:
+    """`deal_signal_detector.py <ws>` prints the candidates (today's
+    behaviour, unchanged). `--workspace <ws> --apply` RUNS the maintenance
+    job (MAINTJOBS1 MUST 3: the `deal-signals` row of
+    `maintenance_dispatcher.JOB_LEGS`, run by `run_job` through the write
+    door like every other script job) and prints its return as ONE JSON
+    line. `--fired-via` / `--triggered-by` are the two flags every job leg
+    ends in: the first is handed to the job, the second rides the receipt the
+    way `log_receipt` reads it (`CR_TRIGGERED_BY`)."""
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(prog="deal_signal_detector.py")
+    parser.add_argument("root", nargs="?", default=None)
+    parser.add_argument("--workspace", default=None)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--fired-via", dest="fired_via", default=None)
+    parser.add_argument("--triggered-by", dest="triggered_by", default=None)
+    args = parser.parse_args(argv)
+    ws = args.workspace or args.root or "."
+    if not args.apply:
+        for c in detect_deal_signals(ws):
+            print(f"[{c['kind']:13s}] {c['org_name']:24s} — {c['evidence']}")
+        return 0
+    if args.triggered_by:
+        os.environ["CR_TRIGGERED_BY"] = args.triggered_by
+    result = run_deal_signal_job(ws, fired_via=args.fired_via)
+    print(json.dumps(result, default=str, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

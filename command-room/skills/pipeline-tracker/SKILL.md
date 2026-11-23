@@ -1,0 +1,427 @@
+---
+name: pipeline-tracker
+surfaces: both
+description: "Deal tracking on the workspace itself — capture a deal, watch the pipeline, move deals through lead / qualified / proposal_sent / negotiating, keep a dated next step on each, flag rot, close won or lost with a reason. Fires on: 'pipeline', 'show my pipeline', 'pipeline review', 'pipeline by stage', 'deals' (plural), 'show my deals', 'new deal', 'what deals are closing', '[Name] signed', 'closed the deal with [name]', 'we won the [deal]', 'we lost the [deal]', 'mark [deal] won / lost', 'move [deal] to [stage]', 'sent the proposal', 'deal is stalled', 'revenue in play', plus 'tune pipeline-tracker'. Ranked report with tiles and one-tap actions; an explicit win on a prospect org converts them to a client in the same turn. Does NOT fire on 'new prospect' / 'is now a client' (workspace-manager) or 'who went dark' (dormant-customer-scan); never claims bare singular deal."
+---
+
+## Entity-resolve enforcement (mandatory)
+
+Every name-bearing trigger ("move [deal] to [stage]", "mark [deal] won", "new deal with [org]", "[Name] signed") MUST call `shared/scripts/entity_resolve.py::resolve_all(workspace_root, query)` FIRST, per `shared/ENTITY_RESOLVE_PROTOCOL.md`. Deals are threads, so they resolve like any entity (`go [deal name]` works for free). **Multiple open deals on one org is a supported, normal shape** — when the resolver returns 2+ candidate deal threads for "move Acme to negotiating", use the disambiguation widget; NEVER first-pick (protocol rule).
+
+## Skill Boundary
+
+- **Use pipeline-tracker for:** the deal lifecycle — capture, stage moves, next steps, rot flags, won/lost closure, the pipeline report and digest. Pre-won, deal-shaped attention.
+- **Use `workspace-manager` for:** the org lifecycle — `new prospect [Name]` (org + engagement, no deal thread) and the administrative conversion verbs (`[Name] is now a client`, `promote/convert [Name] to client`). A deal is a thread ON an org; the org record stays workspace-manager's.
+- **Use `dormant-customer-scan` for:** post-won customers going quiet. An org can legitimately appear in both (a live deal AND dormant delivery work).
+- **Use `stalled-projects` for:** non-deal threads. It excludes `kind="deal"` threads by fence — deal rot reports here, with per-stage thresholds.
+
+## Writer Contract
+
+- **Reads:** `_hq/data/entities.json` threads/orgs (via `deal_state.list_open_deals` / `list_closed_deals` — defensive, wrapper-aware), events via `deal_state.load_deal_events` + `thread_activity.derive_thread_activity` with `honor_reclassifications=True` (recency — RECL1: corrections move contact activity with the event, so `days_quiet` is honest; NEVER the deprecated `thread.last_activity`), open commitments via `cru_match.load_open_commitments` **routed through `cru_match.split_pending_review(...)` — confirmed half only** (the next-step signal; INTAKE — a pending row marks a deal "has next step" off a guess and masks exactly the rot this skill exists to surface), `_hq/data/skill_config/pipeline-tracker.json`.
+- **Writes — ONLY through `shared/scripts/deal_state.py`,** the single writer of every `deal.*` field and every `deal_*` event (`deal_created` / `deal_updated` / `deal_stage_changed` / `deal_won` / `deal_lost`). It routes through `thread_writer` + `event_gate.append_event` internally. Hand-editing entities.json or hand-appending a deal event is forbidden — that is exactly how engagement labels became a free-text status store.
+- **Next steps are commitments** (D3): "next step: send revised proposal by Fri" is a standard `commitment` event with `primary_thread_id` = the deal thread. It closes ONLY via `commitment_state.close_commitment`. No parallel task concept, no `deal.next_step` field.
+- **Config** via `skill_config_writer` (`save_skill_config` / `get_config` / `wipe_skill_config`).
+- **Scan receipt (REQUIRED, every report fire):** `from receipts import log_receipt; log_receipt(WORKSPACE_ROOT, "pipeline-tracker", fired_via="manual", surfaced=n_open, extra_data={"flagged_thread_ids": [...], "untracked": n_untracked})` — the next fire reads it to dedup nags; value surfaces count the work.
+- If `load_deal_events` returns a non-empty `skipped` list, surface the standard banner ("I couldn't read N lines of saved history — the numbers below may be missing those") — never silently swallow it.
+
+## What It Does
+
+One place for every open deal: what stage it's in, how long it's sat there, whether it has a dated next step, what's rotting, what's closing this month, and what you've won and lost lately — computed from the workspace's own record of meetings, email, and commitments, not from fields someone remembered to update. High-stakes changes (stage, value, close) happen only when you say so; the numbers derive themselves.
+
+## First-Run Personalization (SPEC FRP1)
+
+Show-then-tune (STT), all three decisions. Read config through `get_config` — never the raw file.
+
+```python
+# Run the Access preamble first (CONTRACT Rule 22 v6, the block in shared/WORKSPACE_ACCESS.md): it resolves $PLUGIN_ROOT, exports CR_ENV, and cds there.
+import sys; sys.path.insert(0, "shared/scripts")
+from skill_config_writer import get_config, save_skill_config, wipe_skill_config, is_configured
+
+DEFAULTS = {
+    "rot_preset": "standard",   # standard (10/10/7/7 days by stage) | relaxed (15/15/10/10) | aggressive (7/7/5/5)
+    "digest": {"enabled": False, "day": "tuesday", "time": "08:00"},  # weekly digest preference — PROPOSED, never auto-registered
+    "value_capture": "exact_only",  # exact_only (ask for a number) | ranges_ok (accept 'about 30-50k' as a note, no money math)
+}
+cfg = get_config(workspace_root, "pipeline-tracker", DEFAULTS)
+```
+
+`rot_preset` maps to `deal_health` stage thresholds: standard = lead 10 / qualified 10 / proposal_sent 7 / negotiating 7; relaxed = 15/15/10/10; aggressive = 7/7/5/5. `digest.enabled` records the preference only — registration goes through enable-command-room-schedules' optional proposed set (Part 2), and only when at least one open deal exists; nothing is ever silently scheduled. `value_capture` controls whether a new deal without a number gets one follow-up ask; ranges are stored as a note in the deal's source field and contribute nothing to any dollar figure (never estimated).
+
+**Mode dispatch (4 modes):**
+
+| Mode | Trigger | Behavior |
+|---|---|---|
+| **Detect** (default) | "pipeline", "show my pipeline", "deals" | run the report with `cfg`. FIRST fire only (`not is_configured(...)`): `save_skill_config(workspace_root, "pipeline-tracker", DEFAULTS)` BEFORE rendering, then append the first-run footer. |
+| **Show settings** | "show pipeline-tracker settings" | render current config in plain English; no report. |
+| **Tune** | "tune pipeline-tracker", "tune the pipeline" | pre-filled re-questionnaire OR freeform (table below) → `save_skill_config(..., is_reconfigure=True)` → re-render. |
+| **Reset** | "reset pipeline-tracker to defaults" | `plan run_writer` naming `skill_config_writer:reset_skill_config` with `{"skill_name": "pipeline-tracker", "workspace_root": "<WS>"}` as its args (in-shell on a seat whose files are local: `reset_skill_config(workspace_root, "pipeline-tracker")`); say its `line` → next fire is a first-fire again. |
+
+**The first-run footer (chat text under the report, renders exactly once ever):**
+
+> *First time showing your pipeline. I set 3 defaults: **I flag a deal once it's quiet past its stage's usual window (about a week when it's late-stage, ten days early)** · **no weekly digest unless you want one** · **I'll ask for a number when a new deal doesn't have one**. Say "tune the pipeline" to change any, or just tell me ("flag deals sooner" / "stop asking for values").*
+
+**Freeform tune (natural language → config):**
+
+| User says | Config change |
+|---|---|
+| "flag deals sooner" / "be more aggressive" | `rot_preset = aggressive` |
+| "give deals more room" / "less naggy" | `rot_preset = relaxed` |
+| "send me the weekly digest" / "digest on Tuesdays" | `digest.enabled = True` (+ day if named) → surfaces the schedule PROPOSAL |
+| "stop the digest" | `digest.enabled = False` |
+| "stop asking for values" / "ranges are fine" | `value_capture = ranges_ok` |
+| "always get a number" | `value_capture = exact_only` |
+
+After applying: `save_skill_config(..., is_reconfigure=True)` + re-render + one-line confirm.
+
+## How to Use
+
+```
+"pipeline" / "show my pipeline"      → the ranked report
+"pipeline review"                     → same report, review framing (what moved, what's stuck)
+"pipeline by stage"                   → the count per stage, from the pipeline ledger
+"what deals are closing this month"  → the closing subset
+"new deal Acme pilot with Acme Co, [amount]"
+"move Acme pilot to negotiating"
+"mark Acme pilot won" / "mark Acme pilot lost — price"
+"Acme signed" / "closed the deal with Acme"   → win + prospect→client conversion in one turn
+"we lost the Beacon Logistics deal"
+"set the next step on Acme pilot: revised proposal by Friday"
+```
+
+## How It Works
+
+### The report ("pipeline" / "show my pipeline" / "pipeline review" / "deals")
+
+**Hard-gated bash — all math in code (Rule 22 preamble, run from $PLUGIN_ROOT):**
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+cd "$PLUGIN_ROOT" && python3 -c "
+import sys, json, datetime
+sys.path.insert(0, 'shared/scripts')
+import deal_state, deal_health, pipeline_math
+from thread_activity import derive_thread_activity
+from cru_match import load_open_commitments, split_pending_review
+ws = '<workspace_root>'
+opens = deal_state.list_open_deals(ws)
+closed = deal_state.list_closed_deals(ws)
+events, skipped = deal_state.load_deal_events(ws)
+activity = derive_thread_activity(ws, honor_reclassifications=True)  # RECL1
+open_cmts = split_pending_review(load_open_commitments(ws + '/_hq/data/events.jsonl'))[0]  # INTAKE — confirmed half
+next_step_ids = {c.get('primary_thread_id') for c in open_cmts if c.get('primary_thread_id')}
+today = datetime.date.today()
+# rot thresholds from cfg['rot_preset'] (standard/relaxed/aggressive map above)
+health = deal_health.compute_deal_health(
+    opens, activity_by_thread=activity, open_commitment_thread_ids=next_step_ids,
+    today=today, stage_thresholds=<preset map>, zombie_days=deal_health.zombie_threshold_days(closed))
+ranked = pipeline_math.rank_deals(health)
+tiles = pipeline_math.pipeline_tiles(opens, health, events, today)
+with open(ws + '/_hq/data/entities.json', encoding='utf-8') as f:
+    gap = pipeline_math.prospects_not_in_pipeline(json.load(f))
+print(json.dumps({'ranked': ranked, 'tiles': tiles, 'n_skipped': len(skipped),
+                  'gap': gap}, default=str))
+"
+```
+
+Render as the OUT2 ranked report (`shared/EXECUTIVE_OUTPUT_STANDARD.md` § "The ranked report"):
+
+1. **Tile band** — exactly `pipeline_math.pipeline_tiles` output, drop-empty (F-60): Open pipeline $ · Closing this month (n · $) · Stalled (n) · Won rate 90d (only at ≥4 terminal events — never a misleading 100%) · Weighted $ (only when ≥1 deal carries a forecast category). Values come from the SAME computation as the rows — never a second pass, never a prose re-count.
+2. **Scored rows, in `rank_deals` order exactly:** `rank · deal (org) · $tag · stage, Nd in stage · next step or ⚠ no next step · why-now · action`. The $tag comes from `quantify.money_time_tag` (deal value leads the trace); absent value = no tag, never an estimate. Why-now cites the flag evidence ("quiet 12d in negotiating — their usual reply gap is 3d"). A deal with zero open commitments renders `⚠ no next step` and ranks up — the single strongest predictor of a deal dying.
+3. **Untracked rows** (pre-existing deal threads with no stage tracking) render at the bottom with one-tap `track deal` adoption — never a rot alarm, never a crash.
+3b. **Reconciliation line (Part 2, D9.1)** — when `gap` is non-empty, ONE line under the rows: *"N prospect orgs aren't in the pipeline yet — [names, comma-joined, cap 5 + 'and K more']. The Sunday scan proposes them when they show deal signal, or say `new deal [name] with [org]` now."* The count and names come verbatim from `pipeline_math.prospects_not_in_pipeline` (the SAME coverage predicate the detector and the confirm handler use — never re-derive membership in prose). Zero gap → no line, no "all reconciled" filler. This line is visibility for the two-"prospect"-systems seam (org tag vs deal object), not a nag: it renders on the report only, never chases.
+4. **Widget:** `widget_mode: "all_batch_widget"` via `render_chat_output_widget`, posted via `widget_transport.render_and_persist` → `show_widget` (`transport["html"]` as `widget_code`) (`shared/CHAT_ACTION_WIDGET.md` § Transport), `source_skill: "cr-pipeline"` (the renderer stamps `src`). Per-item actions (all in `CANONICAL_ACTIONS` via the verb taxonomy): `move to [stage]` · `set next step [text]` · `mark won` · `mark lost [reason]` (reason REQUIRED — F-17 hold-with-reason) · `draft re-engagement` · `snooze 14d` · `skip`. Untracked rows carry `track deal` + `skip` only. Dispatch lives in apply-choices' `cr-pipeline` source entry. **Load the widget tool before anything else** (`shared/CHAT_ACTION_WIDGET.md` § Finding the widget tool first): on the merged and half-merged seats it is deferred, and a listed deferred tool counts as present; ToolSearch loads it, its setup tool runs first, then the relay.
+5. **Docx on request** ("pipeline report as a doc") via `brief_writer.make_brief(brief_kind="ranked_report", ...)` — CONTRACT Rule 27: never a .md deliverable. The tile-band section additionally carries the **stage-mix donut** (SPEC OUT3): attach `charts: [{"kind": "donut", "data": {"slices": pipeline_math.stage_mix(opens)}, "title": "Pipeline by stage"}]` — slices come verbatim from `stage_mix` (counts per stage, zero stages dropped, reader-facing labels), NEVER hand-counted. Skip the key when `stage_mix` returns fewer than 2 slices. It renders best-effort inside `make_brief` (`charts.try_chart_png`): a refused shape or no rasterizer on this machine = the report renders exactly as before (selection rules: `shared/CHART_SELECTION.md`). Then the OUT2 §3 visual pass (`visual_gate.render_preview` → 7-item checklist → fix at most once → `log_visual_gate`). Surface the file as an H2 heading link LAST in the turn via `chat_output_renderer.doc_headline_link(label, brief_path.get_brief_artifact_url(absolute_path))` — never a plain-text path, never a hand-built URL (CONTRACT Rule 3).
+6. **Receipt** (Writer Contract above) + the skipped-lines banner when `n_skipped > 0`.
+
+**File card first (CONTRACT Rule 3, owner ruling 2026-11-03).** Every file this turn made, this document included, comes back in the chat as a file card before the summary and before any link: call `SendUserFile` with the file and `display: "render"` (load it through the host's tool search when it is not in the tool list yet; a tool that has to be loaded is present, not absent). On a merged seat the card tool runs in this chat and cannot read the customer's computer, so stage the landed file into this session's own scratch first (the device staging tool, or the staged copy `plan_delivery` makes) and card that copy; never hand the card tool a path on the customer's computer, and never paste the file's bytes as text. Only where this chat has no file-card tool at all does the link or the saved-to line stand in for the card, and then `deliverables.card_absent_line()` is said once, in plain words, under it. A path in words is not delivery.
+
+**When the docx renders, `make_brief` is the only way it renders (DOCFENCE1):**
+
+- **NEVER hand-roll the report** with the generic `anthropic-skills:docx` skill, `python-docx` directly, or docx-js. Those paths bypass every gate and ship a substandard or PII-leaking pipeline report (the v3.20.0 failure mode) — and deal values plus customer names are exactly the payload the leak scan exists for.
+- **NEVER create, render, copy, upload, or update the report — or any part, derivative, or restatement of it ("talking points", "a summary", "just the deal list") — through Claude Docs (the built-in docs / artifact page), Google Docs, Google Drive, or ANY other document/file connector** (Slides, Sheets, Notion, OneDrive, Dropbox: the ban is on the connector delivery path, not one vendor's API quirk). It fails twice at once: the connector path bypasses every gate above, AND a connector-created file lands at that connector's default location with no folder control — for a Google Doc, and for a parentless Drive upload of the canonical `.docx` itself, that is My Drive root (the 2026-07-24 root-drop incident). Not exceptions: "for mobile", "for sharing", "so the team can edit it", "as a copy alongside the canonical file" — **nor a direct instruction**: "put the pipeline in a Google Sheet" is a request this gate refuses, not an override. Hand back the canonical file's link; the widget is the edit surface.
+
+Zero open deals: *"No open deals tracked yet. Say 'new deal [name] with [org]' to start one."* — no tile band, no empty frames.
+
+### "pipeline by stage" (the count per stage, from the pipeline ledger; cr1#1018)
+
+A count of open deals per stage is answered from the pipeline ledger (`shared/scripts/ledgers.py`, rebuilt by the daily `number-ledgers` Maintenance job), never by counting deals by hand and never from the ranked report above. Render this one call with `workspace_access.py plan run_helper --json '<it>'` and paste what it prints, verbatim:
+
+```bash
+cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_helper --json '{"args": {"workspace_root": "<WS>"}, "name": "ledgers:pipeline_by_stage"}'
+```
+
+- Render the envelope's `result.text` verbatim: each stage with its count, each deal with the date it entered the stage and its last touch, deal threads with no stage listed as such, and the Sources at the end. Keep the Sources.
+- No money. This answer carries no value, currency or forecast, and none is added from the report, the tiles or the deal records.
+- The stage is the one typed on each deal, kept for the pipeline by the owner's ruling; the last touch is worked out from activity.
+- When `result.counted_from_log` is true, the text already says in one sentence that it was counted from the log because the ledger was older; keep that sentence.
+- `ok:false` is a stop: one sentence, per the preamble's rule 6.
+
+### "new deal [name] with [org], $[value]"
+
+1. `resolve_all` the org. Unresolved → offer `new prospect [Name]` first (workspace-manager owns org creation — a deal needs a real org). Ambiguous → disambiguation widget.
+2. Parse value if stated. `value_capture: exact_only` and no number → one follow-up ask ("Got a number for it? Fine to skip."); `ranges_ok` → store the range text in the deal's source note, value stays empty.
+3. **Hard gate — run the block, never hand-write entities.json:**
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+cd "$PLUGIN_ROOT" && python3 -c "
+import sys
+sys.path.insert(0, 'shared/scripts')
+import deal_state
+t = deal_state.create_deal('<workspace_root>', name='<deal name>', org_id='<resolved org id>',
+                           value=<number or None>, expected_close=<ISO date or None>,
+                           source=<free text or None>, source_skill='pipeline-tracker')
+print('DEAL_CREATED ' + t['id'] + ' stage=' + t['deal']['stage'])
+"
+```
+
+   The `DEAL_CREATED` line is the proof (thread + `deal_created` event through the gate). The org record is NOT touched — a new deal on a prospect changes nothing about the org.
+3b. **The org already has an open deal (ENTITY1 §4c) — propose, never traceback.** The block above raises `thread_writer.DuplicateDealError` when a non-archived, un-closed deal thread already hangs off that org. Catch it. The exception carries `.existing` (the live deal thread — `id`, `canonical_name`, and its nested `deal` object with `stage` / `value`); NEVER print the exception text or a Python traceback to the user (Output guard below). Say what already exists and offer the two real moves:
+
+   > *"Acme Co already has an open deal: **Acme pilot**, proposal sent, an amount. Want this folded into that one, or are these genuinely two separate engagements?"*
+
+   - **Fold in** (the default, and what most repeat asks mean) → don't create anything. Apply the new details to the existing thread: value / expected close / source via `deal_state.update_deal(ws, <existing id>, value=…, expected_close=…)`, a stage move via `deal_state.set_stage`, a stated next step as a commitment on `.existing['id']`. Ack as an update, not a create: *"✓ Folded into Acme pilot, value now an amount."*
+   - **Two engagements** (explicit user confirmation only — a second product line, a separate region, a genuinely parallel pursuit) → re-run the block with `skip_dedup=True` added to the `create_deal(...)` call. That flag belongs to the user's answer; never set it to make the error go away, and never retry with it automatically.
+   - If the existing deal actually ended and nobody closed it, the close verbs are the fix — `mark [deal] won` / `mark [deal] lost — [reason]` — then open the new one. A closed deal never blocks (repeat business is not a duplicate).
+4. Ack in plain English: *"✓ Acme pilot opened, lead stage, an amount. Give it a next step? ('revised proposal by Friday' works.)"* A stated next step becomes a commitment on the new thread.
+
+### "move [deal] to [stage]"
+
+Resolve the deal (disambiguate on 2+), then `deal_state.set_stage(ws, thread_id, '<stage>', source_skill='pipeline-tracker')`. Backward moves are allowed — deals regress; the event records direction and days-in-stage resets. Invalid stage names get the four real ones offered in plain words ("Stages are Lead, Qualified, Proposal sent, Negotiating — won/lost are closes: say 'mark [deal] won'"; labels from `deal_state.STAGE_DISPLAY` — the snake_case wire ids never render, UXC1). Untracked deal thread → offer `track deal` adoption first (`deal_state.adopt_deal`).
+
+### "mark [deal] won" · "mark [deal] lost — [reason]" · "[Name] signed" · "we lost the [deal]"
+
+ALL closes go through `deal_state.close_deal` — the single closure path. Idempotent: `already_closed` is acked honestly ("that one was already closed — nothing changed"), never re-appended.
+
+- **`mark [deal] won`** → `close_deal(ws, thread_id, 'won', source_skill='pipeline-tracker')`. **DEALNAG1 / M ruling 4 (2026-09-03): when the deal's org is still a prospect, the close PROMOTES it — `close_deal` runs `org_promotion.promote_org` itself, with an `org_promoted` receipt and a standing undo.** The return carries `promoted: True`; the ack says so in one line and offers the reversal: *"✓ Won. Acme Co is a client now — say `undo` if that's wrong."* Do not ask; a question about a fact just written down was the defect this ruling removes. When `promoted` is False the return still carries `conversion_suggestion` (the promotion was skipped — most often no primary-focus org is set); render it verbatim as before: *"✓ Won. Acme Co is still marked a prospect — say `Acme Co is now a client` and I'll convert them."* Never flip the org by hand from this verb — the writer path does it or nothing does.
+  - **One rule for reversing a win (CLOSETRUTH1 3.2 / M's ruling 5, 2026-09-13): undo reverses all of it.** Whether the win rode a promotion or stood alone, and whether the deal was already on the books or `mark [org] won` opened it, a single `undo` puts the deal back at the stage it was at, the project back to the status it had, the org back to prospect, and the win out of the closed-deals list and the 90-day rate. There is no half reversal and never was a “the deal stays won” case — the 2026-09-13 walk left a closed-won deal with nothing paid or signed standing on the book after the person reversed the act that made it, and that is the defect this rule closes. Never tell a person a win cannot be reversed; `undo`, or the batch the act advertised, is the whole answer.
+  - **`mark [org] won` when `[name]` resolves to an ORG with NO open deal thread (CUTB item 3, 2026-09-06 — the v5.28.0 attended test saw the chat invent a deal from a detector proposal and close it in the same breath, with no receipt, no CHANGED line and no undo).** Do NOT build a deal by hand and do NOT hand the turn to `[Name] is now a client`. Run `deal_state.win_org_without_deal(ws, <org_id>, source_skill='pipeline-tracker')` — it opens the deal openly (stage lead, its `source` names this path), closes it won and promotes the org through the SAME receipted path (`org_promoted` carries `deal_manufactured`, the thread id and the won event's seq). Render the return's `ack` VERBATIM — it is the receipt: *"No deal was on file for Acme Co, so I opened one and closed it won. Acme Co is a client now — say `undo` to put it all back."* `undo` reverses ALL of it: the org back to prospect, the engagement edge, the manufactured thread archived, and the won event marked reversed for the closed-deals list, the won-rate tile and this report (CUTB item 4). Honest no-ops, nothing written: `has_open_deal` (the org DOES have an open deal — close THAT one with the ordinary `mark [deal] won`, naming it; two or more → ask which), `already_closed` (*"Acme Co was already marked won — closed Aug 18. Nothing changed."*), `already_client` (a client with no deal on file: *"Acme Co is already a client — nothing to mark. Say `new deal [name] with Acme Co` if you want the deal on the books."*), `no_primary_focus` (no primary-focus org is set — checked BEFORE anything is written, so no deal is ever manufactured that the promotion then cannot follow; render the return's `ack` verbatim: *"Nothing on file for Acme Co and no primary-focus org is set, so I did not open a deal — tell me which of your orgs this client is for first."*). `mark [org] won` is the person's own word, so it runs `convert_prospect=True` like `[Name] signed`: a prior `undo` of an AUTOMATIC promotion never blocks it, and the promotion it makes has its own batch and `undo`. Never a second manufactured deal.
+- **`[Name] signed` / `closed the deal with [Name]` / `we won the [deal]`** — the user-explicit win declaration (D6): resolve the org's open deal thread (2+ → disambiguate; the org-level phrasing usually means the furthest-along deal — confirm, don't guess), then `close_deal(ws, thread_id, 'won', convert_prospect=True, ...)`. On a prospect org this closes the deal AND converts it — **since CUTB item 3 (2026-09-06) the explicit conversion runs through the SAME receipted, undoable path as the automatic one** (`org_promotion.promote_org` with `explicit=True`: an `org_promoted` receipt, a batch id, the brief's one CHANGED line "Promoted 1 prospect to client … say `undo`"; the person's own word overrides a standing undo of an earlier automatic promotion). One utterance, one result, acked as one line WITH the reversal: *"✓ Acme pilot won — and Acme Co is a client now. Say `undo` if that's wrong."* If the org resolves but NO open deal thread exists, this is the `mark [org] won`-with-no-deal case above: `deal_state.win_org_without_deal(...)`, ack verbatim — never a hand-built deal, never a silent conversion.
+- **`mark [deal] lost` / `we lost the [deal]`** → a loss reason is REQUIRED. If not stated, ask once with the fixed list (no decision · price · competitor · did it themselves · timing · bad fit · other) — `no_decision` first; most losses are indecision, not a rival. Then `close_deal(ws, thread_id, 'lost', loss_reason='<enum>', loss_note='<their words>')`. Thread archives; the loss shows up in board-pack concerns and the loss-pattern readout.
+- **Value stated at close** ("closed at 35") → pass `value=35000`; never infer a unit — confirm ambiguous magnitudes.
+
+### "set the next step on [deal]: [text]"
+
+A standard commitment capture with `primary_thread_id` = the deal thread and an EXPLICIT `data.kind` (Gate 21 — never rely on the gate's default): `promise` when the step involves a counterparty ("send the revised proposal to Acme by Fri" — enters chase), `task` when it's purely the user's own move with nobody owed. Owner = the user unless they name someone. Dated next steps get chased by the existing commitment machinery — nothing new; closure only via `commitment_state.close_commitment`. This clears the `⚠ no next step` flag on the next render.
+
+### Detector-observed signals (Part 2 — LIVE, propose-and-confirm only)
+
+The deal-signal detector (`shared/scripts/deal_signal_detector.py`) is the observed lane: stage markers, won language, money amounts on open deals, and — D9.1 — deal GENESIS (a sales-typed meeting or pursuit language on a prospect/client org with no deal coverage proposes `deal_created(lead)`). It runs Sundays as the `deal-signals` maintenance job and, scoped to the meeting's own orgs, as a meeting-notes / follow-up-ritual post-step. Every signal flows through `brain_proposals.propose(tier="confirm")` → the Staff Meeting / brain confirm card → apply-choices → `deal_state`. NOTHING observed ever auto-writes a deal field — only a user confirm (or an explicit user utterance above) moves a deal. This skill never runs the detector inline during a report fire; the report reads what's already tracked plus the reconciliation line.
+
+### The weekly digest (`pipeline-digest` — optional scheduled chat, Part 2)
+
+**RETIRED (SPEC TASKRET1, M's ruling 2026-08-17) — READINESS class.** The weekly Tuesday 8 AM chat is gone: the digest reports on tracked deals, and deal tracking is being rebuilt underneath it, so a weekly report against a baseline about to move is noise. `pipeline-digest` is out of `DEFAULT_SCHEDULES`, its `PROPOSAL_THRESHOLDS` row is deleted, and `references/orchestrator-pipeline-digest.md` is now a retirement stub. Never propose it, never register it, and never tell the customer it can be scheduled.
+
+**None of that touches the report itself.** The digest was always the SCHEDULED CALLER of one computation path — this section — and only the caller went. "Show me the pipeline" runs the identical tile band, ranked rows and top-3 moves on the spot, and the Staff Meeting remains the sole adjudication door (FB-20). If the customer asks for a weekly digest: say the scheduled version is off while deal tracking is rebuilt, that they can ask for the report any time, and what brings the chat back — `schedule_config.retirement_line("pipeline-digest")` is that sentence, verbatim.
+
+`digest.enabled` stays a PREFERENCE record that never registered anything and still doesn't. Leave any stored value alone; do not rewrite a customer's stored preference from a retirement, and do not read a stored `true` as licence to schedule.
+
+## Executive Output Standard (EXEC1)
+
+Inherits `shared/EXECUTIVE_OUTPUT_STANDARD.md`. The chat lead is the quantified count line, not a theme: *"6 open · [amount] · 2 stalled · 2 closing this month."* Exec header on the docx path: verdict = the headline pipeline number; CHANGED = moves since the last receipt; DECIDE = the one deal to push today; NEEDED = the top one-tap. Money via `quantify` only, no estimation.
+
+**Output guard:** no internal tokens, paths, event names, entity ids, or version numbers in anything the CEO sees (`shared/VOICE_CALIBRATION.md` § Plain-language glossary).
+- Bad: "deal_stage_changed appended for project_017."
+- Good: "✓ Acme pilot moved to negotiating — day 1 of the clock."
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## Gotchas
+
+- **Two open deals, one org, is normal.** Disambiguate by deal name; never first-pick, never merge them.
+- **`deal.stage` is a word, not a number.** The integer `stage` on threads is the project-lifecycle field — never write sales stages into it (`deal_state` and `thread_writer` both reject drift).
+- **Won/lost are not stages.** "move Acme to won" routes to the close path, with the reason flow for losses.
+- **Never estimate a value.** No number = no money tag, no tile contribution. Ranges live in the source note.
+- **Won-rate needs a floor.** Under 4 closes in 90 days the tile drops — a 1-for-1 quarter is not "100%".
+- **Untracked deal threads are data, not errors.** Pre-existing deal threads without stage tracking render as adoption offers.
+- **Recency is observed, not asserted.** Rot keys on real contact from the event log — editing a field never resets the clock.
+
+## What It Doesn't Do
+
+- Doesn't create orgs — `new prospect` / `new org` (workspace-manager) own that; a deal needs an existing org.
+- Doesn't convert prospects on its own judgment — conversion happens only on the user's explicit win declaration (D6) or workspace-manager's administrative verbs. Observed signals never auto-flip anything.
+- Doesn't chase next steps itself — commitments do ('show waiting' or Commitments in the Hub's Work tab, chase drafts, snooze machinery all come free).
+- Doesn't draft the follow-up email — `draft re-engagement` hands to email-writer (lazy, draft-never-send).
+- Doesn't read QuickBooks — no QBO dependency anywhere; deal values are user-stated.
+- Doesn't auto-register the weekly digest — the digest is proposed through the schedule setup's optional set, never silently registered.
+
+## Narration leak scan (CUT-C item 8 — MANDATORY on every composed line)
+
+Widget bodies are scanned inside `widget_transport.render_and_persist`; the PROSE this skill composes around them is not, unless this step runs. Before posting any sentence you composed — an ack, a header, a summary, a pointer, a "why" line — run `validate_chat_output(<the text>)` from `chat_output_renderer.py` (`shared/scripts/`). It raises `LeakDetectedError` on a raw id (`person_NNN`, `project_NNN`, `org_NNN`, a `cmt_` / `bp_` / `pcand:` wire id), an event or field name, a file name or path, or a score. ABORT the post and rewrite the sentence with the entity's name (`narration_names.humanize(text, narration_names.name_index(<WORKSPACE>))` is the one substitution). NEVER catch the error and post anyway. Text relayed byte-exact from a driver or the transport is already scanned and is not re-composed.
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill. The routing metadata is budget-capped by the platform (G11); routing correctness is enforced mechanically by tests/triggers.yaml. Everything below remains binding at fire time.
+
+> Deal tracking built on the workspace substrate — capture, stage, next-step, rot, and close every deal from the workspace's own activity record. Use when the CEO says 'pipeline', 'show my pipeline', 'show the pipeline', 'pipeline review', 'deals', 'show my deals', 'my deals', 'open deals', 'what deals are closing', 'what deals are closing this month', 'deals closing this month', 'revenue in play', 'new deal', 'new deal [name] with [org]', 'track this as a pipeline deal', 'track deal', 'move [deal] to [stage]', 'mark [deal] won', 'mark [deal] lost', 'mark won', 'mark lost', 'we won the', 'we lost the', 'closed the deal with', 'signed' ('[Name] signed' — the explicit win declaration; deal-won on a prospect org converts them in the same turn per the single-closure fence), 'sent the proposal' (stage nudge phrasing), 'deal is stalled', 'deal is stalling', 'which deals are stalling', 'set the next step on', 'loss reasons', 'why are we losing deals'. Also handles first-run personalization settings — use when the CEO says 'tune pipeline-tracker', 'tune the pipeline', 'show pipeline-tracker settings', 'reset pipeline-tracker to defaults'.
+
+> Fences (one per line — each stays with its owner):
+> DOES NOT fire on 'new prospect' (workspace-manager — org + engagement, no deal thread).
+> DOES NOT fire on 'is now a client' / 'promote to client' / 'convert to client' (workspace-manager — the administrative conversion verbs; when the org has an open deal, its handler routes through this skill's closure path).
+> DOES NOT fire on 'who went dark' / 'dormant customers' (dormant-customer-scan — post-won customers).
+> DOES NOT fire on 'stalled projects' (stalled-projects — non-deal threads; it excludes deal threads by fence).
+> DOES NOT fire on 'who owes me money' (deliberately unowned — AR is not pipeline; AR proper stays gated on an accounting connector).
+> DOES NOT fire on 'brief me on the' (catch-all topic brief).
+> DOES NOT fire on 'add pipeline digest' (change-schedule — which now REFUSES it warmly: the weekly digest chat is retired as of TASKRET1, and change-schedule owns that refusal so the wording comes from the registry. This skill never registered anything and still doesn't).
+> DOES NOT fire on a chart-verb ask — 'chart', 'graph', 'plot', 'visualize', 'visualise', 'trend' anywhere in the phrase (chart-on-demand — the chart verb makes it a chart ask, drawn via charts.py; the bare pipeline status stems here own the report ask, SPEC OUT3B §4; verb-level rather than exact-phrase per second-eyes 2026-07-19 — exact phrases left chart-revenue-in-play / visualize-the-pipeline colliding 2-ways, and quoting those phrase mentions here would leak them past the 400-char negative window as stray positives).
+> Never claims these bare tokens (deliberately NOT quoted triggers here; each stays with its owner or unowned): deal (singular), lost, move, update, kill, proposal, where are we with.
+
+> Loose-status handoff: *where are we with the [name] deal* stays workspace-manager's catch-all; its ladder hands the turn here when ENTITY_RESOLVE lands on a deal thread. `go [deal name]` navigation stays workspace-manager's.

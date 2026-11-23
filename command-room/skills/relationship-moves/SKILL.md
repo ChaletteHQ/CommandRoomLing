@@ -1,0 +1,182 @@
+---
+name: relationship-moves
+surfaces: both
+description: "The weekly proactive outreach surface: the top 3 people worth reaching out to THIS week, each with last touch, an evidence-cited why-now, and a pre-drafted opener in the CEO's voice. Fires on: 'relationship moves', 'who should I reach out to' / 'who should I reach out to this week', 'weekly outreach'. Ranks on a code-computed blend of dormancy, live-thread leverage, and overdue commitments; on demand only (the Sunday task is retired). Does NOT fire on 'who went dark' (dormant-customer-scan — raw detection this skill consumes), 'warm threads to revive' (dormant-customer-scan — its threads lens), 'follow up with [name]' (follow-up-ritual), or 'balance check' / 'my white space' / 'plan a date night' (retired Balance phrases — workspace-manager; a spouse or parent never appears here). The line: scans DETECT; this RANKS and hands you drafts."
+---
+
+# Relationship Moves — the weekly outreach action pack
+
+One widget, top 3 people worth reaching out to this week, each with a pre-drafted opener. Not a detection report (that's dormant-customer-scan — people lens and threads lens) — this RANKS their signals and hands the CEO ready-to-send drafts.
+
+## Skill Boundary (v2.1)
+
+- **Is:** a ranked, pre-drafted action pack. The differentiator vs the detection skills is the opener-in-your-voice + the weekly batch framing.
+- **Is NOT** `dormant-customer-scan` (the raw "who's gone quiet" report — its people lens, or its threads lens, formerly `thread-resurrection`). This skill CONSUMES their normalized `dormancy_signal` events and turns the top 3 into drafts.
+
+## Ranking is CODE, never prose math
+
+All ranking comes from `shared/scripts/relationship_moves.py` `compute_relationship_moves(...)`:
+
+```
+score = 0.5 × normalized_dormancy + 0.3 × thread_context + 0.2 × min(overdue_days/10, 1)
+```
+
+`compute_relationship_moves` loads normalized dormancy signals (`dormancy.load_dormancy_signals`, last 14 days, max-score per entity), folds each thread into its counterparty person (one card per human), computes overdue commitments from `cru_match.load_open_commitments`, dedupes anyone already emailed/suggested in the last 7 days or snoozed/dismissed, and returns ≤3 candidates. It NEVER pads below the real candidate count. You do not compute scores in prose.
+
+## Behavior
+
+### Step 1 — Entity-resolve + live-check gate (MANDATORY)
+
+Resolve the workspace per `shared/CONTRACT.md` Rule 22. Then, per candidate, you MUST call `shared/scripts/live_contact_check.py::live_contact_check()` before surfacing — inherit the `dormant-customer-scan` live-check MUST-language verbatim: NO dormancy-driven outreach from substrate-only data. Drop any candidate the live check un-dormants (a recent touch the substrate missed) — EXCEPT candidates whose rank is carried by overdue commitments (overdue component >= dormancy component in the blend): an overdue item is still overdue after a recent touch, so keep the card and cite the recent touch in the why-now line instead of pitching re-engagement.
+
+**Meetings count as contact (BUG-8244).** `dormancy.load_dormancy_signals` now folds every meeting-binding variant (including email-shaped attendee fields) into its contrary-evidence gate, so a person the user actively MEETS no longer ranks as dormant off stale signals — the failure that once pre-drafted a "we haven't talked in a while" opener about someone the user holds weekly 1:1s with. The live check stays mail/Slack-scoped; recent meetings are the substrate's job, and a candidate whose only "dormancy" is a missing meeting binding never reaches Step 2 in the first place.
+
+### Step 2 — Compute the ranked candidates
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+cd "$PLUGIN_ROOT" && python3 -c "..."
+```
+
+```python
+import sys; sys.path.insert(0, "shared/scripts")
+from relationship_moves import compute_relationship_moves
+# thread_totals: pass {} UNLESS the threads lens (dormant-customer-scan, formerly
+#   thread-resurrection) Phase 2 already ran in THIS
+#   session — then reuse its per-counterparty totals verbatim (commitment +3,
+#   project +2, relationship-tier +2/+1, multi-turn <=+3, direction +1). Never
+#   recompute thread scores ad-hoc inside this skill; {} simply zeroes the
+#   thread_context term and the blend renormalizes.
+moves = compute_relationship_moves("<abs workspace root>", top_n=3, thread_totals=thread_totals)
+```
+
+`compute_relationship_moves` appends one `relationship_move_suggested` event per returned candidate (you do not write it yourself).
+
+### Step 3 — Draft the top-3 openers (email-writer chain)
+
+For each candidate, draft an opener in the CEO's voice via the email-writer chain (intro-broker pattern): build a voice corpus from the CEO's prior `email_drafted` events to this person, fall back to the email-writer Voice Block + the two-step protocol. Seed the opener with the threads-lens revival hook (dormant-customer-scan, formerly thread-resurrection) when a thread anchors the candidate, else the people-lens suggested angle. Drafts are NEVER auto-sent.
+
+### Step 4 — Render ONE widget
+
+Render one `all_batch_widget` per `shared/CHAT_ACTION_WIDGET.md`. Per item:
+- person name + the thread topic as the title
+- `context_tag` = "last touch [date] · [N] days ago"
+- `body_lines` = the why-now line citing real evidence (e.g. *"you owed them a pricing answer since Feb; they announced funding Mar 12"*) + the blockquoted opener
+- `metadata` = `[["To", email], ["Subject", subject]]` (email-shaped — required for the data-shape validator)
+- actions `["N send", "N draft", "N snooze 3d"]` (use `add email then send` when no address is on file)
+
+All verbs are already in `CANONICAL_ACTIONS` — no renderer change. The `send`/`draft` clicks dispatch through apply-choices into email-writer's Phase 5/6 (`email_drafted` + `email_sent` with `draft_event_seq` linkage) — do NOT reinvent the send lifecycle. Put the Links section after the widget, then STOP (the widget is the entire turn).
+
+**Ranked-report layout (SPEC OUT2 §4 — this pack is one of the four ranked-report surfaces; contract in `shared/EXECUTIVE_OUTPUT_STANDARD.md` § "The ranked report").** The widget above maps to the contract — align, don't duplicate: open the widget with the shared **tile summary band** (components.py fragment) derived from the SAME ranking computation — **worth a touch** (candidate count) · **days quiet** (median gap across the 3) · **owed** (count with an overdue commitment component); drop-empty per F-60, and with fewer than 2 real tiles skip the band entirely (a one-tile band is noise on a 3-item pack). Each item IS the scored row: rank (widget position) · name · quantify tag (the days-quiet + overdue-commitment component, code-computed, never an estimate) · why-now (the evidence line) · action (send / draft / snooze 3d). The widget's actions are the ask block (one-ask-surface) — never a prose twin. No synthesis lead: ranked lists lead with the count line.
+
+**Output guard:** no internal tokens, paths, event names, or version numbers in anything the CEO sees — vocabulary per `shared/VOICE_CALIBRATION.md` § Plain-language glossary.
+- Bad: "last touch [date] · [N] days (dormancy_signal score 0.72)"
+- Good: "last touch Feb 3 · 47 days ago"
+
+### Fewer than 3 / zero candidates
+
+Render fewer when fewer qualify — NEVER pad with sub-threshold candidates (padding manufactures outreach pressure from noise). Zero candidates → render the `all_clear_summary` data view (the orchestrator-dont-forget all-clear pattern), never hand-built HTML.
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## What this skill does NOT do
+
+- Does not detect dormancy itself — it consumes the normalized `dormancy_signal` events the detectors emit.
+- Does not auto-send — `send` is always a user click.
+- Does not pad to 3 — it surfaces only real candidates.
+- Does not suggest the CEO reach out to HIMSELF. The resolved primary user is dropped from the candidate set in code (`relationship_moves.compute_relationship_moves`, LIFECYCLE1 §7c) — the overdue-commitment term alone used to carry his own record over the threshold, and the 2026-08-03 pack duly told him to nudge himself. If you ever see the CEO's own name in this pack, that is a defect to report, never a row to render.
+- Does not double-surface someone already emailed/suggested this week (7-day dedupe) or snoozed/dismissed anywhere — including a `dont_forget_snooze` written by the retired Pulse chat, which `_recently_excluded` still honours as fossil history.
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> The weekly proactive outreach surface: the top 3 people worth reaching out to THIS week, each with last touch, a one-line why-now citing real evidence, and a pre-drafted opener in the CEO's voice — actionable via send / draft / snooze 3d buttons. Ranks on a code-computed blend of normalized dormancy (the cooling relationship), live-thread leverage, and overdue commitments. Fires as a Sunday-evening scheduled task and on demand. Triggers: 'relationship moves', 'who should I reach out to', 'who should I reach out to this week', 'weekly outreach'. DOES NOT fire on 'who went dark' / 'dormant customer scan' / 'quiet customers' / 'who hasn't replied in a while' (that's dormant-customer-scan — the raw detection report, not a ranked pre-drafted action pack). DOES NOT fire on 'thread resurrection' / 'warm threads to revive' (that's dormant-customer-scan — its threads lens, formerly thread-resurrection; thread-granularity). DOES NOT fire on 'follow up with [name]' (that's follow-up-ritual — a single named follow-up). DOES NOT fire on 'balance check' / 'how's my white space' / 'plan a date night' (the retired Balance phrases, cr1#552 — workspace-manager answers them in one line; `tie: "personal"` people are dropped from this skill's candidate set at the load/score boundary, BAL1 D1.1, and belong to Balance exclusively). The line: dormant-customer-scan and thread-resurrection DETECT; relationship-moves RANKS the detections and hands you drafts.

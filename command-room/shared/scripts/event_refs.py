@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Canonical dual-layer extraction of thread + person references from events.
+
+THE PROBLEM THIS SOLVES (deep-audit + brain-substrate-drift audit, 2026-05):
+events.jsonl is schema-heterogeneous. Newer events carry references at the
+TOP level (`primary_thread_id`, `person_ids`); older `workspace-ingest`
+backfill carries them NESTED under `data` (`data.project_id`,
+`data.person_ids`). A scan that reads only one layer silently under-reads the
+other — which is exactly how a prior linkage table came out ~10x low on
+thread-links and how downstream consumers miss real involvement.
+
+Every consumer that needs "which threads/people does this event touch" MUST
+import `threads_of` / `persons_of` from here, so producer and consumer never
+drift on where the reference lives. Verified to reproduce the corrected C5
+linkage table against the live 2,453-event substrate.
+
+stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+
+def threads_of(ev: dict) -> set[str]:
+    """Every thread/project id this event references, across both schema
+    layers (top-level + nested `data`) and both the singular and list forms,
+    including soft `related_thread_ids` cross-refs."""
+    out: set[str] = set()
+    d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    for k in ("primary_thread_id", "thread_id", "project_id", "primary_project_id"):
+        if ev.get(k):
+            out.add(ev[k])
+        if d.get(k):
+            out.add(d[k])
+    for k in ("related_thread_ids", "thread_ids", "related_project_ids"):
+        for r in (ev.get(k) or []):
+            out.add(r)
+        for r in (d.get(k) or []):
+            out.add(r)
+    return {t for t in out if isinstance(t, str) and t}
+
+
+def persons_of(ev: dict) -> set[str]:
+    """Every person id this event references, across both schema layers and
+    every observed person-bearing field (owner/requester/attendee/etc.).
+    Filtered to ids that look like `person_*` so a stray org/thread id in a
+    shared slot can't leak in."""
+    out: set[str] = set()
+    d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    for r in (ev.get("person_ids") or []):
+        out.add(r)
+    for r in (d.get("person_ids") or []):
+        out.add(r)
+    for k in ("person_id", "owner_person_id", "requester_person_id", "inferred_person_id"):
+        if d.get(k):
+            out.add(d[k])
+    for k in ("attendee_person_ids", "counterparty_person_ids", "people",
+              # BUG-8244: canonically these carry emails, but pre-spec
+              # improvised writers sometimes put person ids in them — the
+              # person_ prefix filter below keeps emails out.
+              "attendees", "attendee_emails", "invitees"):
+        for r in (d.get(k) or []):
+            out.add(r)
+    for k in ("owner_id", "requester_id", "target_id"):
+        v = d.get(k)
+        if isinstance(v, str) and v.startswith("person_"):
+            out.add(v)
+    return {p for p in out if isinstance(p, str) and p.startswith("person_")}
+
+
+def attendee_emails_of(ev: dict) -> set[str]:
+    """Every attendee EMAIL this event carries, lowercased (BUG-8244).
+
+    Meeting events historically forked across field names: `data.attendees`
+    (emails — historical-backfill; also the canonical builder's home),
+    `data.attendee_emails` (meeting_discovery's substrate replay), and
+    `data.invitees` (observed drift). Entries without an "@" are skipped —
+    `data.attendees_external` and name-drift never leak into an email set."""
+    d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    out: set[str] = set()
+    for k in ("attendees", "attendee_emails", "invitees"):
+        for a in (d.get(k) or []):
+            if isinstance(a, str) and "@" in a and a.strip():
+                out.add(a.strip().lower())
+    return out
+
+
+def meeting_person_ids(ev: dict, email_index: dict | None = None) -> set[str]:
+    """THE meeting→person binding reader (BUG-8244). Folds every variant the
+    substrate has ever carried into one person_id set:
+
+      * top-level `person_ids` / `data.person_ids`   (canonical + ingest)
+      * `data.attendee_person_ids`                   (PASSIVE_CAPTURE legacy)
+      * `data.attendees` / `data.attendee_emails`    (emails — resolved when
+        the caller supplies `email_index`, built via `email_person_index`)
+
+    Before this existed the two resolution helpers covered DISJOINT field
+    sets (`cru_match._PERSON_ID_FIELDS` probed `data.attendees` emails as ids
+    — a branch that never once matched; `persons_of` skipped emails entirely),
+    so no writer shape satisfied every reader. Every consumer that asks
+    "who was in this meeting" imports THIS, so producer and consumer can
+    never drift again. Repair-on-read: legacy rows resolve here; nothing
+    rewrites history."""
+    out = persons_of(ev)
+    if email_index:
+        for e in attendee_emails_of(ev):
+            pid = email_index.get(e)
+            if pid:
+                out.add(pid)
+    return out
+
+
+def email_person_index(entities: dict) -> dict[str, str]:
+    """{email_lower: person_id} over an entities.json dict — the resolver
+    `meeting_person_ids` takes. Built once per scan, never per event. Uses
+    `people_writer.get_person_emails` (canonical `emails` + deprecated
+    `email`) with a dependency-free fallback so this module stays importable
+    standalone."""
+    try:
+        from entities_io import entities_collection
+        from people_writer import get_person_emails
+        people = entities_collection(entities, "people")
+        getter = get_person_emails
+    except Exception:
+        people = entities.get("people") or []
+        def getter(p):  # noqa: E306 — local fallback mirrors get_person_emails
+            out = [e for e in (p.get("emails") or []) if isinstance(e, str)]
+            if isinstance(p.get("email"), str):
+                out.append(p["email"])
+            return out
+    idx: dict[str, str] = {}
+    for p in people:
+        pid = p.get("id")
+        if not (isinstance(pid, str) and pid.startswith("person_")):
+            continue
+        for e in getter(p):
+            e = str(e or "").strip().lower()
+            if e and e not in idx:
+                idx[e] = pid
+    return idx
+
+
+def event_ts(ev: dict) -> str:
+    """Best-effort ISO timestamp string for ordering/recency (canonical
+    `ts` → `timestamp` → `date` via event_time, else nested). Returns '' when
+    absent — callers compare lexically, which is correct for ISO-8601."""
+    d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    try:
+        from event_time import event_time
+    except ImportError:  # pragma: no cover
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from event_time import event_time
+    return event_time(ev) or d.get("ts") or ev.get("created_ts") or d.get("created_ts") or ""
+
+
+def event_seq(ev: dict):
+    """The event's seq (identity backbone), or None.
+
+    UNDOGUARD: delegates to the canonical `event_seq.event_seq`. This
+    function predates it and carried DIFFERENT semantics under the SAME name
+    — it dropped a string seq as unreadable and passed floats through
+    un-normalized. Two same-named helpers disagreeing about what a seq is
+    was exactly the drift that lets a fix look complete while a caller keeps
+    the old behavior, so this is now a thin alias rather than a second
+    implementation. Kept as a re-export because callers already import it
+    from here."""
+    try:
+        from event_seq import event_seq as _canonical
+    except ImportError:
+        import sys as _sys
+
+        _sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from event_seq import event_seq as _canonical
+    return _canonical(ev)
+
+
+def load_events(events_jsonl_path: str | Path) -> list[dict]:
+    """Defensively load events.jsonl, skipping blank/unparseable/non-dict
+    lines. (Mirrors the cru_match defensive loader; kept dependency-free.)
+
+    SPEC A5 — shard-transparent: when handed a path to an `events.jsonl`, this also
+    includes any sibling `events-<year>.jsonl` shards so full-history callers see the
+    whole timeline after a rotation. On an unsharded workspace the result is identical
+    to the pre-A5 single-file read (no siblings exist). A non-`events.jsonl` path is
+    read as-is (back-compat for callers pointing at a custom file).
+
+    ONE LOG PER COMPUTER (cr1#1061): an `events.jsonl` path also reads every
+    per-computer log beside it and merges the streams through
+    `events_io.merge_streams` (everything from each, exact duplicates
+    dropped). With none -- every seat today -- the read is unchanged."""
+    path = Path(events_jsonl_path)
+    if path.name == "events.jsonl":
+        try:
+            from events_io import log_streams
+            streams = [files for _name, files in log_streams(path)]
+        except Exception:
+            streams = [[path] if path.exists() else []]
+    else:
+        streams = [[path] if path.exists() else []]
+    parsed = [_load_files(files) for files in streams]
+    if len(parsed) == 1:
+        return parsed[0]
+    from events_io import merge_streams
+    return merge_streams(parsed)
+
+
+def _load_files(paths) -> list[dict]:
+    out: list[dict] = []
+    for p in paths:
+        if not p.exists():
+            continue
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(ev, dict):
+                out.append(ev)
+    return out

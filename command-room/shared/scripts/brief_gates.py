@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+"""Shared pre-save gate stack — one implementation, every deliverable backend
+(SPEC OUT5 §3b).
+
+WHY THIS EXISTS
+---------------
+Before OUT5 the save-time quality gates (input validation → output-contract
+gate → voice-tell gate → exec-header requirement) lived inline in
+`brief_writer.make_brief` — the .docx chokepoint. OUT5 adds a SECOND rendering
+backend (`premium_html.make_premium_brief`), and a second backend with its own
+gate code is exactly how the GATE1 bug class (runtime-unreachable gates)
+re-enters the product. So the gate SEQUENCE moved here, verbatim, and both
+backends call the same function. There is deliberately no way to render a
+deliverable through either chokepoint without this stack running.
+
+THE PARITY INVARIANT (test-pinned — tests/run_guard_g16_gate_parity_test.py)
+----------------------------------------------------------------------------
+**No gate that fires on the docx path may be absent on the premium-HTML path.**
+A new gate belongs HERE, in `run_pre_save_gates`, never inline in one backend.
+The G16 guard enumerates both backends' gate sets and fails naming the side
+that lags.
+
+WHAT LIVES HERE
+---------------
+  - The brief-kind registry (EYEBROW_BY_KIND / SUPPORTED_BRIEF_KINDS) and the
+    EXEC1 kind sets (STANDARD_KINDS / DECISION_SHAPED_KINDS /
+    EXEC_EYEBROW_EXCLUDED_KINDS) — moved from brief_writer VERBATIM;
+    brief_writer re-exports them so existing imports keep working.
+  - `run_pre_save_gates(...)` — the canonical pre-render gate sequence, exactly
+    the code that ran inline in make_brief through v4.8.0: input validation →
+    EXEC1 kwarg validation → recommendation-ordering check → output-contract
+    gate (B3) → voice-tell gate (B2) → STANDARD_KINDS exec-header requirement.
+  - `warn_page_cap(...)` — the WARN-ONLY page-cap estimate (SPEC OUT2 §5),
+    shared so an over-cap render warns identically on both backends.
+  - The audit emitters (`emit_brief_meta_audit` / `emit_gate_ran_audit`) —
+    moved from brief_writer; `emit_gate_ran_audit` now takes a `surface`
+    argument ("docx" / "premium_html") so the GATE1 detectable-bypass join
+    works per backend.
+
+Stdlib only — the HTML backend must never need python-docx just to run gates.
+"""
+from __future__ import annotations
+
+import inspect
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+
+# ---------- Supported brief kinds (moved from brief_writer, SPEC OUT5) ----------
+# Module-level so the output-contract validator's sync guard can import it (via
+# brief_writer's re-export) and assert set(RULES_BY_KIND) <= set(EYEBROW_BY_KIND)
+# — a renamed kind then breaks loudly instead of silently un-scoping its
+# contract rules.
+
+EYEBROW_BY_KIND = {
+    "call_prep":         "CALL PREP",
+    "past_meeting":      "MEETING BRIEF",
+    "board_pack":        "BOARD PACK",
+    "board_review":      "BOARD REVIEW",  # P1.9 2026-07-02 — boardroom deliberation memo (distinct from board_pack reporting)
+    "contract_review":   "CONTRACT REVIEW",
+    "decision_memo":     "DECISION MEMO",
+    "operator_report":   "OPERATING LIFT",
+    "value_receipt":     "VALUE RECEIPT",
+    "weekly_recap":      "WEEKLY RECAP",
+    "weekly_audit":      "WEEKLY AUDIT",
+    "dormant_scan":      "DORMANT CUSTOMER SCAN",
+    "automation_scan":   "AUTOMATION SCAN",
+    "automation_recipe": "AUTOMATION SETUP RECIPE",
+    "followup_pack":     "FOLLOW-UP PACK",
+    "memo":              "MEMO",
+    "one_pager":         "ONE-PAGER",
+    "insights":          "INSIGHTS",
+    "stress_test":       "STRESS TEST",
+    "kpi_scorecard":     "KPI SCORECARD",  # SPEC OUT7 — the between-packs KPI view / QBR pre-read
+    "chart_on_demand":   "CHART",          # SPEC OUT3B — one substrate-derived chart on demand
+    # SPEC TRIAGEROUTE — the daily inbox triage brief. Registered because
+    # inbox-triage MANDATED `_hq/inbox/TRIAGE_[...].docx` ("the triage brief is
+    # ALWAYS a `.docx`") with no brief_kind and no route: the model hand-rolled
+    # it every morning, skipping the output-contract gate, the voice-tell gate
+    # and the post-render leak scan on the most PII-dense artifact in the
+    # product. It takes a NAMED eyebrow because it is brief-family — see the
+    # EXEC_EYEBROW_EXCLUDED_KINDS note below.
+    "inbox_triage":      "INBOX TRIAGE",
+    # SPEC_SURFACES2 PROFILE1 - "export my profile". The profile page
+    # as a document, through the same writer, the same gates and the
+    # same post-render leak scan as every other on-demand render.
+    "profile":           "PROFILE",
+}
+
+SUPPORTED_BRIEF_KINDS = frozenset(EYEBROW_BY_KIND)
+
+
+# ---------- Executive Output Standard (SPEC EXEC1) ----------
+# See shared/EXECUTIVE_OUTPUT_STANDARD.md. The standard is enforced HERE (the
+# render chokepoint), not re-implemented per skill.
+
+# Kinds required to carry a 30-second exec header (element 1). Missing header
+# on one of these raises ValueError (SPEC OUT2 §4 — the deferred release-N+1
+# flip, landed after the EXEC1 warn-only staging release). The flip shipped in
+# the SAME commit as the scheduled-orchestrator compliance sweep (CONTRACT
+# Rule 16 — prompts lag the plugin; the sweep verified every scheduled
+# orchestrator that renders a STANDARD_KIND passes exec_header: upcoming-
+# meetings passes it on the call_prep path; past-meetings renders past_meeting,
+# not a STANDARD_KIND; friday-wrap delegates to weekly-recap's phases which
+# pass it; no other orchestrator renders a .docx). These are exactly the §4
+# docx-producing skills that carry the adoption edit in their SKILL.md.
+STANDARD_KINDS = frozenset({
+    "call_prep",
+    "memo",
+    "board_pack",
+    "weekly_recap",
+    "one_pager",
+    "followup_pack",
+    "decision_memo",
+    "dormant_scan",
+    # OUT2 §4 — EXEC1 completion: the three kinds EXEC1 deferred.
+    "contract_review",   # verdict = the deal-breaker flag line
+    "automation_scan",   # verdict = top opportunity + payback
+    "stress_test",       # verdict = the kill-risk line
+    # SPEC OUT7 — the KPI scorecard / QBR pre-read. Brief-family (a recurring
+    # "how are we tracking" digest, sibling to weekly_recap), so it is
+    # deliberately NOT in EXEC_EYEBROW_EXCLUDED_KINDS below: it renders the full
+    # verdict + CHANGED/DECIDE/NEEDED header. verdict = the single most
+    # decision-relevant KPI move this period (build_scorecard computes it).
+    "kpi_scorecard",
+    # SPEC OUT3B — the on-demand single-chart page. A STANDARD_KIND so it rides
+    # the full exec-header contract (verdict = the one-sentence reading of the
+    # chart); eyebrow-excluded below (a one-chart answer is a document, not a
+    # since-yesterday digest — the one_pager posture). verdict is supplied by
+    # the chart-on-demand skill from the series it just rendered.
+    "chart_on_demand",
+    # SPEC TRIAGEROUTE — the daily inbox triage brief. The exec header costs
+    # this kind nothing new: inbox-triage's Step 8 return line is ALREADY the
+    # 30-second contract in prose — "12 overnight emails. 3 top items flagged.
+    # 2 replies drafted. 1 decision needed: Acme pricing." That is a verdict
+    # (what the inbox amounts to) plus CHANGED (what arrived) / DECIDE (the one
+    # call to make) / NEEDED (the drafts to approve). Registering it here makes
+    # the header the document's first line instead of only the chat line.
+    "inbox_triage",
+})
+# NB: operator_report is deliberately NOT here. Per SPEC EXEC1 §4 its Section 0
+# synthesis lead is "untouched (it's the prototype)" and §5 lists it as a
+# synthesis-lead surface — its synthesis paragraph IS its contract/lead, so it
+# does not pass a separate exec_header (that would double-lead). The only EXEC1
+# change for operator-report is the quantify dollar tag on Section 1 items.
+
+# Decision-shaped kinds get the recommendation-ordering check (element 2):
+# a rec/decision/suggested-outcome-headed section that appears only LATE
+# (earliest occurrence at section index > 2) → ValueError. Analysis exists to
+# audit the recommendation, not to defer it.
+DECISION_SHAPED_KINDS = frozenset({"decision_memo", "memo", "one_pager"})
+# NB: inbox_triage is deliberately NOT here (SPEC TRIAGEROUTE). A triage brief
+# REPORTS what arrived and who is waiting; it recommends nothing, so there is no
+# recommendation to hoist. Adding it would not merely be inert — it would block
+# ordinary content, for exactly the reason the `past_meeting` carve-out below
+# names. `Decision Needed` is ONE OF THE FIVE BUCKETS this skill classifies into,
+# so its brief carries that heading as a matter of course; `_REC_HEADING_RE`
+# matches `\bdecision\b`, and the buckets section sits after the ranked list and
+# the tile band (index > 2). Registering the kind as decision-shaped would refuse
+# a correct, unremarkable triage on a normal morning. Same class of finding as
+# `past_meeting`'s "Decisions" list: a heading that reports decisions is not a
+# heading that makes one.
+
+# A section heading reads as a recommendation when it matches this. Scoped to
+# DECISION_SHAPED_KINDS only, so a past_meeting "Decisions" list (decisions
+# already made) never trips it.
+_REC_HEADING_RE = re.compile(
+    r"\b(recommendation|recommended|suggested\s+outcome|verdict|the\s+ask|decision)\b",
+    re.IGNORECASE,
+)
+
+# Canonical heading for the ASK block (element 4).
+ASKS_HEADING = "What I need from you"
+
+# Max asks (element 4) — more than this and the page stops being a contract.
+MAX_ASKS = 3
+
+# Small-caps labels for the three exec-header lines (element 1). Shared render
+# data — both backends emit the same three lines in the same order.
+EXEC_HEADER_LINES = (("changed", "CHANGED"), ("decide", "DECIDE"), ("needs", "NEEDED"))
+
+# FS-13 — the CHANGED / DECIDE / NEEDED eyebrow is a BRIEF-FAMILY scaffold (a
+# recurring digest of what moved). Document / decision kinds lead with the
+# VERDICT alone: a memo, one-pager, decision memo, board pack, or analysis is
+# not a "since yesterday" digest, and the three-line eyebrow both misframes
+# them and eats the one-pager's single page (FS-13, 4/4 docs bled it live).
+# These kinds render the verdict lead + rule, no eyebrow lines.
+EXEC_EYEBROW_EXCLUDED_KINDS = frozenset({
+    "memo", "one_pager", "decision_memo", "board_pack",
+    "contract_review", "automation_scan", "stress_test",
+    # SPEC OUT3B — a single-chart page leads with the verdict (the reading),
+    # then the chart + table twin. The 3-line CHANGED/DECIDE/NEEDED eyebrow
+    # would misframe a one-answer page (same reasoning as one_pager).
+    "chart_on_demand",
+})
+# NB: inbox_triage is deliberately NOT excluded (SPEC TRIAGEROUTE) — it renders
+# the full three-line eyebrow, like dormant_scan and weekly_recap. The split
+# above is brief-family (a recurring digest of what MOVED) versus document /
+# analysis kinds (one-shot, verdict-led). Two members settle it by example:
+# `dormant_scan` is absent from this set because its whole subject is what
+# changed since the last scan, while `automation_scan` IS in it — a workspace
+# audit is a one-shot analysis, no "since last time" to report, which is why it
+# sits alongside contract_review and stress_test rather than alongside
+# dormant_scan. A triage brief is the archetype of the first group: it fires
+# daily, its window is literally "since LAST_TRIAGE", and the thing it reports
+# is what arrived overnight. Excluding it would strip the one scaffold its
+# content is already shaped like.
+
+# Composer skill whose customer-side voice block (B1: `_hq/voice/voice-block-
+# <skill>.md`) calibrates each outbound brief kind. The override file is keyed
+# by SKILL name, not brief kind — voice-block-memo-writer.md, never
+# voice-block-memo.md — so the voice-tell gate needs this lookup to load it.
+# Scoped to the hard-blocking outbound kinds (voice_tell_detector.
+# FAIL_BLOCKING_KINDS): those are exactly the saves a false-positive tell can
+# block, so they are where the client's Taboos carve-out must reach the gate.
+VOICE_SKILL_BY_KIND = {
+    "memo":          "memo-writer",
+    "one_pager":     "one-pager-composer",
+    "decision_memo": "decision-memo-composer",
+    # cr1#552: board-pack-assembler retired; the kind stays hard-blocking
+    # (the library still renders it) and, with no composer skill, takes the
+    # workspace-wide dash opt-out path below like the unmapped kinds.
+    "board_pack":    None,
+    "followup_pack": "follow-up-ritual",
+}
+
+
+def _resolve_ban_dashes_workspace(workspace_root) -> bool:
+    """FB-16's per-client dash opt-out, resolved for a brief kind that has NO
+    mapped composer skill (SPEC DASHBAN §3.1).
+
+    `ban_dashes` is a fact about a CLIENT's calibrated voice, not about a
+    document kind — a CEO who writes with dashes writes with them in a past-
+    meeting brief too. But it is parsed out of the per-skill
+    `_hq/voice/voice-block-<skill>.md` files, and VOICE_SKILL_BY_KIND only maps
+    the five outbound kinds. Before DASHBAN that gap was inert (those five were
+    also the only blocking kinds); now that the dash rule blocks everywhere, an
+    unmapped kind with no route to the override would refuse the save of a
+    client who explicitly opted out.
+
+    So for unmapped kinds: any calibrated voice block in the workspace that
+    says this client keeps dashes turns the rule off. Conservative in the
+    direction that matters — it can only ever RELAX a block, never add one, and
+    it cannot change what the mapped five do (they never reach this function).
+
+    Absent workspace, absent voice dir, or any read error -> True (the product
+    default, dashes banned)."""
+    try:
+        from pathlib import Path as _P
+
+        from voice_corrections import load_voice_block_override  # type: ignore
+
+        vdir = _P(workspace_root) / "_hq" / "voice"
+        if not vdir.is_dir():
+            return True
+        for path in sorted(vdir.glob("voice-block-*.md")):
+            skill = path.name[len("voice-block-"):-len(".md")]
+            if not skill:
+                continue
+            override = load_voice_block_override(workspace_root, skill)
+            if override and not override.get("ban_dashes", True):
+                return False
+    except Exception as exc:
+        print(
+            f"[voice-tell gate] workspace ban_dashes resolution failed "
+            f"({type(exc).__name__}: {exc}) — dash ban stays on",
+            file=sys.stderr,
+        )
+    return True
+
+
+# ---------- Gate registry (SPEC OUT5 — the G16 enumeration surface) ----------
+# The canonical, ordered names of the save-time gates every deliverable backend
+# runs. `run_pre_save_gates` returns the subset of PRE_SAVE_GATES that actually
+# fired (contract / voice are mode- and install-dependent); the always-on
+# raising checks (input validation, rec-ordering, exec-header requirement) are
+# listed so the G16 guard can behaviorally exercise the full set on BOTH
+# backends. Post-save, each backend runs its format's leak scan ("leak") — same
+# forbidden-token list (docx_leak_scanner), one scanner per file format.
+PRE_SAVE_GATES = ("input_validation", "rec_ordering", "contract", "voice", "exec_header")
+POST_SAVE_GATES = ("leak",)
+
+
+# ---------- Audit emitters (moved from brief_writer VERBATIM; surface added) ----------
+
+def _ledger_path(workspace_root) -> Path:
+    """The live events.jsonl for `workspace_root`, the ONE path both audit
+    emitters write through (cr1#473).
+
+    A caller may pass the `_hq` folder itself as the root. A raw
+    `<root>/_hq/data/events.jsonl` join then lands in a nested
+    `_hq/_hq/data/events.jsonl` that nothing reads, and the audit event goes
+    missing from the real ledger. So a root whose last part is `_hq` is
+    stepped up to its parent first. Normalised here, not in
+    `data_root.resolve()`, so no other caller's resolution changes."""
+    root = Path(workspace_root)
+    if root.name == "_hq":
+        root = root.parent
+    return root / "_hq" / "data" / "events.jsonl"
+
+
+def emit_brief_meta_audit(
+    brief_kind: str, reason: str, workspace_root: Optional[str],
+    severity: str = "warn",
+) -> None:
+    """Exec-standard audit trail (SPEC EXEC1 element 1). NEVER raises itself.
+
+    Always surfaces a `[brief_meta]` line on stderr (dev-internal, never
+    user-visible — same channel the contract/voice gates use for their
+    findings). When `workspace_root` is known, ALSO best-effort appends a
+    `brief_meta` event to events.jsonl (mirrors compute_and_log_brief_state) so
+    the finding is DETECTABLE in the verify loop. Since the OUT2 §4 flip the
+    missing-header call site passes severity="error" and raises AFTER this
+    returns — the event is the substrate trace of the refused save (an
+    orchestrator that lagged the flip shows up in the verify loop, not just in
+    a transient stderr line). The events.jsonl write is wrapped so it can
+    never block or mask the caller's outcome."""
+    print(
+        f"[brief_meta] exec-standard {severity}: {brief_kind} — {reason}",
+        file=sys.stderr,
+    )
+    if not workspace_root:
+        return
+    try:
+        from atomic_write import atomic_append_jsonl as _append
+        from cru_match import _now_iso as _ts
+        events_path = _ledger_path(workspace_root)
+        # No hand-stamped seq (BUG-8330 item 7) — appender allocates in-lock.
+        _append(events_path, [{
+            "ts": _ts(),
+            "type": "brief_meta",
+            "source_skill": "brief_writer",
+            "data": {"brief_kind": brief_kind, "reason": reason, "severity": severity},
+        }])
+    except Exception:
+        # Never let the audit write block or mask the caller's outcome.
+        pass
+
+
+def emit_gate_ran_audit(
+    brief_kind: str,
+    gates: List[str],
+    output_path: str,
+    workspace_root: Optional[str],
+    surface: str = "docx",
+) -> None:
+    """SPEC GATE1 — detectable-bypass audit. NEVER raises.
+
+    Emitted from inside a backend chokepoint AFTER a deliverable is successfully
+    rendered and saved, recording WHICH save-time gates actually ran for it
+    (contract / voice / leak). This is the #99 lesson applied: we cannot FORCE
+    the LLM to route deliverable production through the chokepoint, but a
+    composer fire that produces a deliverable with NO matching `gate_ran` event
+    that turn is a flaggable bypass (the LLM hand-rolled the file via a generic
+    skill, or answered in chat). The verify loop / cleanup can join board-pack /
+    one-pager / memo `*_drafted` events against `gate_ran` events to surface a
+    deliverable that dodged the gates.
+
+    `surface` names the backend ("docx" — brief_writer, the default so every
+    pre-OUT5 caller is unchanged; "premium_html" — premium_html). Same event
+    type, one join for the verify loop.
+
+    Self-contained on purpose: it adds `gate_ran` as its OWN events-schema enum
+    member and does NOT depend on EXEC1's unpushed `brief_meta` stack. Always
+    prints a `[gate_ran]` line on stderr (dev-internal, never user-visible —
+    same channel the contract/voice gates use). When `workspace_root` is known,
+    ALSO best-effort appends a `gate_ran` event to events.jsonl via the locked
+    writer so the signal lands in substrate; the write is wrapped so it can
+    never block a save."""
+    from os.path import basename
+    print(
+        f"[gate_ran] {brief_kind} rendered via {surface} chokepoint — gates: "
+        f"{','.join(gates) if gates else 'none'} "
+        f"(file: {basename(output_path)})",
+        file=sys.stderr,
+    )
+    if not workspace_root:
+        return
+    try:
+        from atomic_write import atomic_append_jsonl as _append
+        from cru_match import _now_iso as _ts
+        events_path = _ledger_path(workspace_root)
+        # seq + ts are auto-stamped inside atomic_append_jsonl for events.jsonl,
+        # so we pass neither — the locked writer reserves the seq atomically.
+        _append(events_path, [{
+            "ts": _ts(),
+            "type": "gate_ran",
+            "source_skill": "brief_writer",
+            "data": {
+                "brief_kind": brief_kind,
+                "gates": gates,
+                "surface": surface,
+                # UNIFIED gate_ran shape (FB-plumbing item 1): every gate_ran
+                # receipt carries BOTH `result` and `artifact` (a list of
+                # names). This emitter reaches here only AFTER a successful
+                # gated render + save — the pre-save gate sequence raises
+                # before this line on a fail — so `result` is always "pass".
+                # `artifact` is the one saved file's basename, boxed in a list
+                # so the field type matches the multi-file sweep emitter.
+                "result": "pass",
+                "artifact": [basename(output_path)] if output_path else [],
+            },
+        }], holder="brief_writer.gate_ran")
+    except Exception:
+        # Never let the audit write block the brief — the deliverable is already
+        # on disk and valid; the audit is best-effort detectability only.
+        pass
+
+
+# ---------- The shared pre-save gate sequence (SPEC OUT5 §3b) ----------
+
+def run_pre_save_gates(
+    *,
+    brief_kind: str,
+    title: str,
+    subtitle: str,
+    sections: List[dict],
+    supported_kinds: frozenset,
+    contract: str = "enforce",
+    contract_profile: Optional[str] = None,
+    voice_gate: str = "default",
+    exec_header: Optional[Dict[str, str]] = None,
+    asks: Optional[List[Dict[str, str]]] = None,
+    workspace_root: Optional[str] = None,
+) -> List[str]:
+    """Run the canonical pre-render gate sequence and return the list of
+    mode-dependent gates that actually fired (["contract", "voice"], a subset —
+    the caller appends its post-save "leak" entry for the gate_ran audit).
+
+    This is EXACTLY the sequence that ran inline in `brief_writer.make_brief`
+    through v4.8.0, moved verbatim (SPEC OUT5 §3b): input validation → EXEC1
+    kwarg validation → recommendation-ordering check (element 2) → output-
+    contract gate (SPEC B3) → voice-tell gate (SPEC B2) → STANDARD_KINDS
+    exec-header requirement (OUT2 §4 flip). Every raise happens BEFORE any
+    file is written — a blocked save loses no content on either backend.
+
+    `supported_kinds` is the calling backend's kind registry (brief_writer
+    passes SUPPORTED_BRIEF_KINDS; premium_html passes its superset that adds
+    "research"). Everything else is backend-agnostic.
+
+    Raises: ValueError / OutputContractError / VoiceTellError exactly as
+    make_brief always did — messages unchanged.
+    """
+    if brief_kind not in supported_kinds:
+        raise ValueError(
+            f"brief_kind must be one of {sorted(supported_kinds)}, "
+            f"got {brief_kind!r}"
+        )
+    if not title:
+        raise ValueError("title is required")
+    if not subtitle:
+        raise ValueError("subtitle is required")
+    if not isinstance(sections, list) or not sections:
+        raise ValueError("sections must be a non-empty list")
+    if contract not in ("enforce", "report", "off"):
+        raise ValueError(
+            f"contract must be 'enforce', 'report', or 'off', got {contract!r}"
+        )
+    if voice_gate not in ("default", "warn", "off"):
+        raise ValueError(
+            f"voice_gate must be 'default', 'warn', or 'off', got {voice_gate!r}"
+        )
+
+    # SPEC GATE1 — track which save-time gates actually run for this deliverable,
+    # so the post-save gate_ran audit records it (detectable-bypass signal).
+    gates_ran: List[str] = []
+
+    # SPEC EXEC1 — input validation for the exec-standard kwargs.
+    if exec_header is not None and not isinstance(exec_header, dict):
+        raise ValueError(f"exec_header must be a dict or None, got {type(exec_header).__name__}")
+    if asks is not None:
+        if not isinstance(asks, list):
+            raise ValueError(f"asks must be a list or None, got {type(asks).__name__}")
+        if len(asks) > MAX_ASKS:
+            # element 4 cap — more than 3 and the page stops being a contract.
+            raise ValueError(
+                f"asks may hold at most {MAX_ASKS} items (got {len(asks)}); "
+                f"a deliverable with >3 reader-actions is not a 30-second contract"
+            )
+        for ask in asks:
+            if not isinstance(ask, dict) or not (ask.get("text") or "").strip():
+                raise ValueError(
+                    f"each ask must be a dict with a non-empty 'text': {ask!r}"
+                )
+
+    # SPEC EXEC1 element 2 — recommendation-ordering check for decision-shaped
+    # kinds. Raised BEFORE the gates / render (a structural input error, like
+    # the kind/title/sections checks above) — no partial file. Analysis exists
+    # to AUDIT the recommendation, not to defer it: if a rec/decision/
+    # suggested-outcome-headed section appears ONLY late (earliest occurrence at
+    # section index > 2), the document is inverted.
+    if brief_kind in DECISION_SHAPED_KINDS:
+        rec_indices = [
+            i for i, sec in enumerate(sections)
+            if isinstance(sec, dict) and _REC_HEADING_RE.search(str(sec.get("heading") or ""))
+        ]
+        if rec_indices and min(rec_indices) > 2:
+            raise ValueError(
+                f"{brief_kind}: the recommendation must come before the analysis "
+                f"(EXEC1 element 2). A recommendation-shaped section first appears "
+                f"at index {min(rec_indices)}; move it into the first three "
+                f"sections (heading: {sections[min(rec_indices)].get('heading')!r})."
+            )
+
+    # SPEC B3 — pre-save output-contract gate. Runs BEFORE the voice gate and
+    # BEFORE any render, so a blocked save writes NO partial file and loses NO
+    # content. Lazy import + ImportError tolerance, exactly like the voice gate
+    # and the post-render leak scan: a workspace mid-update that hasn't taken
+    # the output_contract_validator update still saves normally.
+    if contract != "off":
+        try:
+            from output_contract_validator import (
+                collect_contract_violations,
+                OutputContractError,
+            )
+        except ImportError:
+            collect_contract_violations = None  # validator not installed yet.
+
+        if collect_contract_violations is not None:
+            gates_ran.append("contract")
+            violations = collect_contract_violations(
+                brief_kind, title, subtitle, sections, profile=contract_profile
+            )
+            if violations:
+                blocking = [
+                    v for v in violations
+                    if v.get("severity", "error") == "error"
+                ]
+                if contract == "enforce" and blocking:
+                    # No file written — caller rewrites the failing sections.
+                    raise OutputContractError(brief_kind, blocking)
+                # report mode (any violation), or warn-only violations in
+                # enforce mode: surface to stderr and let the save proceed.
+                print(
+                    f"[output-contract] {len(violations)} contract "
+                    f"violation(s) in {brief_kind} "
+                    f"({'report mode' if contract == 'report' else 'warn-only'}"
+                    f", save proceeds):\n"
+                    + "\n".join(
+                        f"  [{v['rule']}] {v.get('section') or 'whole brief'}: "
+                        f"{v['observed']} — {v['expected']}. {v['fix_hint']}"
+                        for v in violations
+                    ),
+                    file=sys.stderr,
+                )
+
+    # SPEC B2 — pre-save voice-tell gate. Runs BEFORE any render so a blocked
+    # save writes NO partial file and loses NO content (the draft is rewritten,
+    # never deleted post-save). Lazy import + ImportError tolerance, exactly
+    # like the post-render leak scan: a workspace mid-update that hasn't
+    # taken the voice_tell_detector update still saves normally.
+    if voice_gate != "off":
+        try:
+            from voice_tell_detector import (
+                check_sections,
+                summarize_findings,
+                VoiceTellError,
+                FAIL_BLOCKING_KINDS,
+            )
+        except ImportError:
+            check_sections = None  # detector not installed yet — skip the gate.
+        else:
+            # SPEC DASHBAN. Same mid-update tolerance the import above carries:
+            # a workspace whose detector predates DASHBAN has no always-blocking
+            # rules, so it keeps the old kind-scoped behavior instead of
+            # crashing on the import.
+            try:
+                from voice_tell_detector import ALWAYS_BLOCKING_RULES
+            except ImportError:
+                ALWAYS_BLOCKING_RULES = frozenset()
+
+        if check_sections is not None:
+            gates_ran.append("voice")
+            # Per-client calibrated phrases (Voice Block Taboos) are fed through
+            # and NEVER hard-blocked. Sourced from B1's override loader when
+            # present; B2 has no hard dependency on it (ImportError tolerated).
+            allow_phrases = None
+            ban_dashes = True
+            _voice_skill = VOICE_SKILL_BY_KIND.get(brief_kind)
+            if workspace_root and not _voice_skill:
+                # SPEC DASHBAN §3.1 fallout. VOICE_SKILL_BY_KIND is scoped to
+                # the five hard-blocking kinds, because those used to be the
+                # only saves a fail finding could block. The dash rule now
+                # blocks on EVERY kind, so on the other 16 the client's opt-out
+                # had no route to the gate at all: a client with
+                # `ban_dashes=False` would still have had their 5 PM Past
+                # Meetings brief refused. Resolve it workspace-wide for the
+                # unmapped kinds. The mapped five keep their per-skill read
+                # below, byte-for-byte unchanged.
+                ban_dashes = _resolve_ban_dashes_workspace(workspace_root)
+            if workspace_root and _voice_skill:
+                try:
+                    from voice_corrections import load_voice_block_override  # type: ignore
+
+                    override = load_voice_block_override(workspace_root, _voice_skill)
+                    if override:
+                        allow_phrases = override.get("taboos_allow") or None
+                        ban_dashes = override.get("ban_dashes", True)
+                except Exception as exc:
+                    # A malformed override must never kill a save — but say so
+                    # on stderr: this branch silently swallowed a wrong-arity
+                    # loader call for months, leaving allow_phrases always None.
+                    print(
+                        f"[voice-tell gate] voice-block override load failed for "
+                        f"{_voice_skill} ({type(exc).__name__}: {exc}) — "
+                        f"gate runs uncalibrated",
+                        file=sys.stderr,
+                    )
+                    allow_phrases, ban_dashes = None, True
+
+            # SPEC DASHBAN §4 — the dash-rewrite PRE-PASS. Runs BEFORE the
+            # scan, and MUTATES `sections` in place, so the rewritten prose is
+            # what both the gate scans AND what the backend renders (both
+            # backends pass this same list and then render from it).
+            #
+            # Why a pre-pass and not enforcement alone: the v5.4.0 dogfood
+            # counted 847 em dashes across 69 of 82 documents in one week.
+            # Blocking every kind without a rewrite path would have turned most
+            # of that into refused saves, and the scheduled surfaces (Past
+            # Meetings at 5 PM, the Friday wrap, inbox triage) save with nobody
+            # watching — a raise there is a failure notice instead of a
+            # document. The pre-pass resolves the routine cases deterministically
+            # so the gate blocks only the residue it declined to guess at.
+            #
+            # Gated on ban_dashes: a client whose calibrated voice keeps dashes
+            # gets neither a rewrite nor a block. Skipped entirely when
+            # voice_gate == "off" (this whole branch is). Under "warn" it still
+            # rewrites — the pre-pass is a content normalizer for a brand-voice
+            # hard rule, and "warn" means "do not block", not "do not comply".
+            if ban_dashes:
+                try:
+                    from dash_rewriter import rewrite_sections as _rewrite_dashes
+                except ImportError:
+                    _rewrite_dashes = None  # not installed yet — gate still runs.
+                if _rewrite_dashes is not None:
+                    try:
+                        _fixed, _residue = _rewrite_dashes(
+                            sections, allow_phrases=allow_phrases
+                        )
+                    except Exception as exc:
+                        # A rewriter bug must never take a save down. The gate
+                        # still runs on the un-rewritten sections and blocks
+                        # loudly if dashes remain — fail closed, not silent.
+                        print(
+                            f"[dash-rewrite] pre-pass failed for {brief_kind} "
+                            f"({type(exc).__name__}: {exc}) — gate runs on "
+                            f"un-rewritten prose",
+                            file=sys.stderr,
+                        )
+                    else:
+                        if _fixed or _residue:
+                            print(
+                                f"[dash-rewrite] {brief_kind}: rewrote {_fixed} "
+                                f"dash(es) as punctuation"
+                                + (
+                                    f"; {_residue} left for the gate "
+                                    f"(ambiguous — needs a human rewrite)"
+                                    if _residue else ""
+                                ),
+                                file=sys.stderr,
+                            )
+
+            # FB-16 per-client dash override: forward ban_dashes=False only when
+            # the installed detector knows the kwarg — the dash ban and its
+            # kwarg land together, so a pre-FB-16 detector has no rule to relax.
+            _extra = {}
+            if not ban_dashes and (
+                "ban_dashes" in inspect.signature(check_sections).parameters
+            ):
+                _extra["ban_dashes"] = False
+            result = check_sections(
+                sections, brief_kind=brief_kind, allow_phrases=allow_phrases,
+                **_extra,
+            )
+            fail_findings = [f for f in result["findings"] if f["severity"] == "fail"]
+
+            # SPEC DASHBAN §3.1 — what blocks, and on which kinds.
+            #
+            # THE voice_gate CONJUNCT IS KEPT, DELIBERATELY. A non-"default"
+            # mode still bypasses the dash block. Reasons, on the record:
+            #   - "off" already short-circuits this entire branch above, so the
+            #     conjunct only ever decides "warn".
+            #   - "warn" is the one documented, caller-supplied "report, do not
+            #     block" posture. Making a rule punch through it would leave no
+            #     escape hatch short of "off", which also silences the banned-
+            #     phrase and leak-adjacent reporting — strictly worse.
+            #   - It costs nothing in real coverage: no skill sets voice_gate
+            #     (grep skills/ -> zero hits) and all three production entry
+            #     points default to "default", so every production render
+            #     already blocks. Only tests and deliberate debugging use
+            #     "warn"/"off".
+            #
+            # The KIND scope is what changes. On a FAIL_BLOCKING_KIND every
+            # fail finding blocks, as before. On every other kind ONLY the
+            # ALWAYS_BLOCKING_RULES findings block — banned-phrase findings
+            # stay warn-only there, exactly as they were. That is why this is a
+            # dedicated rule set and not a widened FAIL_BLOCKING_KINDS: the
+            # frozenset governs banned-phrase blocking too, and widening it
+            # would change enforcement for rules M has not ruled on.
+            if voice_gate != "default":
+                blocking_findings: List[dict] = []
+            elif brief_kind in FAIL_BLOCKING_KINDS:
+                blocking_findings = fail_findings
+            else:
+                blocking_findings = [
+                    f for f in fail_findings
+                    if f.get("rule") in ALWAYS_BLOCKING_RULES
+                ]
+
+            if blocking_findings:
+                raise VoiceTellError(
+                    f"Voice-tell gate blocked a {brief_kind} save — "
+                    f"{len(blocking_findings)} voice-rule violation(s) must be "
+                    f"rewritten before this document can be written:\n"
+                    + summarize_findings(blocking_findings),
+                    findings=result["findings"],
+                )
+            if result["findings"]:
+                # Warn-only path (internal kind, or voice_gate="warn"): surface
+                # the findings on stderr and let the save proceed.
+                print(
+                    f"[voice-tell gate] {len(result['findings'])} tell(s) in "
+                    f"{brief_kind} (warn-only, save proceeds):\n"
+                    + summarize_findings(result["findings"]),
+                    file=sys.stderr,
+                )
+
+    # SPEC EXEC1 element 1 — STANDARD_KINDS exec-header presence check.
+    # HARD-REQUIRE as of SPEC OUT2 §4 (the deferred release-N+1 flip): a
+    # STANDARD_KIND with no exec_header raises BEFORE any render — no
+    # partial file. The warn-only staging release gave orchestrator prompts a
+    # full release to catch up (CONTRACT Rule 16); the compliance sweep landed
+    # in the same commit as this flip (see the STANDARD_KINDS comment above).
+    if brief_kind in STANDARD_KINDS and not (
+        exec_header and (exec_header.get("verdict") or "").strip()
+    ):
+        emit_brief_meta_audit(
+            brief_kind,
+            "no exec_header (30-second contract) passed — save refused (OUT2 §4 flip)",
+            workspace_root,
+            severity="error",
+        )
+        raise ValueError(
+            f"brief_kind {brief_kind!r} is a STANDARD_KIND and requires an "
+            f"exec_header with a non-empty 'verdict' (the 30-second contract, "
+            f"shared/EXECUTIVE_OUTPUT_STANDARD.md element 1). Pass "
+            f"exec_header={{'verdict': ..., 'changed': ..., 'decide': ..., "
+            f"'needs': ...}} — 'Nothing' forms are legal and encouraged."
+        )
+
+    return gates_ran
+
+
+# ---------- Page-cap estimate (SPEC OUT2 §5, shared for parity per OUT5) ----------
+
+# Rough words-per-page for the WARN-ONLY page_cap estimate. Deliberately crude
+# (the profile never blocks a save); tables/tiles/timelines count as word
+# equivalents below.
+WORDS_PER_PAGE_EST = 450
+
+
+def estimate_pages(title: str, subtitle: str, sections: List[dict]) -> int:
+    """Crude, deterministic page estimate for the WARN-ONLY page_cap check.
+    Counts words in bodies/bullets/table/matrix cells; tiles and timeline
+    points weigh a fixed word-equivalent each. (Moved from brief_writer
+    verbatim — the HTML backend uses the same estimate so a configured cap
+    warns identically whichever backend renders.)"""
+    words = len(str(title).split()) + len(str(subtitle).split())
+    for sec in sections:
+        if not isinstance(sec, dict):
+            continue
+        words += len(str(sec.get("heading") or "").split()) + 4
+        words += len(str(sec.get("body") or "").split())
+        for b in sec.get("bullets") or []:
+            words += len(str(b).split()) + 2
+        table = sec.get("table")
+        if isinstance(table, dict):
+            for row in (table.get("rows") or []):
+                for cell in row:
+                    words += len(str(cell).split()) + 1
+            for h in (table.get("headers") or []):
+                words += len(str(h).split()) + 1
+        matrix = sec.get("matrix")
+        if isinstance(matrix, dict):
+            cells = matrix.get("cells")
+            if isinstance(cells, list):
+                for row in cells:
+                    words += sum(len(str(c).split()) + 1 for c in row)
+        words += 12 * len(sec.get("tiles") or [])
+        words += 8 * len(sec.get("timeline") or [])
+    return max(1, -(-words // WORDS_PER_PAGE_EST))  # ceil division
+
+
+def warn_page_cap(
+    resolved_profile: dict, brief_kind: str,
+    title: str, subtitle: str, sections: List[dict],
+) -> None:
+    """page_cap (WARN-ONLY, forever): a configured cap for this kind that the
+    crude estimate exceeds gets one stderr note — never a block, never a
+    truncation. No cap configured (the default) = silence. Shared so both
+    backends warn identically (SPEC OUT5 parity)."""
+    cap = (resolved_profile.get("page_cap") or {}).get(brief_kind)
+    if cap:
+        est = estimate_pages(title, subtitle, sections)
+        if est > cap:
+            print(
+                f"[output-profile] {brief_kind}: estimated ~{est} pages against "
+                f"a configured page cap of {cap} (warn-only — save proceeds; "
+                f"consider tightening the longest sections)",
+                file=sys.stderr,
+            )
+
+
+__all__ = [
+    "EYEBROW_BY_KIND",
+    "SUPPORTED_BRIEF_KINDS",
+    "STANDARD_KINDS",
+    "DECISION_SHAPED_KINDS",
+    "EXEC_EYEBROW_EXCLUDED_KINDS",
+    "ASKS_HEADING",
+    "MAX_ASKS",
+    "EXEC_HEADER_LINES",
+    "PRE_SAVE_GATES",
+    "POST_SAVE_GATES",
+    "run_pre_save_gates",
+    "estimate_pages",
+    "warn_page_cap",
+    "emit_brief_meta_audit",
+    "emit_gate_ran_audit",
+]

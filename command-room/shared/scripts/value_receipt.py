@@ -1,0 +1,1234 @@
+"""Value receipt — deterministic monthly/quarterly ROI receipt (SPEC C1).
+
+WHY THIS EXISTS
+---------------
+The CEO wants a monthly "value receipt" they can read in chat and forward as a
+.docx: how many commitments got captured and resolved on time, how many drafts
+and briefs were produced, how many meetings were processed, how many quiet
+relationships got resurfaced, how many decisions were logged — plus a
+CONSERVATIVE-labeled hours-saved estimate. A quarterly roll-up variant (3-month
+window + a per-month breakdown table) is tuned for the justify-the-spend
+audience the CEO forwards to a board or CFO.
+
+The numbers are COMPUTED IN CODE, never by the LLM. operator-report counts every
+section by hand in SKILL.md prose; the same failure mode (the model gets the
+arithmetic wrong, or quietly invents a number) is exactly what the Bug #98/#99
+enforcement model exists to kill: a printed claim is not a checkable artifact, an
+EVENT is. So `compute_value_receipt` does the math, appends a
+`value_receipt_generated` audit event carrying the CODE's numbers, and returns a
+receipt the skill renders verbatim. `validate_receipt_ran` reads the event back —
+a hand-rolled bypass (numbers in prose, no event) is detectable. This mirrors
+`reconcile_sent_commitments.reconcile_and_receipt` / `validate_reconcile_ran`.
+
+PRIVACY
+-------
+Every number comes from the customer's OWN `events.jsonl`. The receipt carries
+counts + hours ONLY — zero names, topics, or email content — so the forwardable
+.docx passes `docx_leak_scanner`. The audit event never leaves the customer's
+own activity log. See skills/value-receipt/SKILL.md "Positioning".
+
+PURE vs ORCHESTRATOR
+--------------------
+  - `compute_metrics(events, window_start, window_end)` is pure: it takes a
+    pre-loaded event list + window bounds and returns the metric dict, the
+    conservative hours estimate, and the per-month breakdown. No I/O, no clock.
+  - `compute_value_receipt(workspace_root, ...)` is the orchestrator: it loads
+    events defensively, calls compute_metrics, appends the audit event, and
+    returns the full receipt (metrics + ready-to-render sections + chat summary).
+"""
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from cru_match import (  # noqa: E402
+    _commitment_field,
+    _commitment_id,
+    _now_iso,
+)
+# SPEC PGUARD1 D1 — the receipt is a CLIENT-FACING artifact: its events read
+# goes through the org-scoped reader (defensive load + account mask +
+# personal-lane drop), never a raw load.
+from events_io import load_events_org_scoped  # noqa: E402
+from event_time import event_dt, event_time  # noqa: E402
+
+try:
+    from source_skill_compat import normalize_source_skill  # noqa: E402
+except ImportError:  # pragma: no cover - back-compat helper always ships
+    def normalize_source_skill(value):
+        return value
+
+try:
+    from receipts import receipt_task_id  # noqa: E402 — v4.5.2 R1 shared reader
+except ImportError:  # pragma: no cover - contract module always ships
+    def receipt_task_id(ev):
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        return normalize_source_skill(data.get("task_id"))
+
+
+# ---------------------------------------------------------------------------
+# Conservative time rubric — SINGLE SOURCE OF TRUTH (SPEC C1 D2).
+# ---------------------------------------------------------------------------
+# Values copied verbatim from operator-report/SKILL.md Section 4's rubric table.
+# Keeping ONE constant means a customer who challenges the estimate is a one-line
+# tunable, and a drifted rubric in a forwarded document (two tables disagreeing)
+# can never happen. operator-report points at this constant as canonical.
+# Minutes "absorbed" per unit of work — deliberately low; the "Conservative"
+# label is the defense, and under-claiming a strong month beats over-claiming a
+# thin one.
+CONSERVATIVE_MINUTES_PER_UNIT = {
+    "commitment_captured": 8,     # would have been re-asked / forgotten
+    "meeting_processed": 12,      # turned into a structured brief
+    "morning_briefing": 15,       # delivered
+    "prep_brief": 20,             # pre-meeting prep brief
+    "email_triaged": 2,           # into Reply Now / Decision / FYI / Discard
+    "email_drafted": 8,           # in voice (user reviews + sends or edits lightly)
+    "decision_logged": 10,        # avoids re-debate next time the topic surfaces
+    "aging_followup": 5,          # surfaced
+    "cleanup": 30,                # weekly self-maintenance
+    "cold_relationship_flag": 25, # one nudge prevents a quarter of stale silence
+}
+
+
+# Commitments "captured" are those extracted from a meeting/email rather than
+# user-created. Mirrors operator-report Section 1 (normalized through
+# source_skill_compat so pre-rename `cr-*` history on migrated workspaces still
+# counts). events.jsonl is append-only — we never rewrite it; we read tolerantly.
+CAPTURE_SKILLS = frozenset(
+    {"meeting-notes", "inbox-triage", "follow-up-ritual", "scan-for-commitments"}
+)
+
+# pack_run task ids that represent a delivered briefing artifact.
+MORNING_BRIEF_TASK_IDS = frozenset({"morning-brief"})
+
+# LEGACY ONLY — pre-BRIEFMERGE history, when prep briefs came from a separate
+# `upcoming-meetings` fire that produced one brief per run. That task is RETIRED
+# (schedule_config.RETIRED_TASKS): the morning brief now preps today's meetings
+# itself as its first leg. Kept so a report window reaching back before the
+# retirement still counts what those fires produced; post-retirement fires are
+# counted from the morning-brief receipt's prep_leg block instead.
+PREP_BRIEF_TASK_IDS = frozenset({"upcoming-meetings"})
+
+# The prep-leg outcome that means a brief was actually PRODUCED by this fire.
+# `reused` is deliberately excluded: it records that a prep already existed, so
+# no work happened on this run and the minutes were already credited when it was
+# made. Counting it would double-claim — the rubric under-claims by design.
+PREP_LEG_PRODUCED_OUTCOME = "ran"
+
+# "Other deliverables" rolled into one documents-produced line (SPEC C1 D4).
+DOCUMENT_EVENT_TYPES = frozenset(
+    {"memo_drafted", "one_pager_drafted", "contract_reviewed", "board_pack_assembled"}
+)
+
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+
+def _parse_dt(value):
+    """Parse an ISO-8601 timestamp (or a bare date) to a naive-UTC datetime for
+    half-open window comparison. Tolerates `...Z`, `...+00:00`, and naive shapes
+    (the auto-stamp emits +00:00, the build_* helpers emit Z, some legacy events
+    are naive). Returns None on junk."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str) and value.strip():
+        v = value.strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(v)
+        except ValueError:
+            try:
+                dt = datetime.fromisoformat(v[:10])
+            except ValueError:
+                return None
+    else:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _in_window(ts, start_dt, end_dt) -> bool:
+    """Half-open membership: start <= ts < end. An event exactly at start is
+    included; one exactly at end is excluded (a calendar month is
+    [first-of-month, first-of-next-month))."""
+    dt = _parse_dt(ts)
+    if dt is None:
+        return False
+    return start_dt <= dt < end_dt
+
+
+def _month_floor(dt: datetime) -> datetime:
+    return datetime(dt.year, dt.month, 1)
+
+
+def _next_month(dt: datetime) -> datetime:
+    if dt.month == 12:
+        return datetime(dt.year + 1, 1, 1)
+    return datetime(dt.year, dt.month + 1, 1)
+
+
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def _month_label(dt: datetime) -> str:
+    return f"{_MONTH_NAMES[dt.month - 1]} {dt.year}"
+
+
+def window_label(start_dt: datetime, end_dt: datetime) -> str:
+    """Readable window string for titles/subtitles. A clean single calendar
+    month renders as 'May 2026'; anything else as a 'Mon D – Mon D, YYYY' range
+    over the inclusive last day."""
+    last = end_dt  # end is exclusive; describe the inclusive span
+    if start_dt == _month_floor(start_dt) and end_dt == _next_month(start_dt):
+        return _month_label(start_dt)
+    # Inclusive end date for human reading.
+    from datetime import timedelta
+    inclusive_end = end_dt - timedelta(days=1)
+    return (
+        f"{_MONTH_NAMES[start_dt.month - 1]} {start_dt.day}, {start_dt.year} – "
+        f"{_MONTH_NAMES[inclusive_end.month - 1]} {inclusive_end.day}, {inclusive_end.year}"
+    )
+
+
+def _closer_id(ev: dict) -> str:
+    """Commitment id a commitment_resolved / thread_resolved event closes.
+    Mirrors cru_match.load_open_commitments' fallback chain."""
+    d = ev.get("data") or {}
+    return (
+        d.get("commitment_id")
+        or d.get("thread_id")
+        or d.get("id")
+        or d.get("target_id")
+        or ev.get("commitment_id")
+        or ev.get("thread_id")
+        or ev.get("id")
+        or ""
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pure compute
+# ---------------------------------------------------------------------------
+
+# Each tuple maps a metric key to the rubric key whose conservative minutes it
+# absorbs. Metrics NOT in this list (drafts_sent, documents_produced,
+# resolved_on_time, briefs_delivered) are reported but do NOT add hours:
+#   - drafts_sent: the work was the DRAFT (already counted via drafts_produced);
+#     a legacy send with no draft counts once in "sent", never synthesizes a
+#     phantom draft (avoids double counting).
+#   - documents_produced / resolved_on_time: real value, but the operator-report
+#     rubric has no per-unit minutes for them — inventing one would drift from
+#     the canonical table, so they stay display-only (conservative under-claim).
+#   - briefs_delivered is the morning+prep total for the display line; hours come
+#     from the two sub-counts so the rubric split (15 vs 20 min) is preserved.
+_HOURS_CONTRIB = (
+    ("commitments_captured", "commitment_captured"),
+    ("meetings_processed", "meeting_processed"),
+    ("morning_briefings", "morning_briefing"),
+    ("prep_briefs", "prep_brief"),
+    ("drafts_produced", "email_drafted"),
+    ("decisions_logged", "decision_logged"),
+    ("dormant_resurfaced", "cold_relationship_flag"),
+)
+
+
+def _hours_from_metrics(metrics: dict) -> float:
+    """Conservative hours absorbed = sum(count x rubric minutes) / 60, 2 dp."""
+    minutes = sum(
+        metrics.get(metric_key, 0) * CONSERVATIVE_MINUTES_PER_UNIT[rubric_key]
+        for metric_key, rubric_key in _HOURS_CONTRIB
+    )
+    return round(minutes / 60.0, 2)
+
+
+def _window_metrics(events, start_dt: datetime, end_dt: datetime, commitments_by_id: dict) -> dict:
+    """Compute the raw metric counts for a single half-open window. `events` is
+    the full list (so resolved-on-time can join against commitments outside the
+    window); `commitments_by_id` is the precomputed id -> commitment-event map."""
+    commitments_captured = 0
+    resolved_on_time = 0
+    drafts_produced = 0
+    drafts_sent = 0
+    meetings_processed = 0
+    decisions_logged = 0
+    dormant_resurfaced = 0
+    documents_produced = 0
+    prep_briefs = 0
+    objectives_status_heard = 0
+    objectives_completed = 0
+    # OBJ1 (draft): distinct objectives flagged drifting BEFORE they stalled
+    # — read from the objectives readout's pack_run receipts (the flag trail
+    # the skill's Writer Contract mandates), never recomputed here.
+    objectives_drift_ids: set = set()
+    # Briefings: a pack_run is canonical; a `briefing` event counts only when no
+    # same-day morning-brief pack_run exists (one fire can emit both — SPEC C1
+    # Risks). Dedupe morning briefings by calendar date.
+    morning_pack_dates = set()
+    briefing_dates = set()
+
+    for ev in events:
+        ts = event_time(ev)
+        if not _in_window(ts, start_dt, end_dt):
+            continue
+        et = ev.get("type")
+        if et == "commitment":
+            if normalize_source_skill(ev.get("source_skill")) in CAPTURE_SKILLS:
+                commitments_captured += 1
+        elif et == "commitment_resolved":
+            commitment = commitments_by_id.get(_closer_id(ev))
+            if commitment is not None:
+                due = _parse_dt(_commitment_field(commitment, "due"))
+                resolved = _parse_dt(ts)
+                if due is not None and resolved is not None and resolved <= due:
+                    resolved_on_time += 1
+        elif et == "email_drafted":
+            drafts_produced += 1
+        elif et == "email_sent":
+            drafts_sent += 1
+        elif et == "meeting_processed":
+            meetings_processed += 1
+        elif et == "decision" or et == "decision_memo_drafted":
+            decisions_logged += 1
+        elif et == "pattern_break_detected" or et == "thread_resurrected":
+            dormant_resurfaced += 1
+        elif et in DOCUMENT_EVENT_TYPES:
+            documents_produced += 1
+        elif et == "objective_review" or et == "objective_report":
+            objectives_status_heard += 1
+        elif et == "objective_completed":
+            objectives_completed += 1
+        elif et == "pack_run":
+            # v4.5.2 R1 — match through the receipt contract, not data.task_id
+            # alone: kind-only receipts (F-10b's live shape) and legacy cr-*/
+            # underscore spellings (F-49's miss class) all resolve.
+            task_id = receipt_task_id(ev)
+            if task_id in MORNING_BRIEF_TASK_IDS:
+                d = _parse_dt(ts)
+                if d is not None:
+                    morning_pack_dates.add(d.date())
+                # SPEC BRIEFMERGE — the prep leg runs INSIDE this fire, so the
+                # briefs it produced are recorded on this receipt rather than on
+                # a separate `upcoming-meetings` one. Reading only the retired
+                # task id meant every prep brief made after the merge went
+                # uncounted: the "pre-meeting prep briefs" line vanished from a
+                # customer-facing report and the hours silently lost 20 minutes
+                # per brief. A fire that predates the merge has no prep_leg
+                # block and contributes 0 here, so history is unchanged.
+                prep_leg = (ev.get("data") or {}).get("prep_leg") or {}
+                counts = prep_leg.get("counts") or {}
+                produced = counts.get(PREP_LEG_PRODUCED_OUTCOME)
+                if isinstance(produced, bool) or not isinstance(produced, int):
+                    produced = 0
+                prep_briefs += max(0, produced)
+            elif task_id in PREP_BRIEF_TASK_IDS:
+                prep_briefs += 1
+            elif task_id == "objectives":
+                for tid in (ev.get("data") or {}).get("drifting_thread_ids") or []:
+                    if isinstance(tid, str) and tid:
+                        objectives_drift_ids.add(tid)
+        elif et == "briefing":
+            d = _parse_dt(ts)
+            if d is not None:
+                briefing_dates.add(d.date())
+
+    # Count a standalone briefing only on days with no morning-brief pack_run.
+    extra_briefings = len(briefing_dates - morning_pack_dates)
+    morning_briefings = len(morning_pack_dates) + extra_briefings
+
+    metrics = {
+        "commitments_captured": commitments_captured,
+        "resolved_on_time": resolved_on_time,
+        "drafts_produced": drafts_produced,
+        "drafts_sent": drafts_sent,
+        "morning_briefings": morning_briefings,
+        "prep_briefs": prep_briefs,
+        "briefs_delivered": morning_briefings + prep_briefs,
+        "meetings_processed": meetings_processed,
+        "dormant_resurfaced": dormant_resurfaced,
+        "decisions_logged": decisions_logged,
+        "documents_produced": documents_produced,
+        "objectives_status_heard": objectives_status_heard,
+        "objectives_completed": objectives_completed,
+        "objectives_drift_flagged": len(objectives_drift_ids),
+    }
+    # QUIET1 D9 — the two counters a seat that never opens a widget cares
+    # about: what closed WITHOUT them, and how often they were asked.
+    # Counted by `quiet.receipt_counters` from the written closures and the
+    # budget receipts (never a plan), over the same half-open window.
+    try:
+        import quiet as _quiet
+        metrics.update(_quiet.receipt_counters(events, start_dt, end_dt))
+    except Exception:  # pragma: no cover — a missing module never blanks a receipt
+        metrics.update({"closed_untouched": 0, "questions_asked": 0})
+    return metrics
+
+
+def compute_metrics(events, window_start, window_end) -> dict:
+    """Pure metric computation over `events` for the half-open window
+    [window_start, window_end). `window_start`/`window_end` may be ISO strings
+    or datetimes.
+
+    Returns:
+      {
+        "window": "<start-iso>..<end-iso>",
+        "metrics": {<the SPEC C1 D4 metric set>},
+        "hours_estimate": float,        # conservative, 2 dp
+        "per_month": [                  # one row per calendar month in window
+          {"month": "2026-05", "label": "May 2026", "hours_estimate": ...,
+           **per-month metrics}
+        ],
+      }
+    """
+    start_dt = _parse_dt(window_start)
+    end_dt = _parse_dt(window_end)
+    if start_dt is None or end_dt is None:
+        raise ValueError(
+            f"compute_metrics needs parseable window bounds; got "
+            f"{window_start!r}..{window_end!r}"
+        )
+    if end_dt <= start_dt:
+        raise ValueError(
+            f"window_end ({window_end!r}) must be after window_start "
+            f"({window_start!r})"
+        )
+
+    events = events or []
+    commitments_by_id = {}
+    for ev in events:
+        if ev.get("type") == "commitment":
+            commitments_by_id.setdefault(_commitment_id(ev), ev)
+
+    metrics = _window_metrics(events, start_dt, end_dt, commitments_by_id)
+    hours_estimate = _hours_from_metrics(metrics)
+
+    # Per-month breakdown — contiguous, non-overlapping buckets clipped to the
+    # window, so each event lands in exactly one bucket and the rows sum to the
+    # totals (the quarterly roll-up's per-month table + its summation guarantee).
+    per_month = []
+    cursor = _month_floor(start_dt)
+    while cursor < end_dt:
+        bucket_start = max(cursor, start_dt)
+        bucket_end = min(_next_month(cursor), end_dt)
+        bucket_metrics = _window_metrics(events, bucket_start, bucket_end, commitments_by_id)
+        row = {
+            "month": f"{cursor.year:04d}-{cursor.month:02d}",
+            "label": _month_label(cursor),
+            "hours_estimate": _hours_from_metrics(bucket_metrics),
+        }
+        row.update(bucket_metrics)
+        per_month.append(row)
+        cursor = _next_month(cursor)
+
+    return {
+        "window": f"{start_dt.isoformat()}..{end_dt.isoformat()}",
+        "metrics": metrics,
+        "hours_estimate": hours_estimate,
+        "per_month": per_month,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Render helpers — code builds the strings so the numbers are NEVER LLM math.
+# ---------------------------------------------------------------------------
+
+def _plural(n: int, singular: str, plural: str = None) -> str:
+    return singular if n == 1 else (plural or singular + "s")
+
+
+# The exact disclaimer sentence from operator-report/SKILL.md Section 4 — used
+# verbatim on every value-receipt surface so the estimate is always labeled
+# Conservative.
+CONSERVATIVE_DISCLAIMER = (
+    "Conservative — assumes you would have done each of these tasks yourself at "
+    "average speed. The real lift is usually higher because half of these would "
+    "have just dropped."
+)
+
+
+# ---------------------------------------------------------------------------
+# COACH2 5.2 item 3 — the four measures, on a seat that opened a door
+# ---------------------------------------------------------------------------
+#
+# The receipt already says what the product ABSORBED. These four say what the
+# customer's own work looks like against the thing they said they are working
+# on — and they render ONLY on a seat whose coaching shape is not `observed`,
+# because on an observed seat there is no such thing and a block that appears
+# anyway is the product deciding to coach somebody who never opened a door.
+#
+# The completion measure is the one with teeth. Its numerator is closes that
+# came from the customer or from evidence; its ELIGIBLE BASE deliberately
+# leaves out every row that left because nobody ever came back to it — the
+# review expiry, the rest and let-go doors, the age-out amnesty. Counting
+# those as failures would make the number a verdict on the customer's memory
+# rather than a reading of their work; counting them in the numerator would
+# make the product look good for forgetting things. They are named on their
+# own line and nowhere else. Every number is read off
+# `flow_measure.window_counts` by door — never recomputed here, so the receipt
+# and the wrap can never disagree about one week.
+
+COACHING_HEADING = "What you are working on"
+
+#: EOD2's self-scored answer (SURFACES2 ruling 5). The receipt lists the
+#: numbers the CUSTOMER said, as a list — no mean, no arrow, no trend word.
+#: They are the customer's own words about their own week, which is exactly
+#: why they are never averaged into a grade.
+COACHING_ANSWER_TYPE = "coaching_answer"
+
+#: The doors whose rows leave the eligible base — SPEC 5.2 item 3's FOUR, by
+#: name: `unconfirmed_expired` (the review expiry), `rested_quiet` and
+#: `let_go_quiet` (the silence rail), `aged_out` (the amnesty). The first is a
+#: resolution REASON inside `flow_measure`'s `lapse` route; the other three
+#: are that module's whole `silence` route.
+#:
+#: WHY NOT THE ROUTE (fix round 1, reviewer F-4): `lapse` is wider than the
+#: expiry. It also carries `ingest_killed`, `target_never_created` and
+#: `policy_retracted` — and those rows were leaving the eligible base under a
+#: customer sentence that says they "left through the expiry, rest and let-go
+#: doors", which is not true of a policy the system retracted. Zero rows on
+#: the book carry them today, so this was a wording risk rather than a wrong
+#: number; it is closed by naming the doors instead of the routes.
+EXCLUDED_ROUTES = ("silence",)
+#: The `lapse`-route reasons that ARE one of the four doors — the review
+#: expiry and nothing else. Spelled through `event_types` so the reason has
+#: one home; the literal is the fallback for a tree without it.
+try:  # pragma: no cover — the constant has shipped since REFINT1
+    from event_types import REVIEW_EXPIRY_REASON as _REVIEW_EXPIRY
+except ImportError:  # pragma: no cover
+    _REVIEW_EXPIRY = "review_expired"
+EXCLUDED_LAPSE_REASONS = (_REVIEW_EXPIRY,)
+#: The doors that count as a close the customer or the evidence made.
+COMPLETION_ROUTES = ("fact", "own_word")
+
+#: The quarterly stakeholder read has no questions to report against until
+#: the first coaching quarter ends (night 12c/13). It says so rather than
+#: rendering an empty section.
+STAKEHOLDER_NOT_ASKED = (
+    "Quarterly stakeholder perception: not yet asked — the first quarter of "
+    "coaching has not closed yet."
+)
+
+
+def _coaching_shape(workspace_root) -> str:
+    try:
+        import coaching_doors as _doors
+        return _doors.coaching_shape(workspace_root)
+    except Exception:  # noqa: BLE001 — no coaching module is an observed seat
+        return "observed"
+
+
+def _behaviour(workspace_root) -> str:
+    try:
+        import coaching_doors as _doors
+        obj = _doors.relationship(workspace_root)
+        return str((obj or {}).get("behaviour") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _answer_scores(events, start_dt, end_dt) -> list:
+    out = []
+    for ev in events or []:
+        if ev.get("type") != COACHING_ANSWER_TYPE:
+            continue
+        if not _in_window(event_time(ev), start_dt, end_dt):
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        value = data.get("score")
+        if isinstance(value, (int, float)):
+            out.append(int(value) if float(value).is_integer() else value)
+    return out
+
+
+def _behaviour_closes_by_week(events, start_dt, end_dt, behaviour: str) -> list:
+    """How many closes carried the behaviour's own words, week by week. A
+    LIST, never a slope: four numbers a reader can look at beats one number
+    that has already decided what they mean."""
+    words = {w for w in str(behaviour or "").lower().split() if len(w) > 3}
+    if not words:
+        return []
+    buckets: dict = {}
+    for ev in events or []:
+        if ev.get("type") != "commitment_resolved":
+            continue
+        dt = event_dt(ev)
+        if dt is None or not _in_window(event_time(ev), start_dt, end_dt):
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        blob = " ".join(str(data.get(k) or "")
+                        for k in ("title", "evidence", "quote")).lower()
+        if not any(w in blob for w in words):
+            continue
+        week = int((dt - start_dt).days // 7)
+        buckets[week] = buckets.get(week, 0) + 1
+    if not buckets:
+        return []
+    return [buckets.get(i, 0) for i in range(max(buckets) + 1)]
+
+
+def _excluded_by_door(events, start_dt, end_dt, routes) -> int:
+    """How many rows left by one of SPEC 5.2 item 3's FOUR doors.
+
+    The whole `silence` route (rest, let-go, the age-out amnesty) read off
+    `flow_measure.window_counts` by door as before — plus the `lapse` rows
+    whose own resolution reason is the review expiry, counted through
+    `flow_measure.route_of`, the same classifier, never a second one. The
+    other three lapse reasons are not one of the four doors and stay in the
+    eligible base."""
+    from flow_measure import route_of
+    n = sum(int(routes.get(r, 0) or 0) for r in EXCLUDED_ROUTES)
+    for ev in events or []:
+        if route_of(ev) != "lapse":
+            continue
+        if not _in_window(event_time(ev), start_dt, end_dt):
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        reason = str(data.get("resolution_reason") or "").strip().lower()
+        if reason in EXCLUDED_LAPSE_REASONS:
+            n += 1
+    return n
+
+
+def coaching_block(workspace_root, window_start, window_end, *,
+                   events=None, shape=None) -> dict:
+    """The four measures, or nothing at all.
+
+    Returns `{"renders": bool, "heading", "bullets", "claims", "numbers"}`.
+    `renders` is False on an observed seat, and the caller adds no section.
+    """
+    import claims as _claims
+
+    shape = shape if shape is not None else _coaching_shape(workspace_root)
+    if shape == "observed":
+        return {"renders": False, "heading": COACHING_HEADING, "bullets": [],
+                "claims": [], "numbers": {}, "shape": shape}
+
+    start_dt = _parse_dt(window_start)
+    end_dt = _parse_dt(window_end)
+    if events is None:
+        events, _skipped = load_events_org_scoped(workspace_root)
+    events = list(events or [])
+
+    from flow_measure import window_counts
+    counts = window_counts(events, start_dt, end_dt)
+    routes = counts.get("out_by_route") or {}
+    completed = sum(int(routes.get(r, 0) or 0) for r in COMPLETION_ROUTES)
+    excluded = _excluded_by_door(events, start_dt, end_dt, routes)
+    eligible = max(0, int(counts.get("out", 0) or 0) - excluded)
+
+    label = window_label(start_dt, end_dt)
+    bullets: list = []
+    claim_list: list = []
+
+    # (i) completion, own word + fact doors only.
+    line = (f"Rows that ended by your own word or on evidence: "
+            f"{completed} of {eligible} eligible.")
+    bullets.append(line)
+    claim_list.append(_claims.make_claim(line, count=completed, window=label))
+    if excluded:
+        ex = (f"{excluded} more left through the expiry, rest and let-go "
+              f"doors — outside the count either way.")
+        bullets.append(ex)
+        claim_list.append(_claims.make_claim(ex, count=excluded, window=label))
+
+    # (ii) the daily question, as the list of what the customer said.
+    scores = _answer_scores(events, start_dt, end_dt)
+    if scores:
+        said = ", ".join(str(s) for s in scores)
+        line = f"What you said about your own days, in order: {said}."
+        bullets.append(line)
+        claim_list.append(_claims.make_claim(line, count=len(scores),
+                                             window=label))
+
+    # (iii) the quarterly read, which has nothing to report yet.
+    bullets.append(STAKEHOLDER_NOT_ASKED)
+
+    # (iv) the behaviour, week by week.
+    behaviour = _behaviour(workspace_root)
+    weekly = _behaviour_closes_by_week(events, start_dt, end_dt, behaviour)
+    if behaviour and weekly:
+        line = (f"{behaviour} appeared in closes, week by week: "
+                f"{', '.join(str(n) for n in weekly)}.")
+        bullets.append(line)
+        claim_list.append(_claims.make_claim(line, count=sum(weekly),
+                                             window=label))
+
+    return {"renders": True, "heading": COACHING_HEADING, "bullets": bullets,
+            "claims": claim_list, "shape": shape,
+            "numbers": {"completed": completed, "eligible": eligible,
+                        "excluded": excluded, "answers": list(scores),
+                        "behaviour_weeks": list(weekly)}}
+
+
+def _count_bullets(metrics: dict) -> list:
+    """Plain-English count lines, counts only — zero names/topics so the
+    forwardable .docx passes the leak scanner. Omit zero lines (omit-don't-pad);
+    a thin month shows thin numbers, never a padded one."""
+    lines = []
+    m = metrics
+
+    def add(n, text):
+        if n > 0:
+            lines.append(text)
+
+    add(m["commitments_captured"],
+        f"{m['commitments_captured']} {_plural(m['commitments_captured'], 'commitment')} "
+        f"captured that weren't tracked anywhere else")
+    add(m["resolved_on_time"],
+        f"{m['resolved_on_time']} {_plural(m['resolved_on_time'], 'commitment')} "
+        f"resolved on time")
+    add(m["meetings_processed"],
+        f"{m['meetings_processed']} {_plural(m['meetings_processed'], 'meeting')} "
+        f"turned into a structured brief")
+    add(m["morning_briefings"],
+        f"{m['morning_briefings']} morning {_plural(m['morning_briefings'], 'briefing')} delivered")
+    add(m["prep_briefs"],
+        f"{m['prep_briefs']} pre-meeting prep {_plural(m['prep_briefs'], 'brief')}")
+    add(m["drafts_produced"],
+        f"{m['drafts_produced']} {_plural(m['drafts_produced'], 'draft')} written in your voice")
+    add(m["decisions_logged"],
+        f"{m['decisions_logged']} {_plural(m['decisions_logged'], 'decision')} logged")
+    add(m["dormant_resurfaced"],
+        f"{m['dormant_resurfaced']} quiet {_plural(m['dormant_resurfaced'], 'relationship')} resurfaced")
+    add(m["documents_produced"],
+        f"{m['documents_produced']} {_plural(m['documents_produced'], 'document')} produced")
+    add(m.get("objectives_status_heard", 0),
+        f"{m.get('objectives_status_heard', 0)} objective status "
+        f"{_plural(m.get('objectives_status_heard', 0), 'update')} heard "
+        "without asking twice")
+    add(m.get("objectives_drift_flagged", 0),
+        f"{m.get('objectives_drift_flagged', 0)} "
+        f"{_plural(m.get('objectives_drift_flagged', 0), 'objective')} "
+        "flagged drifting before they stalled")
+    add(m.get("objectives_completed", 0),
+        f"{m.get('objectives_completed', 0)} "
+        f"{_plural(m.get('objectives_completed', 0), 'objective')} completed")
+    # QUIET1 D9 — both drop-empty like every line above.
+    add(m.get("closed_untouched", 0),
+        f"{m.get('closed_untouched', 0)} "
+        f"{_plural(m.get('closed_untouched', 0), 'commitment')} closed "
+        "that you never touched")
+    add(m.get("questions_asked", 0),
+        f"asked you {m.get('questions_asked', 0)} "
+        f"{_plural(m.get('questions_asked', 0), 'question')} this period")
+
+    if not lines:
+        lines.append("No recorded activity in this window yet.")
+    return lines
+
+
+def _hours_body(hours_estimate: float) -> str:
+    """The hours block, with the literal word 'Conservative' adjacent to the
+    figure (SPEC C1 acceptance #7)."""
+    return (
+        f"~{hours_estimate:g} hours of operational overhead absorbed.\n\n"
+        f"{CONSERVATIVE_DISCLAIMER}"
+    )
+
+
+# Metric keys that roll up into the "Actions handled" tile — every unit of work
+# Command Room actually did this window. briefs_delivered already folds
+# morning_briefings + prep_briefs, so those are NOT re-added (no double count).
+_ACTIONS_HANDLED_KEYS = (
+    "commitments_captured",
+    "meetings_processed",
+    "briefs_delivered",
+    "drafts_produced",
+    "decisions_logged",
+    "documents_produced",
+    "dormant_resurfaced",
+)
+
+
+def build_receipt_tiles(metrics: dict, hours_estimate: float) -> list:
+    """The stat-tile band for the value receipt (SPEC OUT1 §4): Actions handled ·
+    Hours returned (conservative) · Threads advanced. Values come straight from
+    the computed receipt — this NEVER re-derives math the skill would then
+    render in prose (F-60: substrate-derived only).
+
+    Drop rule follows this module's own omit-don't-pad convention (mirrors
+    `_count_bullets`, which skips zero lines): a zero tile is omitted so a thin
+    window shows a thin band, never a wall of zeros. Returns [] when nothing was
+    handled — the caller then omits the band entirely (`_count_bullets` already
+    prints the honest 'No recorded activity' line)."""
+    m = metrics
+    actions_handled = sum(int(m.get(k, 0)) for k in _ACTIONS_HANDLED_KEYS)
+    # A "thread advanced" = an outbound draft written or a quiet relationship
+    # resurfaced — both move a conversation forward.
+    threads_advanced = int(m.get("drafts_produced", 0)) + int(m.get("dormant_resurfaced", 0))
+
+    tiles = []
+    if actions_handled > 0:
+        tiles.append({"label": "Actions handled", "value": str(actions_handled)})
+    if hours_estimate and hours_estimate > 0:
+        tiles.append({"label": "Hours returned (conservative)", "value": f"~{hours_estimate:g}"})
+    if threads_advanced > 0:
+        tiles.append({"label": "Threads advanced", "value": str(threads_advanced)})
+    return tiles
+
+
+def build_trend_chart(per_month: list, *, metric: str = "hours_estimate",
+                      label: str = "Hours returned",
+                      title: str = "Month over month",
+                      unit: str = "h") -> Optional[dict]:
+    """SPEC OUT3 — the month-over-month trend as a `charts` entry for
+    make_brief / make_premium_brief, or None when there is no trend to show.
+
+    Points come VERBATIM from `per_month` rows (compute_metrics' output — the
+    same rows the quarterly table renders; one computation, two renders,
+    never re-derived in prose). Returns None below 2 months or when every
+    value is zero — the caller simply omits the chart and the table/tile
+    representation stands (refusal over empty frames). Forwardability lock
+    unchanged: month labels + numbers only, no names.
+
+    Used by value-receipt's quarterly roll-up AND operator-report's trend
+    context (operator-report calls compute_metrics over its trailing window
+    and passes the per_month rows here — the shared conservative rubric stays
+    the single source of the numbers)."""
+    rows = [r for r in (per_month or []) if isinstance(r, dict)]
+    if len(rows) < 2:
+        return None
+    points = []
+    for r in rows:
+        v = r.get(metric)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return None  # never chart a gap as zero
+        points.append({"x": str(r.get("label") or r.get("month") or ""), "y": float(v)})
+    if all(p["y"] == 0 for p in points):
+        return None
+    return {
+        "kind": "line",
+        "title": title,
+        "data": {"series": [{"label": label, "points": points}], "unit": unit},
+    }
+
+
+def build_value_receipt_infographic(
+    receipt: dict,
+    *,
+    label: Optional[str] = None,
+    brand: Optional[dict] = None,
+    workspace_root=None,
+    org_id: Optional[str] = None,
+) -> Optional[str]:
+    """SPEC OUT4 §3c — render a quarterly value receipt as a `stat_spotlight`
+    infographic (a self-contained premium-HTML one-pager), or None when it does
+    not fit.
+
+    This is an OUTPUT MODE, not a new number: the hero figure and every support
+    tile come VERBATIM from `build_receipt_tiles` (which reads the code-computed
+    receipt) — nothing is re-derived here (F-60 / the value_receipt.py contract).
+    The hero is the conservative hours-returned figure (the receipt's headline
+    ROI number); the remaining tiles are the support band. Forwardability lock
+    unchanged: counts + hours + the window label only, zero names — the same
+    reason the .docx receipt passes `docx_leak_scanner` (and build_infographic
+    re-runs that leak scan over the rendered page).
+
+    The caller renders this ONLY when the profile opts value-receipt into the
+    infographic mode — `output_profile.renders_infographic_first("value_receipt",
+    workspace_root)` — AND the roll-up is quarterly (the justify-the-spend
+    variant). Returns None (honest no-fit) when: the roll-up is not quarterly,
+    there is no hours figure to headline, or fewer than one support tile remains
+    — the caller then keeps the .docx / premium-HTML receipt.
+
+    Args mirror the render helpers: an explicit `brand` dict wins, else
+    workspace/org resolution, else byte-stable defaults.
+    """
+    if not isinstance(receipt, dict) or receipt.get("rollup") != "quarter":
+        return None
+    metrics = receipt.get("metrics") or {}
+    hours_estimate = receipt.get("hours_estimate") or 0
+    tiles = build_receipt_tiles(metrics, hours_estimate)
+
+    hero = next((t for t in tiles if str(t.get("label", "")).lower().startswith("hours")), None)
+    if hero is None:
+        return None  # no headline ROI number — a spotlight has no hero
+    support = [t for t in tiles if t is not hero]
+    if not support:
+        return None  # a hero with no support is a stat line, not an infographic
+
+    try:
+        from infographic import build_infographic
+    except ImportError:  # pragma: no cover — partial-install posture
+        return None
+
+    win = label or receipt.get("window") or ""
+    return build_infographic(
+        "stat_spotlight",
+        {"hero": {"value": hero["value"], "label": hero["label"]},
+         "support": support[:4]},
+        title="Value Receipt",
+        subtitle=win,
+        eyebrow="VALUE RECEIPT",
+        brand=brand,
+        workspace_root=str(workspace_root) if workspace_root is not None else None,
+        org_id=org_id,
+    )
+
+
+def _build_sections(metrics: dict, hours_estimate: float, per_month: list,
+                    rollup: str, coaching: dict = None) -> list:
+    """A ready-to-pass make_brief sections list. Code builds every number into
+    the strings, so the skill renders — it never recomputes in prose."""
+    sections = []
+    # SPEC OUT1 §4 — tile band above the counts. Substrate-derived, drop-empty.
+    tiles = build_receipt_tiles(metrics, hours_estimate)
+    if tiles:
+        sections.append({"heading": "At a glance", "tiles": tiles})
+    sections += [
+        {"heading": "What Command Room handled", "bullets": _count_bullets(metrics)},
+        {"heading": "Time absorbed", "body": _hours_body(hours_estimate)},
+    ]
+    # Quarterly roll-up: a per-month breakdown table (counts + hours per month).
+    if rollup == "quarter" and len(per_month) > 1:
+        headers = ["Month", "Commitments", "Meetings", "Briefs", "Drafts", "Decisions", "Hours"]
+        rows = []
+        for r in per_month:
+            rows.append([
+                r["label"],
+                str(r["commitments_captured"]),
+                str(r["meetings_processed"]),
+                str(r["briefs_delivered"]),
+                str(r["drafts_produced"]),
+                str(r["decisions_logged"]),
+                f"~{r['hours_estimate']:g}",
+            ])
+        section = {
+            "heading": "Month by month",
+            "table": {"rows": rows, "headers": headers},
+        }
+        # SPEC OUT3 — the MoM hours trend rides above the table (same numbers,
+        # rendered best-effort; a refused/None chart leaves the table alone).
+        trend = build_trend_chart(per_month)
+        if trend:
+            section["charts"] = [trend]
+        sections.append(section)
+    # COACH2 5.2 item 3 — last, and only through the door. A block that is
+    # not built (observed seat) adds no heading at all: an empty "What you
+    # are working on" would announce a layer the seat never opened.
+    if coaching and coaching.get("renders") and coaching.get("bullets"):
+        sections.append({"heading": coaching["heading"],
+                         "bullets": list(coaching["bullets"])})
+    return sections
+
+
+def _build_summary(metrics: dict, hours_estimate: float, label: str) -> str:
+    """The verbatim chat line the skill pastes. Contains 'Conservative' adjacent
+    to the hours figure (acceptance #7). Honest on an empty window."""
+    m = metrics
+    if not any(m[k] for k in m):
+        return (
+            f"{label}: no recorded activity in this window yet. As Command Room "
+            f"logs more of your work, this receipt fills in."
+        )
+    parts = []
+    if m["commitments_captured"]:
+        parts.append(f"captured {m['commitments_captured']} "
+                     f"{_plural(m['commitments_captured'], 'commitment')}")
+    if m["meetings_processed"]:
+        parts.append(f"processed {m['meetings_processed']} "
+                     f"{_plural(m['meetings_processed'], 'meeting')}")
+    if m["briefs_delivered"]:
+        parts.append(f"delivered {m['briefs_delivered']} "
+                     f"{_plural(m['briefs_delivered'], 'brief')}")
+    if m["drafts_produced"]:
+        parts.append(f"wrote {m['drafts_produced']} "
+                     f"{_plural(m['drafts_produced'], 'draft')}")
+    if m["decisions_logged"]:
+        parts.append(f"logged {m['decisions_logged']} "
+                     f"{_plural(m['decisions_logged'], 'decision')}")
+    lead = ", ".join(parts) if parts else "kept the operating layer running"
+    return (
+        f"{label}: {lead} — about {hours_estimate:g} hours of operational "
+        f"overhead absorbed (Conservative: assumes you'd have done each yourself "
+        f"at average speed)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator + audit event (SPEC C1 D1) — copies reconcile_and_receipt.
+# ---------------------------------------------------------------------------
+
+# Idempotency guard (v4.5.2 R4 / F-09+F-36): the writer double-emitted
+# byte-identical month receipts three separate times in the dogfood (Jul 1
+# ~22s apart, Jul 7 17s apart, Jul 8 10s apart — the skill re-emits on some
+# second pass). A value_receipt_generated event for the SAME window + rollup
+# with IDENTICAL numbers inside this interval is the same logical receipt:
+# skip the append and note the skip on the returned receipt. If the numbers
+# CHANGED (events landed between the two calls), the new snapshot is real and
+# still writes — the guard only kills verbatim duplicates.
+IDEMPOTENCY_GUARD = timedelta(minutes=10)
+
+
+def _find_recent_duplicate(events, window_str, rollup, metrics, hours_estimate):
+    """The most recent value_receipt_generated event that duplicates the
+    receipt about to be written (same window, rollup, metrics, and hours),
+    or None. Caller checks its age against IDEMPOTENCY_GUARD."""
+    latest = None
+    for ev in events:
+        if ev.get("type") != "value_receipt_generated":
+            continue
+        d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        if (
+            d.get("window") == window_str
+            and d.get("rollup") == rollup
+            and d.get("metrics") == metrics
+            and d.get("hours_estimate") == hours_estimate
+        ):
+            latest = ev  # append-ordered — keep the last one seen
+    return latest
+
+
+def preview_value_receipt(workspace_root, window_start, window_end, *,
+                          rollup="month") -> dict:
+    """cr1#928: the value receipt's numbers and sections WITHOUT the
+    `value_receipt_generated` row. The same reads and builders
+    `compute_value_receipt` uses, in the same order; appends nothing. The
+    monthly-report door job renders the operating report from this first, so
+    nothing serves the month's slot until that report exists, and only then
+    calls `compute_value_receipt` (pinned equal by
+    tests/run_skill_jobs_door_test.py)."""
+    events, _skipped = load_events_org_scoped(workspace_root)
+    computed = compute_metrics(events, window_start, window_end)
+    metrics = computed["metrics"]
+    hours_estimate = computed["hours_estimate"]
+    per_month = computed["per_month"]
+    coaching = coaching_block(workspace_root, window_start, window_end,
+                              events=events)
+    return {"window": computed["window"], "rollup": rollup,
+            "metrics": metrics, "hours_estimate": hours_estimate,
+            "per_month": per_month,
+            "sections": _build_sections(metrics, hours_estimate, per_month,
+                                        rollup, coaching)}
+
+
+def compute_value_receipt(
+    workspace_root,
+    window_start,
+    window_end,
+    *,
+    rollup="month",
+    source_skill="value-receipt",
+    output_path=None,
+):
+    """Compute the value receipt end-to-end and return a tamper-proof receipt.
+
+    Reads events.jsonl defensively, computes every metric IN CODE, appends ONE
+    `value_receipt_generated` audit event carrying the code's numbers, and
+    returns the receipt the skill renders. A skill that hand-rolls the numbers
+    leaves no event — detectable via `validate_receipt_ran` (the Bug #98/#99
+    enforcement model: an event is checkable, a printed sentence is not).
+
+    Receipts are point-in-time and window-pure: re-running appends a SECOND event
+    (correct — each is a snapshot) and never mutates prior events; there is no
+    cursor state to go stale. EXCEPTION (v4.5.2 R4 / F-36): a re-run inside
+    IDEMPOTENCY_GUARD whose window, rollup, AND numbers are identical to the
+    latest prior receipt skips the append — the returned receipt notes the
+    skip in `duplicate_guard` and the prior event remains the receipt of
+    record (validate_receipt_ran still passes for the window).
+
+    Args:
+      workspace_root: absolute workspace root (the dir containing _hq/).
+      window_start, window_end: ISO strings or datetimes; half-open
+        [start, end) (a calendar month is [1st, 1st-of-next)).
+      rollup: "month" (single window) or "quarter" (adds the per-month table).
+      source_skill: tag for the audit event.
+      output_path: optional path of the .docx the skill will write (the skill
+        writes the doc AFTER calling this, so it's usually None here).
+
+    Returns a receipt:
+      {
+        "ran": True,
+        "window": "<start-iso>..<end-iso>",
+        "rollup": str,
+        "metrics": {...},               # the SPEC C1 D4 metric set
+        "hours_estimate": float,
+        "per_month": [ {...} ],
+        "sections": [ ... ],            # ready to pass to make_brief
+        "summary": str,                 # verbatim chat line
+        "skipped_lines": int,           # malformed events.jsonl lines tolerated
+        "duplicate_guard": {            # v4.5.2 R4 idempotency note
+            "skipped": bool,            # True = duplicate write suppressed
+            "prior_receipt_ts": str?,   # ts of the receipt of record when skipped
+        },
+      }
+    """
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    # BUG-8330 fix round (FX-5) — measure what the personal firewall removed.
+    # An org receipt that cannot say how many rows it did not see is the same
+    # invisible-collapse shape item 6 closed on the confidence lane.
+    org_stats: dict = {}
+    events, skipped = load_events_org_scoped(workspace_root, stats=org_stats)
+
+    computed = compute_metrics(events, window_start, window_end)
+    metrics = computed["metrics"]
+    hours_estimate = computed["hours_estimate"]
+    per_month = computed["per_month"]
+    window_str = computed["window"]
+
+    start_dt = _parse_dt(window_start)
+    end_dt = _parse_dt(window_end)
+    label = window_label(start_dt, end_dt)
+
+    # COACH2 5.2 item 3 — computed from the SAME events this receipt already
+    # loaded, so the block and the counts above it describe one read of one
+    # book. An observed seat gets `renders: False` and no section.
+    coaching = coaching_block(workspace_root, window_start, window_end,
+                              events=events)
+    sections = _build_sections(metrics, hours_estimate, per_month, rollup,
+                               coaching)
+    summary = _build_summary(metrics, hours_estimate, label)
+
+    # Idempotency guard (v4.5.2 R4 / F-09+F-36): if the latest prior receipt
+    # for this window+rollup carries IDENTICAL numbers and is younger than
+    # IDEMPOTENCY_GUARD, this call is the double-emit bug — skip the append
+    # and note it. The prior event stays the receipt of record.
+    duplicate = _find_recent_duplicate(
+        events, window_str, rollup, metrics, hours_estimate
+    )
+    if duplicate is not None:
+        prior_dt = event_dt(duplicate)
+        now_dt = datetime.now(timezone.utc)
+        if prior_dt is not None and (now_dt - prior_dt) <= IDEMPOTENCY_GUARD:
+            return {
+                "ran": True,
+                "window": window_str,
+                "rollup": rollup,
+                "metrics": metrics,
+                "hours_estimate": hours_estimate,
+                "per_month": per_month,
+                "sections": sections,
+                "summary": summary,
+                "skipped_lines": len(skipped),
+                "duplicate_guard": {
+                    "skipped": True,
+                    "prior_receipt_ts": event_time(duplicate),
+                },
+            }
+
+    # ALWAYS append a value_receipt_generated AUDIT event carrying the CODE's
+    # numbers — even on an empty window. Enforcement points at THIS event
+    # (metrics + hours_estimate), not a printed sentence: a hand-rolled receipt
+    # with no event fails validate_receipt_ran. The payload numbers are
+    # byte-equal to the returned receipt (acceptance #3).
+    from atomic_write import atomic_append_jsonl
+    # No hand-stamped seq (BUG-8330 item 7) — appender allocates in-lock.
+    # WALKFIX1 Item C — `output_path` arrives from the calling skill, which
+    # knows the absolute path it is about to write. Persist the portable form.
+    from workspace_paths import to_workspace_relative
+    audit_event = {
+        "ts": _now_iso(),
+        "type": "value_receipt_generated",
+        "source_skill": source_skill,
+        "data": {
+            "window": window_str,
+            "rollup": rollup,
+            "metrics": metrics,
+            "hours_estimate": hours_estimate,
+            "output_path": (to_workspace_relative(output_path, workspace_root)
+                            if output_path else output_path),
+        },
+    }
+    # FX-5 / fix round 2: a MEASURED zero is written; an unmeasured read
+    # carries no key at all. `org_stats` is empty exactly when layer 3 did not
+    # run, and defaulting that to 0 would put a measurement on the permanent
+    # record that never happened.
+    for _k in ("personal_withheld", "personal_withheld_by_tie"):
+        if _k in org_stats:
+            audit_event["data"][_k] = int(org_stats[_k])
+    atomic_append_jsonl(events_path, [audit_event])
+
+    return {
+        "ran": True,
+        "window": window_str,
+        "rollup": rollup,
+        "metrics": metrics,
+        "hours_estimate": hours_estimate,
+        "per_month": per_month,
+        "sections": sections,
+        "summary": summary,
+        "skipped_lines": len(skipped),
+        "duplicate_guard": {"skipped": False},
+    }
+
+
+def validate_receipt_ran(workspace_root, *, window=None) -> dict:
+    """Read events.jsonl back and confirm a REAL value receipt was generated
+    (SPEC C1 D1). The ungameable check: a printed receipt with no
+    `value_receipt_generated` event returns ok=False.
+
+    Looks at the LATEST `value_receipt_generated` event. If `window` is given,
+    that event's `data.window` must match (so a stale prior receipt can't pass
+    for the requested window).
+
+    Returns {ok, ran, reason?, window, rollup, hours_estimate, metrics}.
+    """
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    if not events_path.exists():
+        return {"ok": False, "ran": False, "reason": "no activity log yet"}
+    events, _skipped = load_events_org_scoped(workspace_root)
+    latest = None
+    for ev in events:
+        if ev.get("type") == "value_receipt_generated":
+            latest = ev  # append-ordered -> keep the last one seen
+    if latest is None:
+        return {
+            "ok": False, "ran": False,
+            "reason": "no value_receipt_generated event — the receipt was not actually computed",
+        }
+    d = latest.get("data") or {}
+    if window is not None and d.get("window") != window:
+        return {
+            "ok": False, "ran": True,
+            "reason": f"latest receipt is for a different window "
+                      f"(window={d.get('window')!r} != expected {window!r})",
+            "window": d.get("window"),
+        }
+    return {
+        "ok": True, "ran": True,
+        "window": d.get("window"),
+        "rollup": d.get("rollup"),
+        "hours_estimate": d.get("hours_estimate"),
+        "metrics": d.get("metrics"),
+    }
+
+
+__all__ = [
+    "CONSERVATIVE_MINUTES_PER_UNIT",
+    "CONSERVATIVE_DISCLAIMER",
+    "IDEMPOTENCY_GUARD",
+    "compute_metrics",
+    "compute_value_receipt",
+    "validate_receipt_ran",
+    "window_label",
+    "build_receipt_tiles",
+]
+
+
+if __name__ == "__main__":
+    # Convenience CLI: read a JSON payload {workspace_root, window_start,
+    # window_end, rollup?} from the file path in argv[1], compute the receipt,
+    # and print it as JSON. Lets a skill shell in without inlining the logic.
+    import json
+
+    if len(sys.argv) < 2:
+        print("usage: value_receipt.py <payload.json>", file=sys.stderr)
+        raise SystemExit(2)
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    out = compute_value_receipt(
+        payload["workspace_root"],
+        payload["window_start"],
+        payload["window_end"],
+        rollup=payload.get("rollup", "month"),
+        source_skill=payload.get("source_skill", "value-receipt"),
+        output_path=payload.get("output_path"),
+    )
+    print(json.dumps(out, indent=2))

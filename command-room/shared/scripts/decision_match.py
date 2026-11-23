@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+"""
+Decision-CRU layer (v3.4.5+).
+
+Sister module to `cru_match.py`. Auto-resolves open decisions when a meeting
+transcript proves the decision was acted on, reversed, or superseded by a
+newer decision. Decisions, unlike commitments, do not have an obvious "send
+an email and we're done" closure path — they get re-decided, executed, or
+abandoned, almost always in conversation. So this module ships with Path 3
+(past-meetings transcript) only; Path 1 (apply-choices send) is left unwired
+for now because emails rarely state decision outcomes explicitly.
+
+THE MATCHING MODEL
+==================
+
+Same scoring engine as `cru_match.py` (max of unigram overlap coefficient
+and bigram Jaccard, tokenizer with stopword filter). Decisions are
+typically titled with content words ("Pivot to product-led GTM", "Switch
+ERP vendor to NetSuite") so the same tokenizer treats them well.
+
+Thresholds are intentionally TIGHTER than commitments — decisions are
+higher-stakes; a false-positive auto-resolution loses real history.
+
+  DECISION_HIGH_CONFIDENCE_THRESHOLD = 0.65  -> auto-resolve / supersede
+  below 0.65                                 -> no action
+
+(No medium-confidence "pending_review" path yet. If telemetry shows the
+0.65 threshold misses too many real closures, we'll add it and surface
+the proposals on the staff meeting.)
+
+RECOMMENDATION TYPES
+====================
+
+For each open decision + transcript pair:
+
+  - score >= HIGH AND completion language AND NOT reversal language
+        -> "decision_resolved" (the decision was executed)
+  - score >= HIGH AND reversal language
+        -> "decision_superseded" (a newer decision overrides the older one;
+            the writer is responsible for emitting the NEW decision event
+            separately — this helper only emits the superseded marker)
+  - else
+        -> "no_action"
+
+Per CONTRACT.md Rule 24 (CRU layer is silent): every event written here is
+silent in chat. The user sees the effect on the next DECISION_LOG view
+regen (superseded / resolved decisions filter out of the active list).
+"""
+from __future__ import annotations
+try:
+    from text_clip import clip  # noqa: E402
+except ImportError:  # pragma: no cover — direct-path fallback
+    import sys as _sys_tc
+    from pathlib import Path as _Path_tc
+    _sys_tc.path.insert(0, str(_Path_tc(__file__).resolve().parent))
+    from text_clip import clip  # noqa: E402
+
+import datetime
+import math
+import re
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+# Reuse the scoring + tokenizer infrastructure from cru_match — same engine,
+# different domain.
+from cru_match import load_events_defensively, score_match
+from cru_match import _content_tokens, fold_plural  # noqa: E402  cr1#1280
+
+# WALKFIX1 Item A — the same-fire fence reads a fence timestamp exactly the way
+# the commitment rail does; two copies of that normalization is how two rails
+# drift apart.
+from cru_match import _normalize_fire_start, _parse_ts  # noqa: E402
+from event_time import event_time  # noqa: E402
+
+# SUPERSEQ1 (walk finding F-11) — the decision-supersede target chains live in
+# ONE home, shared with render_decision_log. This module used to close by id
+# only, so a ruling superseded via any seq-shaped spelling (including the
+# top-level `supersedes_seq` the schema/gate accept) stayed "open" here and
+# could be re-proposed against.
+from event_types import (  # noqa: E402
+    decision_supersede_targets,
+    decision_resolve_targets,
+    decision_self_status,
+)
+
+# v3.5.0+: canonical source in shared/scripts/confidence.py. Aliased here
+# for back-compat — existing callers and __all__ exports keep the old name.
+from confidence import DECISION_MATCH_AUTO_RESOLVE
+
+# Bilingual overlay (Spanish beta) — inert for English installs. See
+# shared/scripts/lexicon.py + references/SPANISH_BUILD_PLAN.md.
+try:
+    import lexicon as _lex
+except Exception:  # pragma: no cover
+    _lex = None
+
+
+def _phrases(key, default):
+    """Merged decision phrase-list, or the English default when the overlay is
+    inactive/absent (production path)."""
+    if _lex is None:
+        return default
+    return _lex.load_lexicon_terms("decision_match", key, default)
+
+
+DECISION_HIGH_CONFIDENCE_THRESHOLD = DECISION_MATCH_AUTO_RESOLVE
+
+
+# =============================================================================
+# WALKFIX1 FR-2 — supersedes are RECOMMEND-ONLY.  ⚠ M-STRIKEABLE ⚠
+# =============================================================================
+#
+# THE EVIDENCE. On 2026-08-10 one past-meetings fire processed TWO transcripts
+# (both from the same client) and wrote NINETEEN `decision_superseded` events.
+# Six targeted decisions the same fire had just extracted — the Item A fence
+# kills those. The other thirteen targeted OLD decisions, and four of four
+# sampled from the live ledger were plainly wrong: a client onboarding call was
+# recorded as reversing an unrelated internal meeting time, an office-lease
+# decision, another person's login preference, and another client's video
+# platform.
+#
+# WHY SCORING CANNOT BE TRUSTED HERE, in three lines of mechanism:
+#   1. `score_match` is `max(unigram overlap coefficient, bigram Jaccard)`, and
+#      the overlap coefficient divides by `min(|A|,|B|)`. With a 45-minute
+#      transcript as A and a short title as B, the divisor is the TITLE's token
+#      set — any title whose content words all appear anywhere in the
+#      transcript scores 1.0.
+#   2. `detect_reversal_signal` is a WHOLE-TRANSCRIPT boolean over 20 phrases,
+#      one of which is "instead of".
+#   3. The two are ANDed with NO locality requirement — the reversal language
+#      need not be anywhere near the matched title.
+# There is no second gate. The attendee filter is not one: every affected
+# decision carried the operator's own person id, and he is on every call.
+#
+# WHY POSTURE AND NOT A THRESHOLD FIX. A supersede is a WRITE to the canonical
+# decision ledger, and a superseded decision drops out of the active view — so
+# a wrong one silently removes a real, unreversed decision from the customer's
+# "current decisions". Fixing the matcher properly (locality + a capped
+# divisor) is a redesign with its own risk and its own train. Refusing to
+# auto-write on a signal this weak costs one review click and cannot be wrong
+# in the dangerous direction. Recommend-only is the cheap half of the right
+# answer, taken now.
+#
+# WHAT IS UNCHANGED: the scoring, the thresholds, the phrase lists, the
+# attendee filter, and `decision_resolved` (completion language, a different
+# signal, not implicated in this finding). Only the supersede WRITE moves.
+#
+# ⚠ M'S TWO PATHS. They are DIFFERENT, and conflating them is what broke the
+# first version of this list (confirm review C-2: following it produced an
+# ImportError, because item 1 deletes constants that a test imports).
+#
+# PATH A — REVERSE THE POSTURE, keep the machinery. THREE edits, and the
+#   count is verified by execution rather than reasoned about (the first two
+#   drafts of this block said "one" and then "two"; both were wrong, and both
+#   were caught by actually performing the path):
+#
+#    (i)  RECOMMEND_ONLY_SUPERSEDES = False  — the runtime change. On its own
+#         this is enough to make supersedes auto-write again immediately.
+#   (ii)  `tests/run_walkfix1_recommend_only_test.py` — delete the single
+#         check "the SHIPPED default is recommend-only". It exists so a
+#         refactor cannot flip this flag SILENTLY; M reversing it on purpose
+#         is the supported act, and this check is the one thing that has to
+#         acknowledge the decision.
+#  (iii)  `tests/run_walkfix1_mutation_test.py` — delete mutations `W19` and
+#         `W19b` and their docstring rows (`W20`/`W22` are FR-3's; leave
+#         them). Both prove things about a posture
+#         that is now off: with the flag False, deleting the seam is a no-op,
+#         so the mutation cannot redden anything and the harness fails.
+#
+#   Nothing else moves. Every other assertion follows the flag rather than the
+#   posture — `run_decision_match_test.py`, the fence suite's `RECOMMEND`
+#   alias, and section [1] of the recommend-only suite all read
+#   `RECOMMEND_ONLY_SUPERSEDES` and assert whichever posture is configured.
+#   This is the path if the posture is wrong but the proposal vocabulary is
+#   worth keeping.
+#
+# PATH B — REMOVE IT ENTIRELY. Ten locations, and the battery is RED until
+#   all ten are done (verified by execution, not asserted):
+#
+#   1. `shared/scripts/decision_match.py` — this block, the flag, the two
+#      RECOMMEND_* constants below, the seam in `match_transcript_to_decisions`
+#      (marked "THE RECOMMEND-ONLY SEAM"),
+#      `build_decision_supersede_proposal_event`, and the three `__all__`
+#      entries naming them;
+#   2. `shared/data-schemas/events.schema.json` — the
+#      `decision_supersede_proposed` enum member;
+#   3. `shared/EVENT_TYPES.md` — the Decision-review lane entry;
+#   4. `shared/scripts/render_decision_log.py` — the `proposals_map` in
+#      `_categorize_decisions`, its `[SUPERSEDE PROPOSED]` rendering in
+#      `_format_decision_line`, and the docstring paragraph naming it;
+#   5. `skills/enable-command-room-schedules/references/orchestrator-past-meetings.md`
+#      — the Phase 4.6.b recommend-only paragraph, the proposal branch in its
+#      bash block (restore `build_decision_superseded_event`), and the
+#      `supersede_proposed=` counter in the diagnostic print;
+#   6. `tests/run_walkfix1_recommend_only_test.py` — the whole suite.
+#      (FR-3's pins live in `run_walkfix1_decision_repair_test.py` and
+#      STAY — FR-3 is not M-strikeable. They were in this suite once,
+#      and striking FR-2 disarmed FR-3 and left two mutations pointing
+#      at a deleted file. Found by performing the strike.);
+#   7. `tests/run_walkfix1_decision_fence_test.py` — the MODULE-level
+#      `RECOMMEND = (...)` conditional reverts to the plain
+#      `"decision_superseded"` literal. One binding; every section in that
+#      suite reads that one name (it was function-local once, with a second
+#      section referencing the constant directly, and striking only the named
+#      site left a NameError — found by performing the strike);
+#   8. `tests/run_walkfix1_mutation_test.py` — mutations `W19`, `W19b` and
+#      `W21` plus their docstring rows. `W20` and `W22` are FR-3's and
+#      stay, pointing at the repair suite;
+#   9. `CHANGELOG.md` — the "A meeting no longer closes decisions it only
+#      mentioned" section of the WALKFIX1 Unreleased block;
+#  10. `tests/run_decision_match_test.py` — **the one the first list missed.**
+#      It imports the three RECOMMEND_* symbols item 1 deletes, so leaving it
+#      alone is an ImportError, not a stale expectation. Drop them from the
+#      import and assert the `"decision_superseded"` literal again.
+#
+RECOMMEND_ONLY_SUPERSEDES = True
+
+# The recommendation the scorer produces, and the one the fire is allowed to
+# act on. Spelled as constants so the seam is one identifier, not a literal
+# scattered across a matcher, an orchestrator and three suites.
+RECOMMEND_SUPERSEDED = "decision_superseded"
+RECOMMEND_SUPERSEDE_PROPOSED = "decision_supersede_proposed"
+
+
+# Phrases indicating a decision was acted on / executed. Slightly different
+# from commitment-completion phrases — decisions get "selected" / "went with"
+# rather than "sent" / "delivered."
+DECISION_COMPLETION_PHRASES = (
+    "went with",
+    "going with",
+    "going forward with",
+    "moving forward with",
+    "moving ahead with",
+    "decided on",
+    "decided to go with",
+    "we chose",
+    "we selected",
+    "we picked",
+    "signed with",
+    "signed the",
+    "committed to",
+    "locked in",
+    "kicked off",
+    "starting with",
+    "rolled out",
+    "launched with",
+)
+
+
+# Phrases indicating a decision was reversed / superseded. The transcript
+# describes the OLD decision being abandoned in favor of a NEW one.
+DECISION_REVERSAL_PHRASES = (
+    "changed our mind",
+    "changed my mind",
+    "actually going with",
+    "actually we're going",
+    "actually decided",
+    "scratch that",
+    "scratch the",
+    "instead of",
+    "switching to",
+    "switching from",
+    "reconsidered",
+    "reversing",
+    "abandoning the",
+    "pulling back from",
+    "walked back",
+    "reverted",
+    "rethinking",
+    "pivoting from",
+    "pivoting away",
+    "decided against",
+)
+
+
+_DECISION_FIELD_ALIASES = {
+    # Mirror the commitment alias-table approach so decisions written in
+    # varying shapes by different writers (meeting-notes, decision-log,
+    # follow-up-ritual) all read correctly.
+    "title": ("title", "decision", "summary"),
+    "decided_by": ("decided_by", "made_by", "owner_id"),
+    # DECSHAPES1 — the status limb is now the SHARED spec: the canonical copy
+    # is `event_types.DECISION_SELF_STATUS_CHAIN`, which both this loader and
+    # the decision-log renderer read the decision's self-status through. Kept
+    # here so this table still documents the full decision shape, and pinned
+    # equal to the shared chain by the DECSHAPES1 drift guard — edit the
+    # vocabulary home, not this entry.
+    "status": ("status", "state"),
+    "rationale": ("rationale", "reason", "why"),
+}
+
+
+def _decision_field(ev: dict, field: str) -> Any:
+    """Read a decision-event field handling shape variants. Tries
+    `data.<alias>` first across the alias chain, then top-level `<alias>`.
+    Returns None if nothing found.
+    """
+    d = ev.get("data") or {}
+    aliases = _DECISION_FIELD_ALIASES.get(field, (field,))
+    for alias in aliases:
+        v = d.get(alias)
+        if v not in (None, ""):
+            return v
+    for alias in aliases:
+        v = ev.get(alias)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _decision_id(ev: dict) -> str:
+    """Stable id for an open decision. Mirrors `_commitment_id` shape so
+    closing events can point back via `data.decision_id`."""
+    d = ev.get("data") or {}
+    return d.get("id") or ev.get("id") or f"decision_seq_{ev.get('seq', '?')}"
+
+
+def detect_completion_signal(text: Optional[str]) -> bool:
+    """True if `text` contains a phrase suggesting a decision was executed
+    (`went with`, `signed with`, `committed to`, etc.).
+    """
+    if not text:
+        return False
+    lo = text.lower()
+    return any(phrase in lo for phrase in _phrases("completion_phrases", DECISION_COMPLETION_PHRASES))
+
+
+def detect_reversal_signal(text: Optional[str]) -> bool:
+    """True if `text` contains a phrase suggesting a decision was reversed
+    (`changed our mind`, `scratch that`, `switching to`, etc.).
+    """
+    if not text:
+        return False
+    lo = text.lower()
+    return any(phrase in lo for phrase in _phrases("reversal_phrases", DECISION_REVERSAL_PHRASES))
+
+
+# =============================================================================
+# SUPERSEDE-TOPICAL1 (cr1#1280): a supersede needs a LINE about its target.
+# =============================================================================
+#
+# One ordinary external meeting wrote six supersede proposals against past
+# decisions it never discussed. The whole-transcript score and the
+# whole-transcript reversal boolean above are each true of almost any long
+# call, and nothing tied them to one place. So before a reversal match may
+# become a supersede (proposed or written), ONE line of the transcript has to
+# carry both: a reversal phrase, and the decision's own words. That line goes
+# on the row as its evidence. No line, no supersede. Deterministic, no model.
+#
+# "The decision's own words" means the title's content words (stopwords and
+# contractions set aside by the shared tokenizer, plurals folded), minus the
+# filler below, which every transcript says about everything. The line must
+# share at least half of them (never fewer than two, unless the title has only
+# one), and at least one shared word must not be a capitalised name in the
+# title, so a line that merely names the same person cannot qualify.
+#
+# A line is one transcript line. A long line (a speaker turn with several
+# sentences) is read as overlapping two-sentence windows, so the words and
+# the reversal phrase must be within two sentences of each other.
+
+#: Words a meeting says about everything; never evidence of a topic.
+SUPERSEDE_FILLER_WORDS = frozenset({
+    "use", "using", "used", "make", "making", "made", "send", "sending",
+    "get", "getting", "got", "keep", "keeping", "kept", "take", "taking",
+    "took", "have", "having", "had", "need", "want", "think", "let", "say",
+    "said", "see", "come", "put", "set", "move", "moving", "start", "try",
+    "going", "go", "went", "run", "work", "decision", "decide", "decided",
+    "plan", "thing", "way", "time", "also", "can", "will", "one", "new",
+    "like", "really", "actually", "well", "there", "here", "yes", "yeah",
+    "okay", "ok", "talk", "call", "meeting",
+})
+
+#: Never fewer shared title words than this on the evidence line.
+SUPERSEDE_LINE_MIN_SHARED = 2
+
+_SUPERSEDE_EVIDENCE_MAX = 300
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+# A name-shaped speaker label only (one to four capitalised words, or the
+# Me / Them fallbacks), so "Decision on the separate app: ..." keeps its words.
+_SPEAKER_PREFIX_RE = re.compile(
+    r"^\s*(?:Me|Them|[A-Z][\w'’-]*(?: [A-Z][\w'’-]*){0,3}):\s+")
+
+
+def _topic_words(text: Optional[str]) -> set:
+    return {fold_plural(w) for w in _content_tokens(text)} - SUPERSEDE_FILLER_WORDS
+
+
+def _title_name_words(title: str) -> set:
+    """Person names in a title: runs of two or more capitalised words
+    ("Rio Sample", "Mira Stone"). A lone capitalised word ("Slack",
+    "Northwind") is a topic, not a name."""
+    words = re.findall(r"[A-Za-z][\w'’-]*", str(title or ""))
+    names: list = []
+    run: list = []
+    for w in words + [""]:
+        if w[:1].isupper():
+            run.append(w)
+            continue
+        if len(run) >= 2:
+            names.extend(run)
+        run = []
+    return _topic_words(" ".join(names))
+
+
+def locate_reversal_line(transcript_text: Optional[str],
+                         title: Optional[str]) -> Optional[dict]:
+    """The first transcript line (or two-sentence window of one) that carries
+    a reversal phrase AND touches the decision titled `title`.
+
+    Returns {"line", "line_no", "shared_words"} or None. `line` is the
+    transcript's own words, clipped; `line_no` is 1-based. Pure.
+    """
+    if not transcript_text or not title:
+        return None
+    title_words = _topic_words(title)
+    if not title_words:
+        return None
+    need = max(min(SUPERSEDE_LINE_MIN_SHARED, len(title_words)),
+               math.ceil(len(title_words) / 2))
+    common = title_words - _title_name_words(title)
+    phrases = _phrases("reversal_phrases", DECISION_REVERSAL_PHRASES)
+    for line_no, line in enumerate(str(transcript_text).splitlines(), start=1):
+        body = line.strip()
+        if not body:
+            continue
+        bounds = ([0] + [m.end() for m in _SENTENCE_END_RE.finditer(body)]
+                  + [len(body)])
+        n = len(bounds) - 1
+        spans = ([(0, len(body))] if n < 2 else
+                 [(bounds[i], bounds[i + 2]) for i in range(n - 1)])
+        for start, end in spans:
+            window = body[start:end].strip()
+            lo = window.lower()
+            if not any(p in lo for p in phrases):
+                continue
+            shared = _topic_words(_SPEAKER_PREFIX_RE.sub("", window, count=1)
+                                  if start == 0 else window) & title_words
+            if len(shared) < need:
+                continue
+            if common and not (shared & common):
+                continue
+            return {"line": window[:_SUPERSEDE_EVIDENCE_MAX],
+                    "line_no": line_no,
+                    "shared_words": sorted(shared)}
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Open-decision loader
+# -----------------------------------------------------------------------------
+
+
+def load_open_decisions(events_jsonl_path: str | Path) -> list[dict]:
+    """Read events.jsonl and return all `type: decision` events that have
+    NOT been closed by a subsequent `decision_resolved` or
+    `decision_superseded` event referencing them.
+
+    Mirrors `cru_match.load_open_commitments`. Returns full event dicts so
+    the caller can pull title / decided_by / primary_thread_id as needed.
+
+    Three closure routes, all through the shared vocabulary home so the
+    decision-log renderer cannot disagree (DECSHAPES1): an overlay closer
+    naming this decision (`decision_superseded` / `decision_resolved`, id or
+    seq spelling), a restamping `decision`, and the decision's OWN closing
+    status. Note the standing asymmetry, unchanged here: this loader has no
+    reaffirm-restore, so a closed-then-reaffirmed ruling is open in the
+    renderer and closed here (SUPERSEQ1 flagged it; it predates both builds
+    and applies to the id path too).
+    """
+    path = Path(events_jsonl_path)
+    if not path.exists():
+        return []
+
+    open_evs: list[dict] = []
+    closed_ids: set[str] = set()
+    # SUPERSEQ1 — seq-shaped supersede targets close too. Every accepted
+    # spelling (data-scope AND the schema's top-level `supersedes_seq`), plus
+    # the restamp shape: a NEW `decision` event carrying `supersedes_seq`
+    # retires the ruling at that seq. Chain home:
+    # event_types.decision_supersede_targets (same one the renderer walks).
+    closed_seqs: set = set()
+
+    # EVGUARD — the hand-rolled loop that used to live here caught only
+    # JSONDecodeError, so a top-level bare-string line parsed fine and the next
+    # `ev.get()` raised AttributeError out of the loader (Sub-bug #14b, second
+    # half). The canonical reader handles both malformed shapes and is
+    # shard-transparent; since_ts=None = full history.
+    events, _skipped = load_events_defensively(path, since_ts=None)
+    for ev in events:
+        et = ev.get("type") or ev.get("event") or ""
+        d = ev.get("data") or {}
+        if et in ("decision_resolved", "decision_superseded"):
+            did = (
+                d.get("decision_id")
+                or d.get("id")
+                or ev.get("decision_id")
+                or ev.get("id")
+            )
+            if did:
+                closed_ids.add(did)
+            # SUPERSEQ1 — a decision_superseded that names its target only by
+            # a seq spelling used to close NOTHING here (the renderer honored
+            # it since 2026-08-13; this reader never did — reader/reader
+            # drift). All accepted spellings now close, via the shared chain.
+            #
+            # DECSHAPES1 — the resolved closer walks its own shared function
+            # (same two chains; see event_types.DECISION_RESOLVE_ID_CHAIN).
+            # SUPERSEQ1 left this one id-only because the builder only ever
+            # writes `data.decision_id`; the gate accepts every other spelling
+            # too, and "the current writer only spells it one way" is the
+            # sentence that preceded all three prior instances of this class.
+            target_ids, target_seqs = decision_supersede_targets(ev)
+            closed_ids.update(target_ids)
+            closed_seqs.update(target_seqs)
+            resolve_ids, resolve_seqs = decision_resolve_targets(ev)
+            closed_ids.update(resolve_ids)
+            closed_seqs.update(resolve_seqs)
+        elif et == "decision":
+            # DECSHAPES1 — the self-status read moved to the shared home
+            # (event_types.decision_self_status), which reads the SAME alias
+            # chain in the SAME priority order this loader's `_decision_field`
+            # did, and which the decision-log renderer now binds to as well.
+            # Behavior here is unchanged; the point is that the renderer can
+            # no longer disagree with it about what the field says. Active is
+            # the default: legacy decisions carry "Active" (title-cased),
+            # "pending", or no status at all, and anything that is not an
+            # explicit "superseded" / "resolved" is open.
+            if decision_self_status(ev) is None:
+                open_evs.append(ev)
+            # SUPERSEQ1 — the restamp shape: this decision retires the ruling
+            # at the seq it names (self-reference excluded inside the helper).
+            # The restamping decision itself stays open; its target must not,
+            # or the matcher keeps scoring transcripts against a ruling the
+            # ledger already replaced.
+            _ids, restamp_seqs = decision_supersede_targets(ev)
+            closed_seqs.update(restamp_seqs)
+
+    return [
+        d for d in open_evs
+        if _decision_id(d) not in closed_ids
+        and d.get("seq") not in closed_seqs
+    ]
+
+
+# -----------------------------------------------------------------------------
+# Path 3 — match a meeting transcript to open decisions
+# -----------------------------------------------------------------------------
+
+
+def _ref_forms(ref: str) -> set:
+    """Every spelling ONE transcript reference can be on file under — the bare
+    id and the `granola:`-prefixed one. Same drift `meeting_capture.
+    _norm_ref_keys` absorbs; said here because a fence that matched only the
+    caller's spelling would be inert on exactly the callers that matter."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return set()
+    out = {ref}
+    if ":" in ref:
+        out.add(ref.split(":", 1)[1])
+    else:
+        out.add("granola:" + ref)
+    return {r for r in out if r}
+
+
+def _ref_in(ref: str, refs: set) -> bool:
+    """True when `ref` names the same transcript as something in `refs`."""
+    mine = _ref_forms(ref)
+    for other in refs:
+        if mine & _ref_forms(other):
+            return True
+    return False
+
+
+def proposal_pair_key(decision_id, source_ref) -> str:
+    """The identity of a (decision, transcript) supersede PROPOSAL.
+
+    CAPTUREONCE1 §2.3. A proposal is a question put to a human, and the same
+    question asked twice is not twice as informative — it is a pile. The
+    v5.30.0 attended run found 742 of them, most of them the same pairs over
+    and over, which is what made the review surface unusable and is why the
+    proposals needed a lifetime (DOORS1) in the first place. Keyed on the
+    PAIR, so a genuinely new transcript still proposes against an old decision
+    exactly once."""
+    ref = str(source_ref or "").strip()
+    # The bare id is the stable half of the two spellings (`granola:x` / `x`),
+    # so key on it and both spellings reduce to one pair.
+    if ":" in ref:
+        ref = ref.split(":", 1)[1]
+    return f"{str(decision_id or '').strip()}||{ref}"
+
+
+def seen_proposal_pairs(events_jsonl_path: str | Path) -> set:
+    """Every (decision, transcript) pair a `decision_supersede_proposed` event
+    already carries on disk. Read defensively — a malformed line is skipped,
+    never fatal.
+
+    `load_events_defensively` returns (events, skipped); iterating its return
+    value directly walks those two LISTS, which is an AttributeError on the
+    first step and takes the whole fire down with it. Found by this lane's
+    own pin, on the reader the orchestrator's Phase 4.6.b calls every fire."""
+    out: set = set()
+    events, _skipped = load_events_defensively(events_jsonl_path)
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") != RECOMMEND_SUPERSEDE_PROPOSED:
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        ref = data.get("source_ref")
+        if not ref:
+            continue
+        out.add(proposal_pair_key(data.get("decision_id"), ref))
+    return out
+
+
+def new_supersede_proposals(proposals, *, events_jsonl_path=None,
+                            seen_pairs=None) -> dict:
+    """Filter built supersede proposals down to the pairs never proposed
+    before — on disk OR earlier in this same batch.
+
+    Returns {"events", "n_duplicate_pairs"}. A proposal with no `source_ref`
+    cannot be paired and is PASSED THROUGH rather than dropped: refusing a row
+    because it is unidentifiable would lose a real proposal to a shape bug.
+    `build_decision_supersede_proposal_event` stamps the ref, so every proposal
+    this tree builds is identifiable."""
+    seen = set(seen_pairs) if seen_pairs is not None else (
+        seen_proposal_pairs(events_jsonl_path) if events_jsonl_path else set())
+    out: list = []
+    dupes = 0
+    for ev in proposals or []:
+        if not isinstance(ev, dict) or ev.get("type") != RECOMMEND_SUPERSEDE_PROPOSED:
+            out.append(ev)
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        ref = data.get("source_ref")
+        if not ref:
+            out.append(ev)
+            continue
+        key = proposal_pair_key(data.get("decision_id"), ref)
+        if key in seen:
+            dupes += 1
+            continue
+        seen.add(key)
+        out.append(ev)
+    return {"events": out, "n_duplicate_pairs": dupes}
+
+
+def match_transcript_to_decisions(
+    *,
+    open_decisions: list[dict],
+    attendee_person_ids: Iterable[str],
+    transcript_text: str,
+    workspace_root=None,
+    exclude_captured_since=None,
+    source_ref: Optional[str] = None,
+    processed_this_fire=None,
+) -> list[dict]:
+    """Path 3 — score a meeting transcript against open decisions.
+
+    Filters open_decisions to those touching at least one attendee (via
+    `person_ids` on the original decision event), then scores transcript
+    against each candidate's title.
+
+    THE SAME-FIRE CIRCULARITY FENCE (WALKFIX1 Item A)
+    -------------------------------------------------
+    `exclude_captured_since` is the fence Phase 4.6 has carried since
+    RECONFENCE and Phase 4.6.b did not. Pass the fire's own start (window
+    start / run start, ISO or datetime) and any decision captured at or after
+    it is dropped as a candidate BEFORE scoring — never created-then-
+    suppressed, so it cannot become a supersede TARGET at all.
+
+    Why the fence has to exist here specifically: this pass reads the SAME
+    transcripts Phase 4 just extracted decisions from. A call that decides
+    something and then discusses switching approach carries both the decision
+    and reversal-shaped language in one text, so without the fence the fire
+    scores its own seconds-old writes against the words they came out of and
+    supersedes them. Field-reported 2026-08-10: one fire wrote 8 decisions and
+    superseded 6 of them, evidence "Past meeting transcript (reversal
+    language)". Nothing was lost — lineage is append-only — but the log read
+    as though the call reversed itself, and any "current decisions" view for
+    that thread drops the call's live outcomes.
+
+    `None` (the default) leaves the fence INERT and every pre-WALKFIX1 caller
+    byte-identical. A malformed value fails SAFE and loud (never silently
+    inert) — `cru_match._normalize_fire_start` is the shared normalizer, so
+    both rails read one implementation of what a fence timestamp is. A
+    candidate whose own capture time is unparseable is EXCLUDED, the same
+    posture layer 2 documents for commitments: on this rail an admitted
+    unknown is a supersede of real history.
+
+    Recommendation logic (conservative, in order):
+      - score >= HIGH AND reversal AND NOT completion -> "decision_superseded"
+      - score >= HIGH AND completion AND NOT reversal -> "decision_resolved"
+      - score >= HIGH AND both signals present       -> "no_action"
+            (ambiguous — meeting mentions both executing and switching;
+             don't auto-act. Surface in transcript review instead.)
+      - score >= HIGH AND neither signal             -> "no_action"
+            (title match alone means "the topic came up," not that it
+             closed. Same conservative bias as commitments Path 3.)
+      - score < HIGH                                  -> "no_action"
+
+    THE THIS-FIRE FENCE (CAPTUREONCE1 §2.3, 2026-09-14)
+    ---------------------------------------------------
+    `exclude_captured_since` above fences the DECISIONS. This fences the
+    TRANSCRIPTS, and it is the other half of the same bug. Phase 4.6.b's
+    prose has always said "for each NEWLY-PROCESSED transcript", and nothing
+    in code made that true: every fire re-matched the whole processed archive
+    against every open decision, so one attended run wrote 742 supersede
+    proposals off transcripts it had not touched (B2.7). Two ways to say it,
+    either one enough:
+
+      `processed_this_fire`  the caller's own list of source_refs it processed
+                             on THIS fire. A transcript not in it is not
+                             matched at all. The explicit answer.
+      `source_ref` + `workspace_root` + `exclude_captured_since`
+                             the derived answer, for a caller that has no
+                             list: a transcript whose `meeting_processed`
+                             receipt predates the fire start was processed by
+                             an EARLIER fire, so this fire does not re-match
+                             it. Same predicate the capture gate uses.
+
+    BOTH ARMS RUN. They are cumulative, not alternatives (review F-4): the
+    list says which transcripts this fire touched, the receipt says whether
+    an earlier fire already did, and a transcript has to clear both. The
+    reference wiring builds its list from the same collection it loops over,
+    so the list arm alone is self-satisfying there and the derived arm is
+    what actually stops the burst.
+
+    Both default None → inert, and a caller that passes neither behaves
+    exactly as it did. `orchestrator-past-meetings.md` Phase 4.6.b now passes
+    `processed_this_fire`; it is not optional there.
+
+    Returns list of dicts sorted by score descending. Caller decides which
+    recommendations to write events for.
+    """
+    if not transcript_text or not open_decisions:
+        return []
+    # BOTH ARMS RUN, CUMULATIVELY (review F-4, 2026-09-14). They were an
+    # `if`/`elif`, and in the ONE wiring the reference block documents that
+    # made the sound arm unreachable: Phase 4.6.b builds `processed_this_fire`
+    # from the same collection it then loops over, so every ref the loop hands
+    # in is in the list it is checked against and the explicit arm can never
+    # refuse anything. The derived arm — "this transcript's receipt predates
+    # the fire start, so an EARLIER fire processed it" — is the one that can,
+    # and an `elif` switched it off exactly when a caller did as it was told.
+    if processed_this_fire is not None:
+        fired = {str(r).strip() for r in processed_this_fire if str(r or "").strip()}
+        ref = str(source_ref or "").strip()
+        if not ref or not _ref_in(ref, fired):
+            return []
+    if source_ref and workspace_root is not None and exclude_captured_since:
+        try:
+            from meeting_capture import processed_before
+            if processed_before(workspace_root, source_ref,
+                                exclude_captured_since):
+                return []
+        except Exception:
+            pass
+    attendee_set = {a for a in attendee_person_ids if a}
+
+    has_completion = detect_completion_signal(transcript_text)
+    has_reversal = detect_reversal_signal(transcript_text)
+    # WALKFIX1 Item A — the fence's own input, normalized through the SAME
+    # helper Phase 4.6 uses. `None` -> inert; unparseable -> fails safe + loud.
+    fire_start = _normalize_fire_start(exclude_captured_since)
+
+    results: list[dict] = []
+    for ev in open_decisions:
+        # Layer 2 — a transcript cannot corroborate a conclusion about a
+        # decision extracted from that same transcript in this same fire.
+        # Dropped before scoring, so the row is NEVER CREATED.
+        if fire_start is not None:
+            captured = _parse_ts(event_time(ev))
+            if captured is None or captured >= fire_start:
+                continue
+        # If we know the attendees and the decision tracked specific people,
+        # require at least one attendee overlap. Decisions with empty
+        # person_ids are workspace-wide; let them through.
+        #
+        # BUG-8244 fail-closed: an EMPTY attendee_set used to skip this
+        # filter entirely — every person-scoped decision workspace-wide got
+        # scored against the transcript, and a coincidental title match plus
+        # a generic completion phrase could auto-write decision_resolved.
+        # This was the one reader that turned a missing meeting binding into
+        # wrong PERSISTED state. Now an unverifiable overlap (no attendees
+        # resolved, decision person-scoped) may still be scored, but its
+        # auto recommendations are downgraded to "no_action" and flagged
+        # `attendee_unverified` — surface in review, never auto-act.
+        person_ids = set(ev.get("person_ids") or [])
+        attendee_unverified = bool(person_ids) and not attendee_set
+        if attendee_set and person_ids and not (attendee_set & person_ids):
+            continue
+
+        title = _decision_field(ev, "title") or ""
+        if not title:
+            continue
+        score = score_match(transcript_text, title)
+
+        # BUG-8330 item 6 — resolve through the calibration accessor so a
+        # workspace override moves this threshold; baked default unchanged.
+        try:
+            from confidence import decision_match_auto_resolve as _dmar
+            _threshold = _dmar(workspace_root)
+        except Exception:
+            _threshold = DECISION_HIGH_CONFIDENCE_THRESHOLD
+        if score < _threshold:
+            recommendation = "no_action"
+        elif has_reversal and not has_completion:
+            recommendation = RECOMMEND_SUPERSEDED
+        elif has_completion and not has_reversal:
+            recommendation = "decision_resolved"
+        else:
+            # Both signals (ambiguous) OR neither signal (topic came up but
+            # nothing closed). Stay conservative.
+            recommendation = "no_action"
+        if attendee_unverified and recommendation != "no_action":
+            recommendation = "no_action"
+
+        # SUPERSEDE-TOPICAL1 (cr1#1280): a reversal match needs one line that
+        # carries both the reversal phrase and this decision's words. Ahead of
+        # the seam, so it holds for a proposal and for a written supersede.
+        evidence_at = None
+        if recommendation == RECOMMEND_SUPERSEDED:
+            evidence_at = locate_reversal_line(transcript_text, title)
+            if evidence_at is None:
+                recommendation = "no_action"
+
+        # ================= THE RECOMMEND-ONLY SEAM (WALKFIX1 FR-2) ==========
+        # M-STRIKEABLE. See RECOMMEND_ONLY_SUPERSEDES for the argument and the
+        # complete strike set. Scoring above is UNTOUCHED; this changes only
+        # what the fire is allowed to WRITE off the back of it.
+        if RECOMMEND_ONLY_SUPERSEDES and recommendation == RECOMMEND_SUPERSEDED:
+            recommendation = RECOMMEND_SUPERSEDE_PROPOSED
+        # ===================================================================
+
+        row = {
+            "decision_id": _decision_id(ev),
+            "score": score,
+            "recommendation": recommendation,
+            "title": title,
+            "primary_thread_id": ev.get("primary_thread_id") or "",
+            "has_completion_signal": has_completion,
+            "has_reversal_signal": has_reversal,
+            "attendee_unverified": attendee_unverified,
+        }
+        if evidence_at is not None:
+            row["evidence_line"] = evidence_at["line"]
+            row["evidence_line_no"] = evidence_at["line_no"]
+        results.append(row)
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
+# -----------------------------------------------------------------------------
+# Event builders
+# -----------------------------------------------------------------------------
+
+
+def _now_iso() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+def build_decision_resolved_event(
+    *,
+    decision_id: str,
+    primary_thread_id: str,
+    source_skill: str,
+    evidence: str,
+    next_seq: int,
+) -> dict:
+    """Build a `decision_resolved` event — the decision was executed /
+    acted on. The original decision event stays in the log; the resolved
+    event closes it so the DECISION_LOG view filters it out of the
+    "Active" list.
+
+    Caller atomic_append_jsonl-s it.
+    """
+    return {
+        "seq": next_seq,
+        "ts": _now_iso(),
+        "type": "decision_resolved",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "data": {
+            "decision_id": decision_id,
+            "evidence": clip(evidence) if evidence else "",
+        },
+    }
+
+
+def build_decision_superseded_event(
+    *,
+    decision_id: str,
+    primary_thread_id: str,
+    source_skill: str,
+    evidence: str,
+    next_seq: int,
+    superseded_by_decision_seq: Optional[int] = None,
+) -> dict:
+    """Build a `decision_superseded` event — a newer decision overrides
+    this one. If the new decision is identifiable, pass its seq via
+    `superseded_by_decision_seq` so the log can render the cross-link.
+    The new decision itself is written separately (typically by
+    meeting-notes' decision extractor on the same transcript pass).
+    """
+    data = {
+        "decision_id": decision_id,
+        "evidence": clip(evidence) if evidence else "",
+    }
+    if superseded_by_decision_seq is not None:
+        data["superseded_by_decision_seq"] = superseded_by_decision_seq
+    return {
+        "seq": next_seq,
+        "ts": _now_iso(),
+        "type": "decision_superseded",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "data": data,
+    }
+
+
+def build_decision_supersede_proposal_event(
+    *,
+    decision_id: str,
+    primary_thread_id: str,
+    source_skill: str,
+    evidence: str,
+    next_seq: int,
+    score: Optional[float] = None,
+    title: str = "",
+    source_ref: str = "",
+    evidence_line: str = "",
+    evidence_line_no: Optional[int] = None,
+) -> dict:
+    """Build a `decision_supersede_proposed` event — WALKFIX1 FR-2.
+
+    SUPERSEDE-TOPICAL1 (cr1#1280): `evidence_line` is the transcript line the
+    proposal rests on (`match_transcript_to_decisions` answers it), with its
+    1-based `evidence_line_no`; both are written on the row when given.
+
+    A PROPOSAL, not a closure. It changes no decision's status: the decision
+    stays exactly where its owner left it, and the decision log renders the
+    proposal beside it so a human can adjudicate where the decision lives.
+    That is the whole difference from `build_decision_superseded_event`, and
+    it is the difference between "a meeting mentioned this" and "a meeting
+    reversed this" — a distinction the matcher cannot currently draw and
+    therefore must not act on alone.
+
+    Carries the SCORE and the matched TITLE deliberately. Whoever adjudicates
+    this is being asked to overrule a machine, and they can only do that if
+    they can see what the machine matched and how confidently.
+
+    CAPTUREONCE1 §2.3 — `source_ref` is the TRANSCRIPT this proposal came out
+    of, and it is written on the row. Without it the (decision, transcript)
+    pair cannot be read back off the ledger, so nothing could tell a second
+    proposal for a pair already proposed from a first proposal for a new one
+    — which is how one fire produced 742 of them. `new_supersede_proposals`
+    is the filter that reads it.
+    """
+    data = {
+        "decision_id": decision_id,
+        "proposed_action": RECOMMEND_SUPERSEDED,
+        "evidence": clip(evidence) if evidence else "",
+        "status": "proposed",
+    }
+    if source_ref:
+        data["source_ref"] = str(source_ref).strip()
+    if score is not None:
+        data["score"] = round(float(score), 4)
+    if title:
+        data["title"] = title[:200]
+    if evidence_line:
+        data["evidence_line"] = str(evidence_line)[:_SUPERSEDE_EVIDENCE_MAX]
+        if evidence_line_no is not None:
+            data["evidence_line_no"] = int(evidence_line_no)
+    return {
+        "seq": next_seq,
+        "ts": _now_iso(),
+        "type": RECOMMEND_SUPERSEDE_PROPOSED,
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "data": data,
+    }
+
+
+__all__ = [
+    "DECISION_HIGH_CONFIDENCE_THRESHOLD",
+    "DECISION_COMPLETION_PHRASES",
+    "DECISION_REVERSAL_PHRASES",
+    "RECOMMEND_ONLY_SUPERSEDES",
+    "RECOMMEND_SUPERSEDED",
+    "RECOMMEND_SUPERSEDE_PROPOSED",
+    "detect_completion_signal",
+    "detect_reversal_signal",
+    "locate_reversal_line",
+    "SUPERSEDE_FILLER_WORDS",
+    "load_open_decisions",
+    "match_transcript_to_decisions",
+    "build_decision_resolved_event",
+    "build_decision_superseded_event",
+    "build_decision_supersede_proposal_event",
+    "proposal_pair_key",
+    "seen_proposal_pairs",
+    "new_supersede_proposals",
+    "_decision_field",
+    "_decision_id",
+]

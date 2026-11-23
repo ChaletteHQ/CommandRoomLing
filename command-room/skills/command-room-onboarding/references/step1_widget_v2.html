@@ -1,0 +1,347 @@
+<!--
+  Step 1 setup widget — v8 (cr1#1163 part 2b, 2026-11-13: Q4 email draft
+  posture MOVED to onboarding step 5, asked after the pull through
+  onboarding_confirm; the AI-name question now closes the widget. Role
+  stays here because the pull reads it. v7: ONBOARD2, ruling 7, 2026-09-08:
+  Q5 check-in cadence REMOVED — the product never asks it; every seat is stamped
+  `light` unconditionally at Phase 0 submission. v6 added Q5 (SPEC QUIET1
+  D1); v5 removed Q2 email exclusions; v4 was SPEC FRP1 email
+  draft-posture; v3 was 2026-05-23 M1 redesign)
+
+  Self-contained HTML/JS. Loaded by skills/command-room-onboarding/SKILL.md
+  Phase 0, passed verbatim to mcp__visualize__show_widget. Bypasses
+  shared/scripts/chat_output_renderer.py — the Phase 0 widget is decoupled
+  from the standard CR renderer so onboarding doesn't share a single point
+  of failure with the scheduled-task orchestrator surfaces.
+
+  Three questions, progressive reveal:
+    Q1 — Role (six top chips, sub-chip drill-down, optional refinement textbox)
+    Q2 — Timezone (four US zones / Other-with-textbox)
+    Q3 — AI name (default "Penelope" / pick-your-own-with-textbox)
+
+  Submission shape (fires when Q3 closes):
+    apply choices: [{"n":1,"action":"<top>","sub":"<sub>","input":"<text>"}, ...]
+    `sub` and `input` are optional per tuple. Three tuples total.
+
+  Routes via apply-choices to command-room-onboarding "Reply handling — Phase 0
+  setup". Fire-marker event widget_kind = step_1_setup_v8.
+-->
+<div style="padding: 1rem 0;">
+<h2 class="sr-only">Phase 0 onboarding widget — three questions; role chips each open sub-chips; sub-chip click opens a refine textbox; every sub-group has its own Other option; the AI-name question closes the widget</h2>
+
+<div style="background: var(--color-background-secondary); border-radius: var(--border-radius-lg); padding: 1.25rem;">
+
+  <div style="margin-bottom: 1rem;">
+    <p style="margin: 0 0 4px; font-size: 16px; font-weight: 500;">Quick setup — three questions, then I'll scan your tools</p>
+    <p style="margin: 0; font-size: 13px; color: var(--color-text-secondary);">Pick a chip, refine a step deeper, add detail if helpful.</p>
+  </div>
+
+  <div data-q="1" class="qcard qactive" style="background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-md); padding: 14px 16px; margin-bottom: 10px;">
+    <div class="qhead">
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+        <i class="ti ti-user" style="font-size: 16px; color: var(--color-text-secondary);" aria-hidden="true"></i>
+        <span style="font-size: 14px; font-weight: 500;">Which best describes you?</span>
+        <span style="margin-left: auto; font-size: 11px; color: var(--color-text-tertiary);">1 / 3</span>
+      </div>
+      <div class="toprow" style="display: flex; flex-wrap: wrap; gap: 6px;">
+        <button class="chip top" data-v="run-company" data-label="Run a company">Run a company</button>
+        <button class="chip top" data-v="senior-leader" data-label="Senior leader (not owner)">Senior leader (not owner)</button>
+        <button class="chip top" data-v="investor" data-label="Investor / board / advisor">Investor / board / advisor</button>
+        <button class="chip top" data-v="client-work" data-label="Client work / service">Client work / service</button>
+        <button class="chip top" data-v="nonprofit" data-label="Nonprofit">Nonprofit</button>
+        <button class="chip top top-other" data-v="other" data-label="Other">Other&hellip;</button>
+      </div>
+      <div class="subrow" style="display: none; margin-top: 12px; padding-top: 12px; border-top: 0.5px solid var(--color-border-tertiary);">
+        <p style="margin: 0 0 8px; font-size: 12px; color: var(--color-text-secondary);">Refine:</p>
+        <div class="subchips" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+      </div>
+      <div class="refine-row" style="display: none; margin-top: 10px;">
+        <textarea class="refine-input" style="width: 100%; min-height: 50px; padding: 8px 10px; font-size: 13px; font-family: inherit; border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); background: var(--color-background-primary); color: var(--color-text-primary); resize: vertical; box-sizing: border-box;"></textarea>
+        <button class="next-btn" style="margin-top: 8px; padding: 6px 14px; font-size: 12px; font-family: inherit; border-radius: var(--border-radius-md);">Next <i class="ti ti-arrow-right" style="font-size: 13px; vertical-align: -2px;" aria-hidden="true"></i></button>
+      </div>
+    </div>
+    <div class="qsummary" style="display: none; font-size: 13px; color: var(--color-text-secondary);">
+      <i class="ti ti-check" style="font-size: 14px; color: var(--color-text-success); vertical-align: -2px; margin-right: 6px;" aria-hidden="true"></i>
+      <span class="summary-label"></span>
+    </div>
+  </div>
+
+  <div data-q="2" class="qcard qlocked" style="background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-md); padding: 14px 16px; margin-bottom: 10px; opacity: 0.4;">
+    <div class="qhead">
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+        <i class="ti ti-clock" style="font-size: 16px; color: var(--color-text-secondary);" aria-hidden="true"></i>
+        <span style="font-size: 14px; font-weight: 500;">What timezone are you in?</span>
+        <span style="margin-left: auto; font-size: 11px; color: var(--color-text-tertiary);">2 / 3</span>
+      </div>
+      <div class="toprow" style="display: flex; flex-wrap: wrap; gap: 6px;">
+        <button class="chip top simple" data-v="pacific" data-label="Pacific" disabled>Pacific</button>
+        <button class="chip top simple" data-v="mountain" data-label="Mountain" disabled>Mountain</button>
+        <button class="chip top simple" data-v="central" data-label="Central" disabled>Central</button>
+        <button class="chip top simple" data-v="eastern" data-label="Eastern" disabled>Eastern</button>
+        <button class="chip top top-other" data-v="other" data-label="Other" data-ph="City or IANA zone (London, Phoenix, Tokyo)" disabled>Other&hellip;</button>
+      </div>
+      <div class="refine-row" style="display: none; margin-top: 10px;">
+        <textarea class="refine-input" style="width: 100%; min-height: 44px; padding: 8px 10px; font-size: 13px; font-family: inherit; border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); background: var(--color-background-primary); color: var(--color-text-primary); resize: vertical; box-sizing: border-box;"></textarea>
+        <button class="next-btn" style="margin-top: 8px; padding: 6px 14px; font-size: 12px; font-family: inherit; border-radius: var(--border-radius-md);">Next <i class="ti ti-arrow-right" style="font-size: 13px; vertical-align: -2px;" aria-hidden="true"></i></button>
+      </div>
+    </div>
+    <div class="qsummary" style="display: none; font-size: 13px; color: var(--color-text-secondary);">
+      <i class="ti ti-check" style="font-size: 14px; color: var(--color-text-success); vertical-align: -2px; margin-right: 6px;" aria-hidden="true"></i>
+      <span class="summary-label"></span>
+    </div>
+  </div>
+
+  <div data-q="3" class="qcard qlocked" style="background: var(--color-background-primary); border: 0.5px solid var(--color-border-tertiary); border-radius: var(--border-radius-md); padding: 14px 16px; margin-bottom: 10px;">
+    <div class="qhead">
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+        <i class="ti ti-sparkles" style="font-size: 16px; color: var(--color-text-secondary);" aria-hidden="true"></i>
+        <span style="font-size: 14px; font-weight: 500;">What do you want to call your AI?</span>
+        <span style="margin-left: auto; font-size: 11px; color: var(--color-text-tertiary);">3 / 3</span>
+      </div>
+      <p style="margin: 0 0 10px; font-size: 12px; color: var(--color-text-secondary); line-height: 1.45;">Default is Penelope. Pick anything that feels right — Jarvis, Alfred, your own first name. She runs your Command Room and shows up by name in every chat (&ldquo;ask Penelope,&rdquo; &ldquo;Penelope said&rdquo;). Her workspace folder becomes <code>[Name]&rsquo;s Brain</code>.</p>
+      <div class="toprow" style="display: flex; flex-wrap: wrap; gap: 6px;">
+        <button class="chip top simple" data-v="default" data-label="Keep Penelope" disabled>Keep Penelope</button>
+        <button class="chip top top-other" data-v="custom" data-label="Pick my own" data-ph="A name (e.g., Jarvis, Alfred, Athena)" disabled>Pick my own&hellip;</button>
+      </div>
+      <div class="refine-row" style="display: none; margin-top: 10px;">
+        <input type="text" class="refine-input" maxlength="40" style="width: 100%; padding: 8px 10px; font-size: 13px; font-family: inherit; border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); background: var(--color-background-primary); color: var(--color-text-primary); box-sizing: border-box;" />
+        <button class="next-btn" style="margin-top: 8px; padding: 6px 14px; font-size: 12px; font-family: inherit; border-radius: var(--border-radius-md);">Finish <i class="ti ti-check" style="font-size: 13px; vertical-align: -2px;" aria-hidden="true"></i></button>
+      </div>
+    </div>
+    <div class="qsummary" style="display: none; font-size: 13px; color: var(--color-text-secondary);">
+      <i class="ti ti-check" style="font-size: 14px; color: var(--color-text-success); vertical-align: -2px; margin-right: 6px;" aria-hidden="true"></i>
+      <span class="summary-label"></span>
+    </div>
+  </div>
+
+  <p style="margin: 1rem 0 0; font-size: 12px; color: var(--color-text-tertiary);">Everything stays in the folder you chose. Nothing leaves your machine. I start light either way — a handful of questions a week at most — and you can say &ldquo;ask me more&rdquo; anytime.</p>
+
+</div>
+</div>
+
+<style>
+  .chip { padding: 5px 11px; font-size: 12px; font-family: inherit; border: 0.5px solid var(--color-border-secondary); border-radius: 999px; background: transparent; color: var(--color-text-primary); cursor: pointer; transition: background 0.1s, border-color 0.1s; }
+  .chip:hover:not(:disabled) { background: var(--color-background-secondary); }
+  .chip:disabled { cursor: not-allowed; }
+  .chip.selected { background: var(--color-text-primary); color: var(--color-background-primary); border-color: var(--color-text-primary); }
+  #cr-sf { width: 100%; margin-top: 10px; font-size: 12px; color: var(--color-text-secondary); }
+  #cr-sw { width: 100%; margin-top: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit; border: 0.5px solid var(--color-border-secondary); border-radius: var(--border-radius-md); background: var(--color-background-primary); color: var(--color-text-primary); resize: vertical; box-sizing: border-box; }
+</style>
+
+<script>
+  (function () {
+    const root = document.currentScript.parentElement;
+
+// WIDGETSEND1 — THE SHARED DISPATCHER, carried BYTE-FOR-BYTE from
+// shared/scripts/chat_output_renderer.py's _JS_CORE (the block from the
+// failure-message constant through the closing brace of crSendPrompt).
+// run_widgetsend1_test.py
+// extracts it from a rendered card and from this file and fails the build if
+// the two texts differ by one byte, so it stays at column 0 and already
+// tightened — do not re-indent it, do not reformat it, change it in the
+// renderer and copy it back here.
+//
+// Two sentences: crSf0 for a click that reached nothing, crSf1 for one that
+// reached a stage and then tripped inside it — telling that customer the
+// card "could not reach the chat" is how an answer that already went gets
+// hand-sent twice. The chrome from a previous failure is cleared at the top
+// of every dispatch, so a card that failed once and then worked stops asking
+// for a paste (REVIEW_WIDGETSEND1 RE-VERIFY N2).
+const crSf0='This card could not reach the chat. Copy the line below and paste it.';
+const crSf1='Sent. If nothing shows up in the chat in a moment, paste the line below.';
+const crSf2=' Why: the chat did not connect to this card within 15 seconds.';
+const crSf3='Waiting for the chat to be ready for your choices.';
+const crSwMs=15000;
+const crSq=new Map();
+function crSEl(h,i,g){let e=document.getElementById(i);if(!e){e=document.createElement(g);e.id=i;h.appendChild(e);}return e;}
+function crSApply(x){const b=document.getElementById('cr-apply');if(b)b.disabled=x;}
+function crSHeld(){return crSq.size>0;}
+function crSWait(){const d=document;crSEl(d.querySelector('.cr-footer')||d.body,'cr-sf','div').textContent=crSf3;crSApply(true);}
+function crSendFailed(t,c){const d=document,h=d.querySelector('.cr-footer')||d.body;
+const l=crSEl(h,'cr-sf','div');l.textContent=c;
+const w=crSEl(h,'cr-sw','textarea');w.readOnly=true;w.value=t;
+const b=d.getElementById('cr-apply');if(b)b.disabled=false;
+const m=()=>{l.textContent=c+' Copied.';};
+try{w.select();if(d.execCommand('copy'))return m();}catch(e){}
+try{navigator.clipboard.writeText(t).then(m,()=>{});}catch(e){}}
+function crSendPrompt(t,p){let c=crSf0;document.querySelectorAll('#cr-sf,#cr-sw').forEach(e=>e.remove());
+const q=crSq.get(t),s=q?q.s:Date.now();if(q){clearTimeout(q.h);crSq.delete(t);crSApply(false);}
+for(const g of[()=>window,()=>window.parent]){
+let o;try{o=g();}catch(e){continue;}
+if(o&&typeof o.sendPrompt==='function'){try{o.sendPrompt(t);return;}catch(e){c=crSf1;break;}}}
+if(c===crSf0){if(Date.now()-s<crSwMs){crSq.set(t,{s:s,h:setTimeout(()=>crSendPrompt(t,p),250)});crSWait();return;}c+=crSf2;}
+crSendFailed(p,c);}
+
+    const labels = { 1: 'Your role', 2: 'Timezone', 3: 'AI name' };
+    const selections = {};
+    // The visible summary each question collapses to — the customer's own
+    // answer in the card's words, kept so the paste line can be written in
+    // them (RE-VERIFY N4).
+    const summaries = {};
+
+    const subOptions = {
+      'run-company': [
+        { v: 'single-op-co', label: 'Single operating company', ph: 'Industry, size — optional' },
+        { v: 'holdco', label: 'Multiple companies (holdco)', ph: 'Portfolio size, industries — optional' },
+        { v: 'family-business', label: 'Family business', ph: 'Industry, generation, your role — optional' },
+        { v: 'other', label: 'Other', ph: 'Describe the company structure', other: true }
+      ],
+      'senior-leader': [
+        { v: 'c-suite', label: 'C-suite', ph: 'Role + company — optional' },
+        { v: 'vp', label: 'VP / SVP', ph: 'Function + company — optional' },
+        { v: 'director-below', label: 'Director or below', ph: 'Function + company — optional' },
+        { v: 'other', label: 'Other', ph: 'Describe your role + company', other: true }
+      ],
+      'investor': [
+        { v: 'gp-fund', label: 'GP / fund partner', ph: 'Fund + stage — optional' },
+        { v: 'board-director', label: 'Board director', ph: 'How many boards, kinds — optional' },
+        { v: 'independent-advisor', label: 'Independent advisor', ph: 'Areas of focus — optional' },
+        { v: 'family-office', label: 'Family office principal', ph: 'Mandate, AUM — optional' },
+        { v: 'other', label: 'Other', ph: 'Describe your investing role', other: true }
+      ],
+      'client-work': [
+        { v: 'consulting', label: 'Consulting', ph: 'Practice area, clients — optional' },
+        { v: 'agency', label: 'Agency', ph: 'Discipline, clients — optional' },
+        { v: 'professional-services', label: 'Professional services', ph: 'Legal, accounting, etc.' },
+        { v: 'other', label: 'Other', ph: 'Describe the service business', other: true }
+      ],
+      'nonprofit': [
+        { v: 'exec-director', label: 'Executive director', ph: 'Mission, org size — optional' },
+        { v: 'senior-staff', label: 'Senior staff', ph: 'Role + mission — optional' },
+        { v: 'board-member', label: 'Board member', ph: 'Boards, focus — optional' },
+        { v: 'other', label: 'Other', ph: 'Describe your nonprofit role', other: true }
+      ]
+    };
+
+    function collapseAndAdvance(qNum, summaryText) {
+      const card = root.querySelector('.qcard[data-q="' + qNum + '"]');
+      card.querySelector('.qhead').style.display = 'none';
+      card.querySelector('.qsummary').style.display = 'block';
+      card.querySelector('.qsummary .summary-label').textContent = labels[qNum] + ': ' + summaryText;
+      summaries[qNum] = summaryText;
+      card.classList.remove('qactive');
+      const next = root.querySelector('.qcard[data-q="' + (qNum + 1) + '"]');
+      if (next) {
+        next.classList.remove('qlocked');
+        next.classList.add('qactive');
+        next.style.opacity = '1';
+        next.querySelectorAll('.chip').forEach(function (c) { c.disabled = false; });
+      } else {
+        const payload = [1, 2, 3].map(function (n) { return Object.assign({ n: n }, selections[n]); });
+        // WIDGETSEND1 F2 — the SECOND argument is what the card shows and
+        // copies when no stage delivers, never the 'apply choices:' wire
+        // string. Every crSendPrompt call passes it.
+        //
+        // RE-VERIFY N4 — and it is the customer's OWN ANSWERS, in the words
+        // this card printed back to them as each question closed ('Your
+        // role: Run a company → Single operating company'), not the wire
+        // enums behind those chips. Nobody types 'run-company single-op-co'
+        // — it is an internal value the reader never saw — and the setup
+        // skill reads the labelled sentence, which is what a person would
+        // have written if the card had never rendered.
+        const typed = [1, 2, 3].map(function (n) {
+          return labels[n] + ': ' + (summaries[n] || '');
+        }).join('; ');
+        crSendPrompt('apply choices: ' + JSON.stringify(payload), typed);
+      }
+    }
+
+    function openRefine(card, ph, required) {
+      const row = card.querySelector('.refine-row');
+      const input = row.querySelector('.refine-input');
+      input.placeholder = ph;
+      input.dataset.required = required ? '1' : '0';
+      input.value = '';
+      row.style.display = 'block';
+      setTimeout(function () { input.focus(); }, 50);
+    }
+
+    function renderSubChips(card, topValue, topLabel) {
+      const subrow = card.querySelector('.subrow');
+      const subchips = card.querySelector('.subchips');
+      subchips.innerHTML = '';
+      subOptions[topValue].forEach(function (opt) {
+        const btn = document.createElement('button');
+        btn.className = 'chip sub';
+        btn.dataset.v = opt.v;
+        btn.dataset.label = opt.label;
+        btn.dataset.ph = opt.ph;
+        btn.dataset.other = opt.other ? '1' : '0';
+        btn.textContent = opt.label + (opt.other ? '…' : '');
+        btn.addEventListener('click', function () {
+          card.querySelectorAll('.chip.sub').forEach(function (c) { c.classList.remove('selected'); });
+          btn.classList.add('selected');
+          card.dataset.activeTop = topValue;
+          card.dataset.activeTopLabel = topLabel;
+          card.dataset.activeSub = opt.v;
+          card.dataset.activeSubLabel = opt.label;
+          openRefine(card, opt.ph, !!opt.other);
+        });
+        subchips.appendChild(btn);
+      });
+      subrow.style.display = 'block';
+    }
+
+    root.querySelectorAll('.chip.top').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.disabled) return;
+        const card = btn.closest('.qcard');
+        const qNum = Number(card.dataset.q);
+        const v = btn.dataset.v;
+        const lbl = btn.dataset.label;
+
+        card.querySelectorAll('.chip.top').forEach(function (c) { c.classList.remove('selected'); });
+        btn.classList.add('selected');
+
+        const subrow = card.querySelector('.subrow');
+        const refineRow = card.querySelector('.refine-row');
+
+        if (btn.classList.contains('simple')) {
+          if (subrow) subrow.style.display = 'none';
+          if (refineRow) refineRow.style.display = 'none';
+          selections[qNum] = { action: v };
+          collapseAndAdvance(qNum, lbl);
+          return;
+        }
+
+        if (btn.classList.contains('top-other')) {
+          if (subrow) subrow.style.display = 'none';
+          card.dataset.activeTop = v;
+          card.dataset.activeTopLabel = lbl;
+          card.dataset.activeSub = '';
+          card.dataset.activeSubLabel = '';
+          openRefine(card, btn.dataset.ph || 'Describe in your own words', true);
+          return;
+        }
+
+        if (refineRow) refineRow.style.display = 'none';
+        card.dataset.activeTop = v;
+        card.dataset.activeTopLabel = lbl;
+        renderSubChips(card, v, lbl);
+      });
+    });
+
+    root.querySelectorAll('.next-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        const card = btn.closest('.qcard');
+        const qNum = Number(card.dataset.q);
+        const input = card.querySelector('.refine-input');
+        const text = input.value.trim();
+        const required = input.dataset.required === '1';
+        if (required && !text) { input.focus(); return; }
+        const topV = card.dataset.activeTop;
+        const topL = card.dataset.activeTopLabel;
+        const subV = card.dataset.activeSub || null;
+        const subL = card.dataset.activeSubLabel || null;
+        const sel = { action: topV };
+        if (subV) sel.sub = subV;
+        if (text) sel.input = text;
+        selections[qNum] = sel;
+        let summary = topL;
+        if (subL) summary += ' → ' + subL;
+        if (text) summary += ' — ' + (text.length > 40 ? text.slice(0, 38) + '…' : text);
+        collapseAndAdvance(qNum, summary);
+      });
+    });
+  })();
+</script>

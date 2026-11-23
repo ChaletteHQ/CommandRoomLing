@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""
+Sent-mail commitment capture — deterministic half of the email-SENT leg
+(v4.6.2, BUG-3719).
+
+WHY THIS EXISTS
+---------------
+The operator's own outbound email promises had NO capture path (BUG-3719,
+critical): inbox-triage's extractor covers both directions but only ever sees
+`is:unread in:inbox` threads — a thread the operator read and replied to the
+same day was never a candidate, so a promise made in that reply was never
+scanned. reconcile-sent scans Sent daily but only CLOSED commitments — a
+promise never logged can never be reconciled. The Slack leg (v4.6.0 MC3, `slack_capture.classify_direction`)
+already treats the user's own sent messages as the PRIMARY promise source;
+email was the only channel where the user's own promises were second-class.
+This module mirrors that pattern for Gmail/Outlook Sent.
+
+Division of labor (same as the Slack leg): the SKILL does the semantic
+extraction — it reads the Step-2 Sent fetch, applies the Stage-D capture
+floor (owner + deliverable + consequence) and COMMITMENT_SCHEMA.md's
+extraction triggers, and decides what is a real commissive. This module does
+the parts that must be exact:
+
+  1. The capture block — `build_sent_commitment_event` runs THE shared
+     Stage-D / S2 / Stage-E gate (`capture_gate.gate_commitment_data`) every
+     capture writer runs: required `kind` classified at extraction,
+     due-or-no_due with silence rejected, task-with-counterparty rejected,
+     counterparty receipts joined into person_ids, and the pending_review
+     safety inversion. Owner is ALWAYS the resolved primary user — this leg
+     captures only the user's OWN outbound promises (inbound asks are
+     inbox-triage's lane; direction is fixed by the surface itself).
+  2. Cross-channel restatement dedup — `capture_gate.matches_open_commitment`
+     (same owner, same counterparty, the wording effectively the same)
+     against the OPEN set, so a sent email restating a meeting-sourced or
+     triage-sourced commitment MERGES into the item that already tracks it
+     instead of double-tracking (the case study's rec #4). Other words keep
+     both (cr1#747).
+  3. Idempotency — `already_captured` codifies the scan's Step-4 dedup rule
+     ((source_ref, title) — case-insensitive first-60-chars) with
+     `gmail:<message_id>` as the per-message source_ref anchor, so re-running
+     the sent pass never re-captures the same message. The restatement match
+     is the second layer (catches a re-extract whose title drifted).
+  4. The relevance gate — items route through W4c's `classify_capture`
+     (caution rail > org override > mode). The user is a party to every own
+     promise, so under party-only these OPEN — an org-level observed-only
+     override still routes them set-aside, and dated/money items always open.
+  5. The orchestration — `capture_sent_items` runs 1–4 over a batch and
+     appends through `event_gate.append_event` (ONE locked call), returning
+     a summary receipt. Per-item gate failures are collected LOUDLY into
+     `summary["errors"]` (never silently dropped) rather than crashing the
+     whole silent scheduled fire — reconcile-sent folds the counts into its
+     `sent_reconcile` audit event, so a bad extraction is visible in the
+     substrate, and the closes that already landed stay landed.
+
+Events omit `seq` (auto-stamped in the writer lock); `ts` is backdated to the
+message's send time (schema: ts is when the commitment was MADE). No parent
+event exists for sent mail (nothing writes `interaction` events for outbound
+threads — that gap IS this bug), so like the Slack leg there is no
+`source_event_seq`; the `gmail:<message_id>` source_ref is the provenance.
+
+Callers: reconcile-sent (via `reconcile_sent_commitments.reconcile_and_receipt
+(..., sent_commitment_items=...)`, the daily rescue path) and
+scan-for-commitments' outbound/Sent pass (the historical backfill path,
+`append=False` — the scan folds the built events into its own single batch).
+
+stdlib only; nothing here calls the network.
+"""
+from __future__ import annotations
+try:
+    from text_clip import clip  # noqa: E402
+except ImportError:  # pragma: no cover — direct-path fallback
+    import sys as _sys_tc
+    from pathlib import Path as _Path_tc
+    _sys_tc.path.insert(0, str(_Path_tc(__file__).resolve().parent))
+    from text_clip import clip  # noqa: E402
+
+import datetime as _dt
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from capture_gate import (  # noqa: E402
+    build_observed_event,
+    capture_cover,
+    cover_owner,
+    classify_capture,
+    gate_commitment_data,
+    intake_kwargs,
+    stamp_confidence as _stamp_confidence,
+    matches_open_commitment,
+    observed_from_commitment_event,
+    resolve_capture_mode,
+    same_wording,
+    workspace_capture_context,
+)
+from connector_adapters.provenance import (  # noqa: E402
+    LEGACY_MAIL_PROVIDER,
+    is_same_artifact,
+    resolve_mail_provider,
+)
+
+
+class SentItemError(ValueError):
+    """An extracted sent-mail item was malformed — fail loud so a bad
+    extraction is visible and goes back to the extractor, never silently
+    dropped or silently written wrong (the F-31 bug class; SweepItemError /
+    SlackItemError's sibling)."""
+
+
+def sent_source_ref(message_id: str, provider: Optional[str] = None) -> str:
+    """Provenance ref for a sent-mail capture: `<provider>:<message_id>` — the
+    spelling COMMITMENT_SCHEMA.md reserves for email artifacts. The message
+    id is the connector's canonical per-message id (stable across re-fetch),
+    so it is both the dedup anchor and traceable back to the send.
+
+    `provider` unresolved falls back to `LEGACY_MAIL_PROVIDER` — the anchor
+    every pre-connector-agnostic row on disk already carries, so the two sides
+    of a dedup comparison agree in that state. It is a BACK-COMPAT anchor, not
+    a preference: the callers with a workspace root in hand resolve the
+    declared email backend first (MAILSEAM item 5), so a Superhuman workspace
+    writes `superhuman:<id>` even when the skill forgets to pass one. Dedup is
+    format-proof either way: `already_captured` compares CANONICAL keys
+    (connector_adapters.provenance), not raw strings.
+    """
+    p = (provider or LEGACY_MAIL_PROVIDER).strip().lower() or LEGACY_MAIL_PROVIDER
+    mid = (message_id or "").strip()
+    if mid.lower().startswith(p + ":"):
+        mid = mid[len(p) + 1:].strip()
+    if not mid:
+        raise SentItemError("a sent-mail capture needs the message id")
+    return f"{p}:{mid}"
+
+
+def _parse_iso_date(value) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        _dt.date.fromisoformat(value.strip()[:10])
+        return True
+    except ValueError:
+        return False
+
+
+def build_sent_commitment_event(
+    title: str,
+    *,
+    message_id: str,
+    kind: str,
+    user_person_id: str,
+    ts: str = "",
+    due: Optional[str] = None,
+    no_due: bool = False,
+    counterparty_id: Optional[str] = None,
+    counterparty_name: Optional[str] = None,
+    evidence: str = "",
+    primary_thread_id: Optional[str] = None,
+    person_ids: Optional[List[str]] = None,
+    classification_confidence: Optional[float] = None,
+    pending_review: bool = False,
+    review_reason: str = "",
+    source_skill: str = "reconcile-sent",
+    provider: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> dict:
+    """One qualifying sent message → one canonical `commitment` event dict,
+    with the full capture block enforced in code (Stage-D kind, S2 due-nudge,
+    Stage-E counterparty receipts, pending_review inversion). Construction
+    only — append through `event_gate.append_event` (ids minted and seq
+    stamped inside the writer lock; C4's semantic dedup fires there).
+
+    `provider` (closeout 2026-07-12) — the seam-resolved provider of the mail
+    connector the message was read from (DiscoveryResult.platform / the
+    declared email backend's provider tag). This function is pure, so it
+    cannot resolve one itself: unresolved falls back to `LEGACY_MAIL_PROVIDER`
+    (MAILSEAM item 5). `capture_sent_items` — which HAS the workspace root —
+    resolves the declared backend before calling here, so the honest
+    attribution (`superhuman:<id>`, not `gmail:<superhuman-id>`) no longer
+    depends on a skill remembering to pass the argument. Dedup is format-proof
+    either way (canonical keys), but provenance honesty is not optional.
+
+    `thread_id` (SENTMATCH) — the CONVERSATION this promise was made in.
+    Stamped as `data.thread_ref` (`<provider>:<thread_id>`, the same spelling
+    as `source_ref`) so a LATER send in the same thread can be recognized as
+    the delivery: `source_ref` names a message, and a message id is not a
+    thread id, so without this field the thread prior has nothing to read on a
+    commitment. Optional — omitted → no `thread_ref`, and the prior simply
+    does not fire for that item rather than firing on a guess.
+
+    OWNER IS ALWAYS THE USER: this leg exists for the user's own outbound
+    promises, so `owner_id` is stamped from `user_person_id` — which MUST be
+    the `resolve_primary_user` result, never a guess (Bug #102: a wrong/None
+    user makes every downstream owner gate match nothing). An empty user id
+    fails loud here rather than minting an ownerless promise.
+
+    Resolve relative due phrases ("next week", "by Friday") against the
+    MESSAGE's send date, not the scan date, before calling this.
+
+    Raises SentItemError on anything the extraction must go back and do.
+    """
+    title = (title or "").strip()
+    if not title:
+        raise SentItemError("a sent-mail commitment needs a non-empty title")
+    source_ref = sent_source_ref(message_id, provider)
+    if not (user_person_id or "").strip():
+        raise SentItemError(
+            f"sent-mail commitment {source_ref} has no resolved user — "
+            f"resolve via resolve_primary_user (Bug #102), never guess; "
+            f"a sent-mail capture is by definition the user's own promise"
+        )
+
+    due_str = (due or "").strip()
+    data: dict = {
+        "title": title,
+        "kind": kind,
+        "due": due_str,
+        "owner_id": user_person_id,
+        "source_ref": source_ref,
+        "channel": "email",
+        # Origin discriminator (ACCOUNT_SCOPE §4a): sent-mail capture is a
+        # connector read — the account-scope wall treats it STRICT.
+        "origin": "connector",
+        # No parent event exists for a sent message (nothing writes outbound
+        # interaction events — that gap IS BUG-3719); like the Slack leg, the
+        # source_ref is the provenance and there is no source_event_seq.
+    }
+    if no_due:
+        data["no_due"] = True
+    _tid = (thread_id or "").strip()
+    if _tid:
+        # Same `<provider>:<id>` spelling as source_ref, via the same helper,
+        # so the two refs canonicalize through one code path.
+        data["thread_ref"] = sent_source_ref(_tid, provider)
+    if counterparty_id:
+        data["counterparty_id"] = counterparty_id
+    if counterparty_name and not counterparty_id:
+        data["counterparty_name"] = counterparty_name
+    if evidence:
+        data["evidence"] = clip(evidence)
+    if pending_review:
+        data["pending_review"] = True
+        if review_reason:
+            data["review_reason"] = review_reason
+
+    # THE shared capture block (v4.6.1 W4c consolidation — one implementation
+    # for every writer): Stage-D kind, S2 due-nudge, the promise-vs-task rule,
+    # and the pending_review safety inversion (absence of the flag is not
+    # consent; never unsets an extractor-set True).
+    gate_commitment_data(
+        data,
+        subject=f"sent-mail commitment {source_ref}",
+        classification_confidence=classification_confidence,
+        error_cls=SentItemError,
+    )
+
+    data["status"] = "open"
+    if due_str and _parse_iso_date(due_str):
+        if _dt.date.fromisoformat(due_str[:10]) < _dt.datetime.now(
+            _dt.timezone.utc
+        ).date():
+            data["status"] = "overdue"
+
+    # Stage E: a resolved counterparty is also a person reference — the
+    # dual-layer reader links via person_ids.
+    pids = [p for p in (person_ids or []) if p]
+    if user_person_id not in pids:
+        pids.append(user_person_id)
+    if counterparty_id and counterparty_id not in pids:
+        pids.append(counterparty_id)
+
+    event: dict = {
+        "type": "commitment",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "person_ids": pids,
+        "data": data,
+    }
+    # CONFCLAMP2 seam 4 of 5 (ATTRIB1-A A2): one confidence vocabulary, one
+    # write seam — clamped where it is written, never passed straight through.
+    _stamp_confidence(event, classification_confidence,
+                      holder="build_sent_commitment_event")
+    if ts is not None and str(ts).strip():
+        # cr1#767: backdate to when the promise was made, one spelling; a
+        # time nothing can read is refused, never stored raw.
+        from message_time import normalize_message_ts
+        event["ts"] = normalize_message_ts(ts)
+        if event["ts"] is None:
+            raise SentItemError(f"a sent-mail commitment time cannot be read: "
+                                f"{str(ts).strip()[:40]!r}")
+    return event
+
+
+def already_captured(workspace_root, message_id: str, title: str,
+                     provider: Optional[str] = None, *, owner=None) -> bool:
+    """Step-4 idempotency for the sent leg, codified: True when a commitment
+    with the same message identity AND the same title (ci, first 60 chars —
+    the scan's documented rule) is already on disk, OR a closure on that
+    message covers it (`capture_gate.capture_cover`: a closure of another
+    message's row covers only that row, and only by the same words,
+    cr1#884 and cr1#909; when `owner` is given, only a row the same person
+    owes, cr1#912). Every sent capture is the user's own promise, so the
+    pipeline passes the user. Shard-transparent via events_io.
+
+    R16 (connector-agnostic-v1): identity is the CANONICAL dedup key
+    (`connector_adapters.provenance.canonical_dedup_key`), so a legacy
+    `gmail:<Id>` source_ref (any case) and a structured-provenance row for the
+    SAME message reduce to one identity — the old raw byte-compare missed
+    both. This keys on the scan's own (identity, title) rule only — the
+    restatement match (`capture_gate.matches_open_commitment`) and C4's
+    semantic append-path layer run separately.
+
+    MAILSEAM item 5: `provider` unresolved is answered by the workspace's
+    DECLARED email backend, and the comparison runs through `is_same_artifact`
+    so EVERY label the same message can be on disk under counts. Both matter
+    together — resolving the provider without widening the comparison would
+    make a Superhuman workspace stop recognizing its own pre-declaration
+    `gmail:` rows and re-capture every one of them."""
+    try:
+        from events_io import iter_events
+    except ImportError:  # pragma: no cover
+        sys.path.insert(0, str(_HERE))
+        from events_io import iter_events
+    from connector_adapters.provenance import canonical_dedup_key
+
+    provider = resolve_mail_provider(workspace_root, provider)
+    want_id = sent_source_ref(message_id, provider).split(":", 1)[1]
+    # CAPTUREONCE1 §2.2 — ask the index first; same contract as the inbound
+    # leg. A hit is final (exact `(source_ref, title)` already on disk); a miss
+    # falls through to the scan, which additionally answers closures and
+    # substring titles. Accelerator only, never a new refusal.
+    try:
+        from source_ref_index import check as _idx_check
+        if _idx_check(workspace_root,
+                      source_ref=sent_source_ref(message_id, provider),
+                      title=title):
+            return True
+    except Exception:
+        pass
+    # INTAKE1 — A HELD ROW IS A CAPTURE: the cover reads `commitment_observed`
+    # as well as `commitment`, so a set-aside row is not re-held on every fire.
+    return capture_cover(
+        lambda: iter_events(workspace_root),
+        lambda ev: is_same_artifact(canonical_dedup_key(event=ev), provider, want_id),
+        title, owner=owner)
+
+
+def _closed_here(workspace_root, message_id, provider, match, title, *, memo) -> bool:
+    """True when `match` is a row a closure on THIS message closed, the
+    closure still standing, and the candidate's title does not agree with it
+    (the scan's title rule, or the same words). `memo` holds each message's
+    closed ids, read once per batch."""
+    from closure_index import closer_target_id
+    from connector_adapters.provenance import canonical_dedup_key
+    from cru_match import _commitment_id
+    from events_io import iter_events
+
+    mid = str(message_id or "").strip()
+    if not mid or not isinstance(match, dict):
+        return False
+    if mid not in memo:
+        from closure_index import ClosureIndex
+        want_id = sent_source_ref(mid, provider).split(":", 1)[1]
+        index, here = ClosureIndex(), {}
+        for pos, ev in enumerate(iter_events(workspace_root)):
+            index.fold(pos, ev)
+            if ev.get("type") in ("commitment_resolved", "thread_resolved") \
+                    and is_same_artifact(canonical_dedup_key(event=ev), provider, want_id):
+                here[closer_target_id(ev)] = pos
+        # Only a closure still in effect: a row reopened since is open again,
+        # and the restatement merges into it as before.
+        memo[mid] = {cid for cid, pos in here.items()
+                     if cid and index.closing_event(cid) is index.event_at.get(pos)}
+    if _commitment_id(match) not in memo[mid]:
+        return False
+    raw = str((match.get("data") or {}).get("title") or "")
+    theirs, mine = raw.strip().lower()[:60], str(title or "").strip().lower()[:60]
+    agree = bool(theirs and mine and (theirs in mine or mine in theirs))
+    return not (agree or same_wording(raw, title))
+
+
+def capture_sent_items(
+    workspace_root,
+    items,
+    *,
+    user_person_id,
+    opens=None,
+    source_skill: str = "reconcile-sent",
+    append: bool = True,
+    provider: Optional[str] = None,
+) -> dict:
+    """Run the full sent-capture pipeline over a batch of SKILL-extracted
+    commissives and (when `append=True`) land the survivors in ONE locked
+    append. The BUG-3719 fix's write path.
+
+    `items` — extraction dicts from the skill's semantic pass, one per
+    commissive found in the user's own sent messages:
+      {"message_id", "ts" (send-time ISO), "title", "kind",
+       "due" | "no_due": True, "counterparty_id" | "counterparty_name",
+       "evidence", "org_id"/"org_name" (the recipient's resolved org, for the
+       per-org override), "primary_thread_id", "person_ids",
+       "classification_confidence", "pending_review"/"review_reason",
+       "thread_id" (SENTMATCH — the mail thread, optional)}
+
+    Per item: (1) `already_captured` — a message already on disk is skipped
+    (idempotent re-runs); (2) the capture block via
+    `build_sent_commitment_event` — a malformed item lands LOUDLY in
+    `errors`, never silently dropped and never crashing the batch (this runs
+    inside a silent scheduled fire whose closes have already landed);
+    (3) restatement dedup vs the OPEN set + earlier items in this batch
+    (`matches_open_commitment`, user excluded from the party test) — a
+    cross-channel restatement records as `merged`, no write; (4) W4c
+    relevance routing (`classify_capture` with the org override resolved per
+    item) — observed-tier items convert via `observed_from_commitment_event`.
+
+    `opens` — pass a pre-loaded `load_open_commitments` projection to pin the
+    dedup baseline (reconcile-sent passes its PRE-close projection so a
+    restatement merges into its original even when this same fire just closed
+    it); None loads fresh. Not into a row this same message closed, unless
+    the titles agree or the words are the same: that row is what the send delivered, and another
+    promise on the send is its own row (cr1#884).
+
+    Returns {"ran": True, "opened", "merged", "observed", "skipped_existing",
+    "errors", "n_opened", "n_merged", "n_observed", "n_skipped", "n_errors",
+    "events"} — `events` carries the built dicts when `append=False` (the
+    scan folds them into its own single batch + preview).
+    """
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    # MAILSEAM item 5 — resolve the provider ONCE for the whole batch, from the
+    # declared email backend when the caller passed none. Every ref this batch
+    # writes and every key it dedups against is then attributed to the same
+    # answer, so half a batch can never land under one label and half under
+    # another.
+    provider = resolve_mail_provider(workspace_root, provider)
+    if opens is None:
+        from cru_match import load_open_commitments
+
+        opens = load_open_commitments(str(events_path))
+
+    ctx = workspace_capture_context(workspace_root)
+    user_names = ctx.get("user_names") or []
+
+    opened, merged, observed, skipped, errors = [], [], [], [], []
+    closed_here_memo: dict = {}
+    batch: list = []
+    accepted_open_events: list = []  # in-batch restatement guard
+
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("message_id") or ""
+        title = item.get("title") or ""
+        try:
+            if already_captured(workspace_root, mid, title, provider=provider,
+                                owner=cover_owner(user_person_id)):
+                skipped.append({"title": title, "message_id": mid})
+                continue
+            ev = build_sent_commitment_event(
+                title,
+                message_id=mid,
+                kind=item.get("kind"),
+                user_person_id=user_person_id,
+                ts=item.get("ts") or "",
+                due=item.get("due"),
+                no_due=bool(item.get("no_due")),
+                counterparty_id=item.get("counterparty_id"),
+                counterparty_name=item.get("counterparty_name"),
+                evidence=item.get("evidence") or "",
+                primary_thread_id=item.get("primary_thread_id"),
+                person_ids=item.get("person_ids"),
+                classification_confidence=item.get("classification_confidence"),
+                pending_review=bool(item.get("pending_review")),
+                review_reason=item.get("review_reason") or "",
+                source_skill=source_skill,
+                provider=provider,
+                # SENTMATCH — the conversation the promise was made in, so a
+                # later send in the same thread can be read as its delivery.
+                thread_id=item.get("thread_id"),
+            )
+        except SentItemError as e:
+            errors.append({"title": title, "message_id": mid, "error": str(e)})
+            continue
+
+        match = matches_open_commitment(
+            ev["data"],
+            list(opens) + accepted_open_events,
+            person_ids=ev.get("person_ids") or (),
+            exclude_party_ids={user_person_id},
+            exclude_party_names=user_names,
+            workspace_root=workspace_root,  # cr1#747: names on file set aside
+        )
+        if match is not None and _closed_here(workspace_root, mid, provider,
+                                              match, title, memo=closed_here_memo):
+            # cr1#884: the row this same send just closed is what it
+            # delivered. A candidate that only shares words with it is
+            # another promise on the send, kept as its own row; merging it
+            # into a closed row lost it. Only the delivered item's own title
+            # still merges.
+            match = None
+        if match is not None:
+            md = match.get("data") or {}
+            merged.append({
+                "title": title,
+                "message_id": mid,
+                "merged_into_id": md.get("id") or match.get("seq"),
+                "merged_into_title": md.get("title") or md.get("summary") or "",
+            })
+            continue
+
+        tier = classify_capture(
+            ev["data"],
+            mode=resolve_capture_mode(
+                workspace_root,
+                org_id=item.get("org_id"),
+                org_name=item.get("org_name"),
+            ),
+            user_id=user_person_id,
+            user_names=user_names,
+            team_ids=ctx.get("team_ids") or (),
+            known_ids=ctx.get("known_ids") or (),
+            # INTAKE1 — a sent-mail row's home is the thread's project when
+            # the thread resolved to one. A raw message id in the same field
+            # is not a project and is not a home (LEAK2's header regression,
+            # said as a gate).
+            **intake_kwargs(ctx,
+                            primary_thread_id=ev.get("primary_thread_id")),
+        )
+        if tier.get("tier") == "observed":
+            obs = observed_from_commitment_event(ev, reason=tier.get("reason") or "")
+            batch.append(obs)
+            observed.append({"title": title, "message_id": mid,
+                             "reason": tier.get("reason") or ""})
+        else:
+            batch.append(ev)
+            accepted_open_events.append(ev)
+            opened.append({
+                "title": title,
+                "message_id": mid,
+                "kind": ev["data"].get("kind"),
+                "due": ev["data"].get("due") or "",
+                "pending_review": bool(ev["data"].get("pending_review")),
+            })
+
+    if append and batch:
+        from event_gate import append_event
+
+        append_event(events_path, batch, holder=source_skill)
+
+    out = {
+        "ran": True,
+        "opened": opened,
+        "merged": merged,
+        "observed": observed,
+        "skipped_existing": skipped,
+        "errors": errors,
+        "n_opened": len(opened),
+        "n_merged": len(merged),
+        "n_observed": len(observed),
+        "n_skipped": len(skipped),
+        "n_errors": len(errors),
+    }
+    if not append:
+        out["events"] = batch
+    return out
+
+
+__all__ = [
+    "SentItemError",
+    "sent_source_ref",
+    "build_sent_commitment_event",
+    "already_captured",
+    "capture_sent_items",
+]

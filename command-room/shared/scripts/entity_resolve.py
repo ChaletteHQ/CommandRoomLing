@@ -1,0 +1,1111 @@
+#!/usr/bin/env python3
+"""
+Shared entity resolution: resolve a free-text name reference to a person /
+org / project record in `entities.json` via exact alias match → fuzzy
+(edit-distance) → phonetic (Soundex) — in that order (v3.13.0+).
+
+WHY THIS EXISTS:
+  Per the 2026-05-20 legacy Cowork handoffs #18 (transcript-search) and #31
+  (workspace-manager): two skills hit the same problem class — a user types
+  a name M's workspace knows about, but the skill's lookup misses because:
+
+    - The name is a misspelling (`Arya` for `Aria`)
+    - The name is phonetic (`Northstarr` for `Northstar`)
+    - The skill only does literal-token / exact-match lookup
+    - The aliases.json entry doesn't exist YET for that specific variant
+
+  Both skills now route through this helper. transcript-search calls it
+  BEFORE the literal-text score so name-bearing queries resolve to the
+  entity graph even when the literal token is absent from transcripts.
+  workspace-manager calls it as a fuzzy fallback step BEFORE falling to
+  the "Ambiguous → ask one question" branch, so misspelled names load
+  context instead of triggering clarifying questions for facts already
+  on disk.
+
+  Same helper, two consumers, one place to update. Same cascade pattern
+  as v3.13.0's other "fix once, many inherit" wins (email-writer widget
+  cascade, org_writer.py).
+
+PUBLIC API:
+  - resolve(workspace_root, query) → ResolveResult | None
+      Walks the 3-tier match ladder (exact → fuzzy → phonetic). Returns
+      the matched entity record + match-signal explanation. None if no
+      match crosses the confidence threshold.
+
+  - resolve_all(workspace_root, query) → list[ResolveResult]
+      Like `resolve` but returns ALL candidates above the threshold,
+      sorted by confidence. Use for disambiguation flows ("did you mean
+      Aria or Mira?").
+
+EXACT VS FUZZY VS PHONETIC:
+  - Exact: case-insensitive whitespace-normalized match against alias `raw`,
+    person.canonical_name, person.aliases[], org.canonical_name,
+    org.legal_name (F-05, v4.8.1), org.aliases[], project.canonical_name.
+    Confidence 1.0.
+  - Fuzzy: difflib.SequenceMatcher ratio ≥ 0.85 against the same surfaces.
+    Confidence == the ratio (0.85 - 1.0). Catches one-letter first-name typos.
+  - Phonetic: Soundex code match against names that share a sound-alike key.
+    Confidence 0.75 (constant — Soundex is binary match-or-not). Catches
+    `Northstarr` ≈ `Northstar`, `Arya` ≈ `Aria`.
+
+CONFIDENCE THRESHOLDS (open question per #31 handoff):
+  - 0.95+ → auto-load (highest confidence, no disambiguation needed)
+  - 0.85-0.95 → load + surface "did you mean X?" inline
+  - 0.75-0.85 → ask before loading
+  - <0.75 → no match returned
+
+Threshold tuning is at the consumer's discretion. The helper returns ALL
+candidates with confidence; the consumer picks what to do with them.
+"""
+from __future__ import annotations
+
+import difflib
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from entities_io import entities_collection  # noqa: E402
+
+# TZDATE3 — canonical date localizer (tz.py, hoisted TZDATE2). Guarded: a
+# stripped install missing tz.py keeps the pre-TZDATE3 UTC-slice behavior
+# exactly (matches the render_*.py precedent).
+try:
+    from tz import localize_date as _localize_date  # noqa: E402
+except ImportError:
+    def _localize_date(ts: str | None, workspace_path: str | None = None) -> str:
+        return ts[:10] if isinstance(ts, str) and ts else ""
+
+try:
+    from read_alarm import SubstrateReadError, record_read_alarm, remedy_line
+except ImportError:  # pragma: no cover
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from read_alarm import SubstrateReadError, record_read_alarm, remedy_line
+
+
+# Bilingual overlay (Spanish beta) — inert for English installs; accent-folding
+# turns on only when a workspace activates it. See shared/scripts/lexicon.py.
+try:
+    import lexicon as _lex
+except Exception:  # pragma: no cover
+    _lex = None
+
+
+EntityType = Literal["person", "org", "project", "open_proposal"]
+MatchSignal = Literal["exact_alias", "exact_canonical", "fuzzy", "phonetic",
+                      "open_proposal", "first_name_token", "token_prefix"]
+
+# IDN-01 (PARALLEL-A lane B, 2026-09-24): the two token tiers sit between
+# fuzzy (>= 0.85) and phonetic (0.75); the numbers place the tiers in the
+# final confidence sort. A query of fewer than TOKEN_PREFIX_MIN_CHARS
+# characters never reaches the prefix tier.
+FIRST_NAME_CONFIDENCE = 0.9
+TOKEN_PREFIX_CONFIDENCE = 0.8
+TOKEN_PREFIX_MIN_CHARS = 2
+
+
+
+@dataclass
+class ResolveResult:
+    """One candidate match for a free-text query.
+
+    Fields:
+      entity_type: kind of record ('person', 'org', 'project')
+      record: the full entity dict from entities.json
+      matched_via: which signal fired ('exact_alias', 'exact_canonical',
+        'fuzzy', 'phonetic')
+      matched_string: the alias/name string that matched
+      confidence: 0.0-1.0 numeric (1.0 = exact, ~0.85-1.0 = fuzzy ratio,
+        0.75 = phonetic match constant)
+      reason: short plain-English explanation for surfacing to the user
+        (e.g., "matched via alias 'Aria's company' to Northstar")
+    """
+    entity_type: EntityType
+    record: dict[str, Any]
+    matched_via: MatchSignal
+    matched_string: str
+    confidence: float
+    reason: str = field(default="")
+    # IDN-01: within a token tier the order is fuller-record-first, then most
+    # recent activity, then shorter name; `rank` carries that order through
+    # the final confidence sort (0 for every other tier - unchanged).
+    rank: int = field(default=0)
+
+    @property
+    def entity_id(self) -> str:
+        return self.record.get("id", "")
+
+    @property
+    def display_name(self) -> str:
+        # For projects, prefer display_name → canonical_name → folder_name
+        if self.entity_type == "project":
+            return (
+                self.record.get("display_name")
+                or self.record.get("canonical_name")
+                or self.record.get("folder_name")
+                or self.record.get("id", "")
+            )
+        return self.record.get("canonical_name") or self.record.get("id", "")
+
+
+# ---------- private helpers ----------
+
+
+def _normalize(s: str) -> str:
+    """Lowercase + collapse whitespace + strip. Use for comparison only;
+    preserve original casing in `matched_string` field.
+
+    Bilingual overlay (Spanish beta): when a workspace activates accent-folding,
+    also strip diacritics so "José"/"Jose" and "Peña"/"Pena" resolve to one
+    entity. Gated + a no-op on ASCII, so English installs are byte-identical."""
+    if not s:
+        return ""
+    out = re.sub(r"\s+", " ", s.strip().lower())
+    if _lex is not None and _lex.accent_fold_enabled():
+        out = _lex.fold_accents(out)
+    return out
+
+
+def _soundex(s: str) -> str:
+    """Compute a 4-character Soundex code for `s`. Sound-alike strings produce
+    the same code. Standard algorithm — no external deps.
+
+    Operates on the FULL string (whitespace stripped). For multi-token names
+    like `Aria Sample`, this computes the Soundex of the concatenated tokens —
+    which means single-word queries like `Arya` won't match `Aria Sample`.
+    For that case use `_soundex_tokens` (v3.13.2+) which returns per-token
+    codes, and compare against ANY of them in the resolver.
+
+    Examples:
+      _soundex('Aria') == 'A600'
+      _soundex('Arya') == 'A600'  → matches
+      _soundex('Northstar') == 'N632'
+      _soundex('Northstarr') == 'N632'  → matches
+    """
+    if not s:
+        return ""
+    s = s.upper().strip()
+    # Keep only A-Z
+    s = re.sub(r"[^A-Z]", "", s)
+    if not s:
+        return ""
+
+    # Soundex code map
+    code_map = {
+        **{c: "1" for c in "BFPV"},
+        **{c: "2" for c in "CGJKQSXZ"},
+        **{c: "3" for c in "DT"},
+        "L": "4",
+        **{c: "5" for c in "MN"},
+        "R": "6",
+    }
+
+    first = s[0]
+    encoded = [first]
+    prev_code = code_map.get(first, "")
+    for ch in s[1:]:
+        code = code_map.get(ch, "")
+        if code and code != prev_code:
+            encoded.append(code)
+        # H and W don't reset prev_code (per standard Soundex); vowels do.
+        if ch not in "HW":
+            prev_code = code
+
+    result = "".join(encoded)[:4]
+    # Right-pad with zeros to length 4
+    return (result + "0000")[:4]
+
+
+def _soundex_tokens(s: str) -> list[str]:
+    """Compute the Soundex code for each whitespace-separated token in `s`.
+
+    v3.13.2+ — closes the multi-token-name match gap. Without per-token
+    Soundex, single-word misspellings like `Arya` never matched canonical
+    names stored as `Aria Sample` (because the full-string Soundex of
+    `Aria Sample` is `A625`, not `A600`).
+
+    Examples:
+      _soundex_tokens('Aria Sample')  == ['A600', 'S514']
+      _soundex_tokens('Bo Stone')     == ['B000', 'S350']
+      _soundex_tokens('Sam')          == ['S500']
+      _soundex_tokens('')             == []
+    """
+    if not s:
+        return []
+    tokens = [t for t in s.strip().split() if t]
+    return [_soundex(t) for t in tokens if _soundex(t)]
+
+
+def _load_entities(workspace_root: Path) -> dict[str, Any]:
+    from entities_io import read_entities_json
+    path = workspace_root / "_hq" / "data" / "entities.json"
+    try:
+        return read_entities_json(path)
+    except FileNotFoundError:
+        raise  # fresh workspace — not corruption; pre-FS-15 behavior kept
+    except (json.JSONDecodeError, OSError) as e:
+        # FS-15 — an entities.json that EXISTS but won't read is corruption
+        # (or a sync cache serving a truncated copy). Record it, then raise
+        # a plain-English error instead of the raw traceback: resolution
+        # cannot proceed without the entity graph, and a cryptic
+        # JSONDecodeError mid-fire is how the model ends up improvising.
+        record_read_alarm(path, e, reader="entity_resolve")
+        raise SubstrateReadError(
+            f"Your workspace records file (entities.json) exists but would "
+            f"not read ({str(e)[:120]}) — likely mid-sync or a stale sync "
+            f"cache, and the records are NOT gone. {remedy_line()}"
+        ) from e
+
+
+def _load_aliases(workspace_root: Path) -> dict[str, Any]:
+    path = workspace_root / "_hq" / "data" / "aliases.json"
+    if not path.exists():
+        return {"mappings": {}}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        # FS-15 — keep the fallback (resolution degrades to canonical-name
+        # matching, which is survivable) but put the degradation ON THE
+        # RECORD so the brief / system-health surface it loudly.
+        record_read_alarm(path, e, reader="entity_resolve")
+        return {"mappings": {}}
+
+
+def _iter_alias_mappings(aliases: dict) -> list[dict]:
+    """Yield every mapping entry from aliases.json regardless of shape.
+
+    v3.13.6+ — closes the hard bug at entity_resolve.py:309 (pre-v3.13.6
+    iterated `mappings` as if it were a flat list, but the canonical
+    aliases.schema.json defines it as a `{people: [...], projects: [...],
+    orgs: [...]}` dict. On any real workspace with the canonical shape,
+    iterating yielded the string keys and `mapping.get('raw')` raised
+    AttributeError, crashing every `resolve()` / `resolve_all()` call).
+
+    cr1#954 / cr1#1011: the shapes are read by `alias_index.alias_rows`, the
+    one reader every alias reader shares. Each row carries `raw` and
+    `canonical_id` whatever the file spelled them. Before, this read only the
+    people / projects / orgs tiers, so a nickname kept under `threads` (the
+    tier the test brain writes) never resolved, and a plain or list-valued
+    `{alias: id}` dict gave nothing.
+    """
+    from alias_index import alias_rows
+
+    return alias_rows(aliases)
+
+
+def _unwrap_entities(entities: dict) -> dict:
+    """Return the entity collections regardless of whether entities.json
+    nests them under top-level (`{people: [...]}`) or under an `entities`
+    wrapper (`{entities: {people: [...]}}`, the canonical schema shape).
+
+    v3.13.6+ — closes the second half of the entity_resolve crash bug.
+    Pre-v3.13.6, callers iterated `entities.get("people", [])` against the
+    wrapper-shape file and got an empty list, so resolve() silently returned
+    no matches.
+    """
+    if isinstance(entities.get("entities"), dict):
+        return entities["entities"]
+    return entities
+
+
+def _find_entity_by_id(entities: dict, entity_id: str) -> tuple[EntityType, dict] | None:
+    """Walk the three top-level collections to find a record by id."""
+    e = _unwrap_entities(entities)
+    if entity_id.startswith("person_"):
+        for p in e.get("people", []):
+            if p.get("id") == entity_id:
+                return ("person", p)
+    elif entity_id.startswith("org_"):
+        for o in e.get("orgs", []):
+            if o.get("id") == entity_id:
+                return ("org", o)
+    elif entity_id.startswith("project_"):
+        # SPEC DUALKEY1: entities_collection(e, "projects") is now an alias
+        # for the canonical `threads` list — a single call is safe by
+        # construction, no more try-both.
+        for proj in entities_collection(e, "projects"):
+            if proj.get("id") == entity_id:
+                return ("project", proj)
+    return None
+
+
+def _iter_match_surfaces(entities: dict):
+    """Yield (entity_type, record, name_string) for every name-like field
+    across every entity in the workspace. The match ladder runs against
+    these surfaces in order — exact, then fuzzy, then phonetic.
+
+    v3.13.6+ — uses _unwrap_entities to handle both top-level + wrapped
+    shapes (the canonical entities.schema.json nests under `entities`).
+    """
+    e = _unwrap_entities(entities)
+    # People
+    for p in e.get("people", []):
+        canon = p.get("canonical_name")
+        if isinstance(canon, str) and canon.strip():
+            yield ("person", p, canon, "canonical")
+        for alias in (p.get("aliases") or []):
+            if isinstance(alias, str) and alias.strip():
+                yield ("person", p, alias, "alias")
+        for nick in (p.get("nicknames") or []):
+            if isinstance(nick, str) and nick.strip():
+                yield ("person", p, nick, "nickname")
+
+    # Orgs
+    for o in e.get("orgs", []):
+        canon = o.get("canonical_name")
+        if isinstance(canon, str) and canon.strip():
+            yield ("org", o, canon, "canonical")
+        # legal_name (F-05, v4.8.1) — the formal registered name, when it
+        # differs from canonical. Without this surface, "pull up [legal name]"
+        # missed orgs the workspace knows (HYG2 nit).
+        # Source label is "legal name" (space, not snake_case) because it
+        # interpolates into the user-surfaceable `reason` string.
+        legal = o.get("legal_name")
+        if isinstance(legal, str) and legal.strip():
+            yield ("org", o, legal, "legal name")
+        for alias in (o.get("aliases") or []):
+            if isinstance(alias, str) and alias.strip():
+                yield ("org", o, alias, "alias")
+
+    # Projects. SPEC DUALKEY1: entities_collection(e, "projects") is now an
+    # alias for the canonical `threads` list.
+    for proj in entities_collection(e, "projects"):
+        for field_name in ("canonical_name", "display_name", "folder_name"):
+            v = proj.get(field_name)
+            if isinstance(v, str) and v.strip():
+                yield ("project", proj, v, "canonical")
+
+
+# ---------- IDN-01: the first-name-token and whole-token-prefix tiers ----------
+
+
+def _person_name_tokens(record: dict) -> list[str]:
+    """The normalized whole tokens of a person's canonical name."""
+    canon = record.get("canonical_name")
+    if not isinstance(canon, str):
+        return []
+    return [t for t in _normalize(canon).split() if t]
+
+
+def _is_one_word_person(record: dict) -> bool:
+    return len(_person_name_tokens(record)) == 1
+
+
+def _parse_ts(ts) -> "datetime | None":
+    """An event `ts` as an AWARE datetime: `Z` and any `+hh:mm`/`-hh:mm`
+    offset honoured, a naive stamp read as UTC. None when unparseable.
+    Recency compares instants, never strings (REVIEW_PARALLEL_A N-5: the
+    ledger mixes `+00:00`, `Z`, local offsets and naive stamps)."""
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    raw = ts.strip()
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+# A whole `person_...` id inside an event's JSON text. The greedy tail stops
+# at the first character outside [0-9A-Za-z_], so a match IS a whole id, the
+# same boundary the per-id pattern below draws (N-4).
+_PERSON_ID_TOKEN = re.compile(r"(?<![0-9A-Za-z_])person_[0-9A-Za-z_]*")
+_PERSON_ID_SHAPE = re.compile(r"person_[0-9A-Za-z_]*")
+
+# One index per workspace, valid while the ledger files are byte-for-byte the
+# same size, mtime and inode (cr1#705). Building it is one pass over the ledger; the
+# old per-call scan read the whole ledger for every ranking, and one
+# commitment close ranks about ten times, so a Hub Apply of twenty closes read
+# a 12 MB ledger about two hundred times and ran out of the door's 150 s.
+_RECENCY_INDEX: dict[str, tuple[tuple, dict[str, tuple[datetime, str]]]] = {}
+
+
+def _ledger_stamp(workspace_root: Path) -> "tuple | None":
+    """Size, mtime and inode of every ledger file iter_events reads, in order;
+    None when any of them cannot be stat'ed (then nothing is cached)."""
+    try:
+        # cr1#1061: every file the merged read covers (per-computer logs too).
+        from events_io import log_files
+        stamp = []
+        for p in log_files(workspace_root):
+            st = Path(p).stat()
+            stamp.append((str(p), st.st_size, st.st_mtime_ns, st.st_ino))
+        return tuple(stamp)
+    except Exception:
+        return None
+
+
+def _person_recency_index(workspace_root: Path) -> "dict[str, tuple[datetime, str]] | None":
+    """Every `person_` id the ledger names -> (newest instant, its ts), from
+    one pass; cached per workspace until a ledger file changes. None when the
+    ledger cannot be read whole (the caller then scans exactly as before)."""
+    stamp = _ledger_stamp(workspace_root)
+    key = str(workspace_root)
+    hit = _RECENCY_INDEX.get(key)
+    if stamp is not None and hit is not None and hit[0] == stamp:
+        return hit[1]
+    index: dict[str, tuple[datetime, str]] = {}
+    try:
+        from events_io import iter_events
+        for ev in iter_events(workspace_root):
+            if not isinstance(ev, dict):
+                continue
+            ts = ev.get("ts")
+            when = _parse_ts(ts)
+            if when is None:
+                continue
+            blob = json.dumps(ev, default=str)
+            if "person_" not in blob:
+                continue
+            for pid in set(_PERSON_ID_TOKEN.findall(blob)):
+                prior = index.get(pid)
+                if prior is None or when > prior[0]:
+                    index[pid] = (when, ts)
+    except Exception:
+        return None
+    if stamp is not None and stamp == _ledger_stamp(workspace_root):
+        _RECENCY_INDEX[key] = (stamp, index)
+    return index
+
+
+def _person_recency_scan(workspace_root: Path, ids: set[str]) -> dict[str, str]:
+    """The per-id scan: any id, one full pass. Used for ids that are not of
+    the `person_` shape, and when the index cannot be built."""
+    out: dict[str, str] = {}
+    newest: dict[str, datetime] = {}
+    pats = {pid: re.compile(r"(?<![0-9A-Za-z_])" + re.escape(pid) + r"(?![0-9A-Za-z_])")
+            for pid in ids}
+    try:
+        from events_io import iter_events
+        for ev in iter_events(workspace_root):
+            if not isinstance(ev, dict):
+                continue
+            ts = ev.get("ts")
+            when = _parse_ts(ts)
+            if when is None:
+                continue
+            blob = json.dumps(ev, default=str)
+            for pid, pat in pats.items():
+                if pat.search(blob) and (pid not in newest or when > newest[pid]):
+                    newest[pid] = when
+                    out[pid] = ts
+    except Exception:
+        return out
+    return out
+
+
+def _person_recency(workspace_root: Path, person_ids: set[str]) -> dict[str, str]:
+    """The newest event `ts` that names each person id, read through
+    events_io (the full-history reader). A person no event names has no
+    entry. Defensive: an unreadable ledger returns {}.
+
+    An id is matched as a WHOLE id, never as a substring (`person_100` is not
+    named by a row naming `person_1000`; REVIEW_PARALLEL_A N-4), and "newest"
+    is the latest instant, not the largest string (N-5). Ids of the
+    `person_` shape are answered from one cached index per ledger state
+    (cr1#705); any other id is scanned for as before."""
+    ids = {i for i in person_ids if i}
+    if not ids:
+        return {}
+    shaped = {i for i in ids if _PERSON_ID_SHAPE.fullmatch(i)}
+    out: dict[str, str] = {}
+    index = _person_recency_index(workspace_root) if shaped else None
+    if index is None:
+        return _person_recency_scan(workspace_root, ids)
+    for pid in shaped:
+        if pid in index:
+            out[pid] = index[pid][1]
+    rest = ids - shaped
+    if rest:
+        out.update(_person_recency_scan(workspace_root, rest))
+    return out
+
+
+def _newest_first(ts: str) -> tuple:
+    """A sort key that orders event timestamps newest-first by INSTANT (N-5)
+    and puts a missing or unparseable timestamp last."""
+    when = _parse_ts(ts)
+    if when is None:
+        return (1, 0.0)
+    return (0, -when.timestamp())
+
+
+def _rank_token_tier(results: list, workspace_root: Path) -> None:
+    """Order a token tier's candidates in place: a fuller record (two or more
+    name tokens) before a one-word stub; then the most recent activity; then
+    the shorter name. The order lands in `rank` so the final confidence sort
+    keeps it."""
+    recency = _person_recency(workspace_root, {r.entity_id for r in results})
+    results.sort(key=lambda r: (_is_one_word_person(r.record),
+                                _newest_first(recency.get(r.entity_id, "")),
+                                len(r.matched_string)))
+    for i, r in enumerate(results):
+        r.rank = i
+        if r.entity_id in recency:
+            when = _localize_date(recency[r.entity_id], workspace_root) or recency[r.entity_id][:10]
+            r.reason += f" (last named {when})"
+
+
+def _first_name_token_people(entities: dict, query_norm: str, seen_ids: set) -> list:
+    """Every person whose canonical name's FIRST token equals the query."""
+    out: list = []
+    e = _unwrap_entities(entities)
+    for p in e.get("people", []):
+        if p.get("id") in seen_ids:
+            continue
+        toks = _person_name_tokens(p)
+        if toks and toks[0] == query_norm:
+            out.append(ResolveResult(
+                entity_type="person", record=p, matched_via="first_name_token",
+                matched_string=p.get("canonical_name", ""), confidence=FIRST_NAME_CONFIDENCE,
+                reason=f"first name {query_norm!r} matches {p.get('canonical_name', '')!r}",
+            ))
+            seen_ids.add(p.get("id", ""))
+    return out
+
+
+def _token_prefix_people(entities: dict, query_norm: str, seen_ids: set) -> list:
+    """Every person one of whose WHOLE name tokens starts with the query (a
+    prefix of a token, never a substring inside one)."""
+    out: list = []
+    if len(query_norm) < TOKEN_PREFIX_MIN_CHARS:
+        return out
+    e = _unwrap_entities(entities)
+    for p in e.get("people", []):
+        if p.get("id") in seen_ids:
+            continue
+        toks = _person_name_tokens(p)
+        hit = next((t for t in toks if t.startswith(query_norm) and t != query_norm), None)
+        if hit is not None:
+            out.append(ResolveResult(
+                entity_type="person", record=p, matched_via="token_prefix",
+                matched_string=p.get("canonical_name", ""), confidence=TOKEN_PREFIX_CONFIDENCE,
+                reason=f"{query_norm!r} starts the name token {hit!r} in {p.get('canonical_name', '')!r}",
+            ))
+            seen_ids.add(p.get("id", ""))
+    return out
+
+
+# ---------- public API ----------
+
+
+def resolve(
+    workspace_root: str | Path,
+    query: str,
+    *,
+    min_confidence: float = 0.75,
+) -> ResolveResult | None:
+    """Return the single best match for `query`, or None if no match crosses
+    `min_confidence`. Walks the 3-tier ladder (exact → fuzzy → phonetic) and
+    returns the first hit at each tier.
+
+    For ambiguous cases (multiple candidates at the same tier), this returns
+    just the top one. Callers that need disambiguation should use `resolve_all`.
+    """
+    candidates = resolve_all(workspace_root, query, min_confidence=min_confidence)
+    return candidates[0] if candidates else None
+
+
+def resolve_all(
+    workspace_root: str | Path,
+    query: str,
+    *,
+    min_confidence: float = 0.75,
+    max_candidates: int = 10,
+    include_open_proposals: bool = False,
+) -> list[ResolveResult]:
+    """Return every match above `min_confidence`, sorted by confidence
+    descending. Used for disambiguation flows.
+
+    Match order: exact_alias > exact_canonical > fuzzy > phonetic. Within a
+    tier, results are sorted by name length (shorter matches first — they're
+    typically more specific).
+
+    WG1-B D-B5 — `include_open_proposals=True` adds an OPT-IN final tier: on a
+    total entities.json miss (no candidate at any tier), the query is
+    name-matched against the open `person_proposal` queue
+    (`confirm_flow.load_open_person_proposals`). A hit returns the distinct
+    `entity_type="open_proposal"` result carrying the proposal row verbatim
+    (name / evidence / captured_ts / seq / fingerprint) so a mention of a
+    person the workspace has a PENDING proposal for surfaces that proposal
+    instead of a cold "who is X" — a mention is corroboration, never
+    auto-adjudication (the confirm flow keeps the click). Default False keeps
+    every existing caller byte-identical — the proposal read never even runs.
+    """
+    workspace_root = Path(workspace_root)
+    if not query or not query.strip():
+        return []
+
+    query_norm = _normalize(query)
+    query_soundex = _soundex(query)
+    # N-7 (REVIEW_PARALLEL_A): a single-token query's trailing .,;:!? is not
+    # part of the name ("Quinn." is "Quinn") for the exact rung and the token
+    # tiers; a multi-token query is untouched.
+    query_single_token = len(query.strip().split()) == 1
+    token_query = (query_norm.rstrip(".,;:!?") or query_norm) if query_single_token else query_norm
+
+    entities = _load_entities(workspace_root)
+    aliases = _load_aliases(workspace_root)
+
+    results: list[ResolveResult] = []
+    seen_ids: set[str] = set()  # dedupe — same entity may match via multiple surfaces
+
+    # Tier 1a: exact match against aliases.json mappings (the canonical alias graph)
+    # v3.13.6+ — uses _iter_alias_mappings to handle BOTH the canonical
+    # dict-of-lists shape AND the legacy flat-list shape. See _iter_alias_mappings.
+    # N-2 (REVIEW_T2_RED1): the aliases.json rung strips a single-token
+    # query's trailing terminator exactly like tier 1b ("Q." hits "Q").
+    # N-4 (REVIEW_T3_SEAMS3): an exact RAW hit outranks a stripped one. The
+    # raw pass runs first and the exact rung returns in list order (no sort),
+    # so "Q." -> A comes before "Q" -> B on the query "Q.", whatever the file
+    # order. A query with nothing to strip runs one pass, as before.
+    for wanted in dict.fromkeys((query_norm, token_query)):
+        for mapping in _iter_alias_mappings(aliases):
+            raw = mapping.get("raw")
+            canonical_id = mapping.get("canonical_id")
+            if not isinstance(raw, str) or not isinstance(canonical_id, str):
+                continue
+            if _normalize(raw) != wanted:
+                continue
+            if canonical_id in seen_ids:
+                continue
+            match = _find_entity_by_id(entities, canonical_id)
+            if match is None:
+                continue
+            entity_type, record = match
+            results.append(ResolveResult(
+                entity_type=entity_type,
+                record=record,
+                matched_via="exact_alias",
+                matched_string=raw,
+                confidence=1.0,
+                reason=f"matched alias {raw!r} → {record.get('canonical_name', canonical_id)}",
+            ))
+            seen_ids.add(canonical_id)
+
+    # Tier 1b: exact match against entity canonical_name / aliases / nicknames
+    for entity_type, record, name, source in _iter_match_surfaces(entities):
+        if record.get("id") in seen_ids:
+            continue
+        if _normalize(name) not in (query_norm, token_query):
+            continue
+        results.append(ResolveResult(
+            entity_type=entity_type,
+            record=record,
+            matched_via="exact_canonical" if source == "canonical" else "exact_alias",
+            matched_string=name,
+            confidence=1.0,
+            reason=f"matched {source} {name!r} → {record.get('canonical_name', record.get('id', ''))}",
+        ))
+        seen_ids.add(record.get("id", ""))
+
+    # IDN-01 (PARALLEL-A lane B): an exact hit on a ONE-WORD person record (a
+    # stub such as a bare first name) does not close the ladder when a FULLER
+    # person shares that first-name token. The stub is re-tiered to
+    # `first_name_token` beside the fuller records and the tier's order
+    # decides (fuller first, then most recent activity). With no fuller record
+    # the stub wins exactly as before - byte-identical for every other query.
+    # A caller asking for exact-only matches (`min_confidence=1.0`, the
+    # counterparty-drop rail in `commitment_parties`) must never receive the
+    # 0.9 re-tiered set: the rule is gated on the tier's own confidence, and
+    # falls through to the exact-wins return below (REVIEW_PARALLEL_A N-1).
+    if (results and query_single_token
+            and FIRST_NAME_CONFIDENCE >= min_confidence
+            and all(r.entity_type == "person" and _is_one_word_person(r.record) for r in results)):
+        fuller = _first_name_token_people(entities, token_query, seen_ids)
+        if fuller:
+            retiered = [ResolveResult(
+                entity_type=r.entity_type, record=r.record, matched_via="first_name_token",
+                matched_string=r.matched_string, confidence=FIRST_NAME_CONFIDENCE,
+                reason=r.reason + " (a one-word record; a fuller record shares this first name)",
+            ) for r in results]
+            tier = fuller + retiered
+            _rank_token_tier(tier, workspace_root)
+            return tier[:max_candidates]
+
+    # If we have any tier-1 (exact) matches, we're done — no need to fuzzy/phonetic.
+    # Exact match always wins.
+    if results:
+        return results[:max_candidates]
+
+    # Tier 2: fuzzy match (edit-distance ratio)
+    # Use difflib.SequenceMatcher.ratio() against every name surface.
+    FUZZY_THRESHOLD = max(0.85, min_confidence)
+    for entity_type, record, name, source in _iter_match_surfaces(entities):
+        if record.get("id") in seen_ids:
+            continue
+        ratio = difflib.SequenceMatcher(None, query_norm, _normalize(name)).ratio()
+        if ratio < FUZZY_THRESHOLD:
+            continue
+        results.append(ResolveResult(
+            entity_type=entity_type,
+            record=record,
+            matched_via="fuzzy",
+            matched_string=name,
+            confidence=ratio,
+            reason=(
+                f"fuzzy match ({ratio:.0%} similar) to {source} {name!r} → "
+                f"{record.get('canonical_name', record.get('id', ''))}"
+            ),
+        ))
+        seen_ids.add(record.get("id", ""))
+
+    # Tier 2b / 2c (IDN-01): the first-name-token tier and the whole-token
+    # prefix tier, people only, single-token queries only, ABOVE phonetic.
+    if query_single_token and FIRST_NAME_CONFIDENCE >= min_confidence:
+        tier = _first_name_token_people(entities, token_query, seen_ids)
+        if tier:
+            _rank_token_tier(tier, workspace_root)
+            results.extend(tier)
+    if query_single_token and TOKEN_PREFIX_CONFIDENCE >= min_confidence:
+        tier = _token_prefix_people(entities, token_query, seen_ids)
+        if tier:
+            _rank_token_tier(tier, workspace_root)
+            results.extend(tier)
+
+    # Tier 3: phonetic (Soundex) match
+    # Only meaningful for word-like strings; skip for empty Soundex or numeric queries.
+    # v3.13.2+ — single-word queries also match per-token Soundex on the candidate,
+    # so "Arya" matches multi-token "Aria Sample" (matches first-token "Aria").
+    PHONETIC_CONFIDENCE = 0.75
+    query_is_single_token = query.strip() and len(query.strip().split()) == 1
+    if query_soundex and PHONETIC_CONFIDENCE >= min_confidence:
+        for entity_type, record, name, source in _iter_match_surfaces(entities):
+            if record.get("id") in seen_ids:
+                continue
+            name_soundex = _soundex(name)
+            full_match = name_soundex and name_soundex == query_soundex
+            # Per-token match: single-word query against any token of a
+            # multi-token candidate name (e.g., `Arya` vs `Aria Sample`).
+            token_match = False
+            matched_token = None
+            if query_is_single_token and not full_match:
+                for token_code, token_str in zip(_soundex_tokens(name), name.strip().split()):
+                    if token_code == query_soundex:
+                        token_match = True
+                        matched_token = token_str
+                        break
+            if full_match or token_match:
+                if token_match:
+                    reason = (
+                        f"phonetic match (sound-alike) to {source} token "
+                        f"{matched_token!r} in {name!r} → "
+                        f"{record.get('canonical_name', record.get('id', ''))}"
+                    )
+                else:
+                    reason = (
+                        f"phonetic match (sound-alike) to {source} {name!r} → "
+                        f"{record.get('canonical_name', record.get('id', ''))}"
+                    )
+                results.append(ResolveResult(
+                    entity_type=entity_type,
+                    record=record,
+                    matched_via="phonetic",
+                    matched_string=name,
+                    confidence=PHONETIC_CONFIDENCE,
+                    reason=reason,
+                ))
+                seen_ids.add(record.get("id", ""))
+
+    # Sort by confidence descending, then by length of matched string ascending
+    # (shorter typically more specific).
+    results.sort(key=lambda r: (-r.confidence, r.rank, len(r.matched_string)))
+    out = results[:max_candidates]
+    # WG1-B D-B5 — the opt-in proposal tier, ONLY on a total miss: an
+    # entities.json hit at any tier above always wins, and the default-flag
+    # path never reaches this read at all.
+    if not out and include_open_proposals:
+        out = _match_open_proposals(workspace_root, query)[:max_candidates]
+    return out
+
+
+def _match_open_proposals(workspace_root: Path, query: str) -> list[ResolveResult]:
+    """D-B5 — exact-normalized name match against the open person-proposal
+    queue. One result per distinct name (the NEWEST row wins — the loader
+    returns oldest-first). Defensive: an unreadable events log returns []."""
+    try:
+        from confirm_flow import load_open_person_proposals
+        rows = load_open_person_proposals(
+            Path(workspace_root) / "_hq" / "data" / "events.jsonl")
+    except Exception:
+        return []
+    query_norm = _normalize(query)
+    newest_by_name: dict[str, dict] = {}
+    for r in rows:
+        name = (r.get("name") or "").strip()
+        if name and _normalize(name) == query_norm:
+            newest_by_name[_normalize(name)] = r  # oldest-first → last wins
+    out: list[ResolveResult] = []
+    for r in newest_by_name.values():
+        name = (r.get("name") or "").strip()
+        date = _localize_date(str(r.get("captured_ts") or ""), workspace_root)
+        out.append(ResolveResult(
+            entity_type="open_proposal",
+            record=r,
+            matched_via="open_proposal",
+            matched_string=name,
+            confidence=1.0,
+            reason=(f"matches the open add-person proposal {name!r}"
+                    + (f" from {date}" if date else "")
+                    + " — pending your confirm"),
+        ))
+    return out
+
+
+def _sort_by_observed_recency(candidates: list, workspace_root) -> list:
+    """HYG1 Item 3 — the C3 fossil-reader retirement. Sort candidate threads
+    by OBSERVED recency: the newest event on each thread via
+    thread_activity.derive_thread_activity, NEVER the deprecated
+    thread.last_activity stamp (F-54/F-61 — no writer maintains it; ranking
+    by it reported the wrong "newest" thread whenever real events disagreed
+    with the ingest-era fossil).
+
+    Fallback chain per thread: derived event ts → the stored last_activity
+    as a ZERO-EVENT FLOOR only (the DATA_CONTRACT carve-out: ingest
+    legitimately stamps it for threads with no event history) → first_seen.
+
+    PERF (entity_resolve is a hot path fired on nearly every routing turn):
+    the derivation runs LAZILY — a 0/1-candidate list returns immediately
+    and never scans events; only the rare multi-candidate disambiguation
+    walk pays one events pass. derive_thread_activity is NOT memoized
+    (the 4.6 incremental-index idea never shipped), so keeping this out of
+    the single-candidate path is what protects resolve latency."""
+    if len(candidates) <= 1:
+        return list(candidates)
+    try:
+        from thread_activity import derive_thread_activity
+        # honor_reclassifications (RECL1): `go [name]` disambiguation honors
+        # merges/moves — a merged-away thread must not outrank its survivor.
+        # Only this rare multi-candidate path pays the fold (laziness above).
+        activity = derive_thread_activity(
+            workspace_root, honor_reclassifications=True)
+    except Exception:
+        activity = {}
+
+    def recency_key(p: dict) -> str:
+        act = activity.get(p.get("id"))
+        if act is not None:
+            # Aware-UTC isoformat; lexicographically comparable with the
+            # date-only fallbacks below (same YYYY-MM-DD prefix rules).
+            return act.ts.isoformat()
+        return p.get("last_activity") or p.get("first_seen") or ""
+
+    return sorted(candidates, key=recency_key, reverse=True)
+
+
+def linked_projects_for_org(
+    workspace_root: str | Path,
+    org_id: str,
+    *,
+    entities: dict | None = None,
+) -> list[dict]:
+    """Every non-archived project/thread affiliated with `org_id`, ranked by
+    OBSERVED recency (HYG1 Item 3 — events via `thread_activity`, never the
+    deprecated `last_activity` fossil).
+
+    Extracted from `resolve_to_linked_project`'s org branch (SPEC THREADBIND1)
+    so a caller that already has an org id in hand — never a free-text
+    query — can get the SAME candidate set and ranking without re-deriving
+    the filter/sort, and without paying `resolve()`'s fuzzy-match cost. The
+    org branch below calls this too: one candidate computation, two callers,
+    zero duplicated logic (the equivalence pin this buys is load-bearing —
+    see `thread_resolve.py`).
+
+    Returns [] for an org with no linked projects. PURE read — no writes,
+    no clock.
+    """
+    workspace_root = Path(workspace_root)
+    ents = _unwrap_entities(entities if entities is not None
+                             else _load_entities(workspace_root))
+    candidates = []
+    for proj in entities_collection(ents, "projects"):
+        if proj.get("status") == "archived":
+            continue
+        if proj.get("affiliation_id") == org_id or proj.get("org_id") == org_id:
+            candidates.append(proj)
+    if not candidates:
+        return []
+    return _sort_by_observed_recency(candidates, workspace_root)
+
+
+def person_org_ids(entities: dict, person_id: str) -> set:
+    """The org(s) a person's record asserts. `primary_org_id` when set (the
+    schema's own primacy field), else ALL of their `affiliation_ids` — the
+    schema documents NO ordering on that list ("all orgs this person is
+    affiliated with"), so a caller must never treat entry [0] as a stronger
+    pick than any other (REVIEW THREADBIND1 F3 — the exact bug this
+    ordering-blindness avoids).
+
+    Extracted from `thread_resolve._person_org_ids` (SPEC THREADANN1) so a
+    second caller (`thread_subjects`'s cluster detector) gets the IDENTICAL
+    org-evidence read instead of re-deriving it — the same "one candidate
+    computation, zero duplicated logic" shape `linked_projects_for_org`
+    already buys for the org-walk side above.
+    `thread_resolve._person_org_ids` now delegates here unchanged;
+    behavior is pinned by the pre-existing `run_thread_resolve_test.py`
+    (which predates this extraction and never moved).
+
+    `entities` is the already-loaded raw dict — pass what you have; this
+    does not re-load or unwrap.
+    """
+    for p in entities_collection(entities, "people"):
+        if isinstance(p, dict) and p.get("id") == person_id:
+            org = p.get("primary_org_id")
+            org = org.strip() if isinstance(org, str) else ""
+            if org:
+                return {org}
+            affil = p.get("affiliation_ids")
+            if isinstance(affil, list):
+                return {a.strip() for a in affil
+                       if isinstance(a, str) and a.strip()}
+            return set()
+    return set()
+
+
+def resolve_to_linked_project(
+    workspace_root: str | Path,
+    query: str,
+    *,
+    min_confidence: float = 0.75,
+) -> ResolveResult | None:
+    """Convenience: resolve `query` via `resolve()`. If the match is a person
+    or org, walk to their linked project (the most recently active project
+    where they're an attendee/key contact).
+
+    Used by workspace-manager loose-input matching: when M says "go Aria",
+    Aria resolves to person_072, and the helper walks to project_020
+    (Northstar — COO Partnership, the most-recently-active project where Aria
+    is the key contact).
+
+    Returns the linked PROJECT match (with `entity_type='project'`), or None
+    if no project link can be resolved.
+    """
+    workspace_root = Path(workspace_root)
+    base = resolve(workspace_root, query, min_confidence=min_confidence)
+    if base is None:
+        return None
+    if base.entity_type == "project":
+        return base
+
+    entities = _unwrap_entities(_load_entities(workspace_root))
+
+    # If person: find projects where this person is key_contact_id OR where
+    # they're in the project's affiliated org. Pick most recently active.
+    if base.entity_type == "person":
+        person_id = base.record.get("id")
+        primary_org_id = base.record.get("primary_org_id")
+        candidates = []
+        for proj in entities_collection(entities, "projects"):
+            if proj.get("status") == "archived":
+                continue
+            if proj.get("key_contact_id") == person_id:
+                candidates.append(proj)
+            elif primary_org_id and proj.get("affiliation_id") == primary_org_id:
+                candidates.append(proj)
+            elif primary_org_id and proj.get("org_id") == primary_org_id:
+                candidates.append(proj)
+        if not candidates:
+            return None
+        # HYG1 Item 3: rank by OBSERVED recency (events, via the
+        # thread_activity derivation) — never the deprecated last_activity
+        # stamp (F-54/F-61: no writer maintains it; the fossil said thread A
+        # was newest while events said B). Derived LAZILY inside
+        # _sort_by_observed_recency: only the rare multi-candidate walk pays
+        # the event scan — the hot single-candidate resolve path never does.
+        candidates = _sort_by_observed_recency(candidates, workspace_root)
+        proj = candidates[0]
+        return ResolveResult(
+            entity_type="project",
+            record=proj,
+            matched_via=base.matched_via,
+            matched_string=base.matched_string,
+            confidence=base.confidence * 0.95,  # tiny penalty for indirect resolution
+            reason=(
+                f"{base.reason} (walked to project "
+                f"{proj.get('canonical_name', proj.get('id', ''))} via key_contact / affiliation)"
+            ),
+        )
+
+    # If org: pick most recently active project under that org
+    if base.entity_type == "org":
+        org_id = base.record.get("id")
+        # THREADBIND1 — the filter/sort now lives in linked_projects_for_org
+        # (one candidate computation, shared with thread_resolve.py). Passing
+        # the already-unwrapped `entities` avoids a second entities.json read.
+        candidates = linked_projects_for_org(workspace_root, org_id,
+                                             entities=entities)
+        if not candidates:
+            return None
+        proj = candidates[0]
+        return ResolveResult(
+            entity_type="project",
+            record=proj,
+            matched_via=base.matched_via,
+            matched_string=base.matched_string,
+            confidence=base.confidence * 0.95,
+            reason=(
+                f"{base.reason} (walked to project "
+                f"{proj.get('canonical_name', proj.get('id', ''))} via affiliation)"
+            ),
+        )
+
+    return None
+
+
+# ---------- CLI ----------
+
+
+def main() -> int:
+    """CLI for bash callers and quick testing:
+        python3 entity_resolve.py <workspace_root> <query>
+        python3 entity_resolve.py <workspace_root> <query> --all
+        python3 entity_resolve.py <workspace_root> <query> --to-project
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description="Resolve a name to an entity record.")
+    parser.add_argument("workspace_root", type=Path)
+    parser.add_argument("query", type=str, help="Free-text name to resolve.")
+    parser.add_argument("--all", action="store_true", help="Return all candidates, not just best.")
+    parser.add_argument("--to-project", action="store_true", help="Walk to linked project.")
+    parser.add_argument("--min-confidence", type=float, default=0.75)
+    args = parser.parse_args()
+
+    if args.to_project:
+        result = resolve_to_linked_project(args.workspace_root, args.query, min_confidence=args.min_confidence)
+        if result is None:
+            print(f"no match for {args.query!r}")
+            return 1
+        print(f"{result.entity_type} {result.entity_id} ({result.display_name})")
+        print(f"  via: {result.matched_via} (conf {result.confidence:.2f})")
+        print(f"  reason: {result.reason}")
+        return 0
+
+    if args.all:
+        results = resolve_all(args.workspace_root, args.query, min_confidence=args.min_confidence)
+    else:
+        single = resolve(args.workspace_root, args.query, min_confidence=args.min_confidence)
+        results = [single] if single else []
+
+    if not results:
+        print(f"no match for {args.query!r}")
+        return 1
+
+    for r in results:
+        print(f"{r.entity_type} {r.entity_id} ({r.display_name})")
+        print(f"  via: {r.matched_via} (conf {r.confidence:.2f})")
+        print(f"  matched_string: {r.matched_string!r}")
+        print(f"  reason: {r.reason}")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(main())

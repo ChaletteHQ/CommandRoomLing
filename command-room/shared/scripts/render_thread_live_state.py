@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""Orchestrator: render a thread's "Live State" block (People + Status) into its
+brain file from the substrate. Ties together thread_roster (who's on it),
+entities.json (status), and render_brain_block (safe marked-region write).
+
+This is the deterministic callable workspace-manager invokes on `go [project]`
+and cleanup invokes on its sweep — so the live state is produced by code, not
+by the LLM assembling it freehand (the enforcement-gate failure class).
+
+Dirty-check: only rewrites when a thread-tagged event NEWER than the block's
+recorded source_seq exists. The "latest seq" uses the human-counter filter
+(ignores legacy nano-epoch seqs ≥ 1e10) so a stray 1.77e18 artifact can't peg
+the check (gotcha caught during the build demo).
+
+stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import event_refs
+import render_brain_block
+from entities_io import entities_collection
+from thread_roster import derive_roster
+
+EPOCH_THRESHOLD = 10 ** 10
+BLOCK_ID = "people"
+# The heading the block is created after on first render (self-bootstrap).
+DEFAULT_ANCHOR = "## 1. People"
+
+# Render-logic version (Bug #97). BUMP THIS whenever the *content logic* below
+# (which people are confirmed/proposed, how the block reads) changes — NOT for
+# new data, which the source_seq dirty-check already catches. A bump makes the
+# next sweep re-render even QUIET threads whose source_seq hasn't moved, so a
+# logic fix actually reaches frozen brains instead of rotting behind a stale
+# block. History: v1 = pre-stamp blocks (no logic_v in marker); v2 = v3.18.9
+# #87 re-fix (org-association applied to low+inherited proposed candidates).
+LIVE_STATE_LOGIC_VERSION = 2
+
+
+def _entities(workspace_root: Path) -> dict:
+    data = json.loads((workspace_root / "_hq" / "data" / "entities.json").read_text(encoding="utf-8"))
+    return data["entities"] if isinstance(data.get("entities"), dict) else data
+
+
+def _human_latest_seq(events: list[dict], thread_ids: set[str]) -> int | None:
+    """Newest human-counter seq among events touching `thread_ids`. Ignores
+    nano-epoch legacy seqs (≥ 1e10) so the dirty-check can't misfire."""
+    latest = None
+    for ev in events:
+        if not (event_refs.threads_of(ev) & thread_ids):
+            continue
+        s = event_refs.event_seq(ev)
+        if s is None or s >= EPOCH_THRESHOLD:
+            continue
+        s = int(s)
+        if latest is None or s > latest:
+            latest = s
+    return latest
+
+
+def _thread(workspace_root: Path, thread_id: str) -> dict:
+    ent = _entities(workspace_root)
+    threads = entities_collection(ent, "projects")
+    return next((t for t in threads if t.get("id") == thread_id), {})
+
+
+def _parent_owns_folder(workspace_root: Path, thread_id: str) -> bool:
+    """True when the thread records the same folder as its parent thread
+    (whatever its case): the brain in that folder is the parent's."""
+    thread = _thread(workspace_root, thread_id)
+    parent_id = thread.get("parent_thread_id")
+    folder = str(thread.get("folder_name") or "").strip().replace("\\", "/").strip("/").lower()
+    if not parent_id or not folder:
+        return False
+    parent = _thread(workspace_root, parent_id)
+    pf = str(parent.get("folder_name") or "").strip().replace("\\", "/").strip("/").lower()
+    return pf == folder
+
+
+def _org_associated_pids(ent: dict, org_id: str) -> set[str]:
+    """Person ids affiliated with `org_id` via primary_org_id, affiliation_ids,
+    or the deprecated org_id field (v3.13.0+ shapes, defensively)."""
+    out: set[str] = set()
+    if not org_id:
+        return out
+    for p in ent.get("people", []) or []:
+        pid = p.get("id")
+        if not pid:
+            continue
+        affs = set(p.get("affiliation_ids") or [])
+        if (p.get("primary_org_id") == org_id
+                or p.get("org_id") == org_id      # deprecated, still honored
+                or org_id in affs):
+            out.add(pid)
+    return out
+
+
+def resolve_brain_path(workspace_root: str | Path, thread_id: str) -> tuple[Path | None, str]:
+    """Resolve the thread's brain file. Returns `(path, reason)`.
+
+    `reason` is `"ok"`, or the status the caller should report:
+
+    * `"no_brain_path"`  — the record names no folder at all (field empty/absent).
+    * `"no_project_folder"` — the record names a folder that is not on disk.
+
+    These are DIFFERENT REPAIR CASES and collapsing them loses the distinction the
+    repair needs: an empty field wants the folder name recorded, while a name
+    pointing nowhere wants the folder located or the record corrected. FOLDERGUARD
+    (v5.4.0) correctly stopped returning a path for a missing folder — every writer
+    downstream creates its parent tree, so returning one is what fabricated the
+    folder — but it reported both cases as `no_brain_path`.
+
+    Note the FOLDERGUARD docstring's claim that a missing folder "stays visible to
+    integrity_check as C9.thread_folder_missing" holds ONLY for the
+    `no_project_folder` case. C9 guards on `if fn and fn not in ("", None)`
+    (integrity_check.py), so the `no_brain_path` case — an EMPTY folder_name, which
+    is exactly what the v5.4.0 resolver now produces when nothing matches on disk —
+    is skipped by C9 entirely and is visible nowhere. That is why the two statuses
+    have to be told apart here: one of them has no other reporting path at all.
+    """
+    workspace_root = Path(workspace_root)
+    folder = _thread(workspace_root, thread_id).get("folder_name")
+    if not folder:
+        return None, "no_brain_path"
+    if not (workspace_root / folder).is_dir():
+        return None, "no_project_folder"
+    return workspace_root / folder / "PROJECT_BRAIN.md", "ok"
+
+
+def resolve_brain_path_to_write(workspace_root: str | Path, thread_id: str) -> tuple[Path | None, str]:
+    """`resolve_brain_path` for a WRITER of the thread's brain. Adds one
+    status, `"parent_owns_folder"`: the thread records the same folder as its
+    parent thread (a Hub work stream's own first thread, cr1#1582), so the
+    brain in that folder is the parent's and this thread never writes it.
+    Every brain writer resolves through here (the live-state block below,
+    `render_brain_anchors.render_thread_anchors`); readers keep
+    `resolve_brain_path`."""
+    workspace_root = Path(workspace_root)
+    if _parent_owns_folder(workspace_root, thread_id):
+        return None, "parent_owns_folder"
+    return resolve_brain_path(workspace_root, thread_id)
+
+
+def default_brain_path(workspace_root: str | Path, thread_id: str) -> Path | None:
+    """Resolve the thread's brain file from its folder_name. None if unresolvable.
+
+    Back-compatible wrapper over `resolve_brain_path` — every existing caller that
+    only needs the path keeps working unchanged. Use `resolve_brain_path` when you
+    need to report WHY resolution failed.
+    """
+    return resolve_brain_path(workspace_root, thread_id)[0]
+
+
+def format_live_state(workspace_root: str | Path, thread_id: str):
+    """Return (markdown_body, source_seq). Pure — no file writes."""
+    workspace_root = Path(workspace_root)
+    thread = _thread(workspace_root, thread_id)
+    status = thread.get("status", "?")
+    events = event_refs.load_events(workspace_root / "_hq" / "data" / "events.jsonl")
+    n_events = sum(1 for e in events if thread_id in event_refs.threads_of(e))
+    source_seq = _human_latest_seq(events, {thread_id} | _lineage(thread))
+
+    roster = derive_roster(workspace_root, thread_id)
+    confirmed = [r for r in roster if r["confidence"] in ("high", "pinned")]
+
+    # Proposed (confirm-gate) set = the `low` + `inherited` candidates, filtered
+    # by ORG-ASSOCIATION. This is the v3.18.9 #87 re-fix.
+    #
+    # The umbrella-bleed (Bug #87, v3.18.1): a pre-split umbrella's whole roster
+    # gets proposed onto every sub-thread, surfacing people who aren't on this
+    # project (visible to the CEO since the Bug #86 fix renders this line). The
+    # v3.18.4 fix org-filtered ONLY `inherited` candidates — but real bleed isn't
+    # `inherited`. On a live workspace the noise is `low`-confidence: vendor/demo
+    # contacts with a single direct project-local event (n_direct=1) and no org
+    # affiliation, which the old code waved straight through (`low` returned True
+    # unconditionally). The earlier assumption that "low always has legitimate
+    # project signal" was wrong — one stray demo event is enough to make a contact
+    # `low`, and that contact is exactly the noise the CEO doesn't want proposed.
+    #
+    # Correct rule: a `low`/`inherited` person is proposed only if they're
+    # affiliated with THIS thread's org. That keeps the genuine org-mates who have
+    # light signal and drops the org-less demo/vendor contacts. If the thread has
+    # no org_id we can't discriminate, so we keep all candidates (the safe,
+    # lineage-aware direction — don't silently drop real umbrella members).
+    org_id = thread.get("org_id") or ""
+    org_pids = _org_associated_pids(_entities(workspace_root), org_id) if org_id else set()
+
+    def _propose(r):
+        if r["confidence"] not in ("low", "inherited"):
+            return False
+        if not org_id:
+            return True  # degenerate: no thread org to discriminate by
+        return r["person_id"] in org_pids
+
+    proposed = [r for r in roster if _propose(r)]
+
+    # JARGONVIEWS1: this block is rendered into the customer's PROJECT_BRAIN
+    # and read as prose. "live from substrate" named the internal event store;
+    # the point of the parenthetical is that the numbers are current, which
+    # "live" already carries.
+    lines = [f"**Status:** {status}    *(live — {n_events} events)*", ""]
+    lines.append("| Person | Events | Last seen |")
+    lines.append("|---|---|---|")
+    for r in confirmed:
+        lines.append(f"| {r['name']} | {r['n_events']} | {r['last_ts'] or '—'} |")
+    if not confirmed:
+        lines.append("| _(no confirmed members yet)_ |  |  |")
+    if proposed:
+        names = ", ".join(r["name"] for r in proposed)
+        lines.append("")
+        lines.append(f"*Proposed — confirm to add (inherited from a pre-split umbrella or low signal):* {names}")
+    return "\n".join(lines), source_seq
+
+
+def _lineage(thread: dict) -> set[str]:
+    out = set()
+    for k in ("parent_thread_id", "spawned_from_thread_id"):
+        v = thread.get(k)
+        if isinstance(v, str) and v:
+            out.add(v)
+    return out
+
+
+def render_live_state(workspace_root: str | Path, thread_id: str, *,
+                      brain_path: str | Path | None = None,
+                      anchor: str = DEFAULT_ANCHOR, force: bool = False,
+                      now_iso: str | None = None) -> dict:
+    """Dirty-check then render the Live State block. Returns the render_block
+    status plus {'rendered': bool, 'source_seq': int|None}.
+
+    `now_iso` (SPEC FLAKEFIX2) is the instant stamped into the block's
+    `generated_at`. Omitted, this reads the actual current UTC time and
+    nothing about the behaviour changes — every existing caller is unaffected.
+
+    THE SEAM EXISTS BECAUSE `generated_at` IS SECOND-GRANULAR AND SITS INSIDE
+    THE TEXT THE IDEMPOTENCE CHECK COMPARES. `render_block` reports
+    `unchanged` only when the whole rewritten region — start marker included —
+    is byte-identical to what is already there. So two renders that agree on
+    every fact still differ when they land in different UTC seconds, and the
+    second one legitimately reports `written`. On a QUIET workspace that is
+    reachable on every sweep: with no events `source_seq` is None, so
+    `needs_render` is unconditionally True and the comparison is reached every
+    time. A caller replaying a fixture passes a fixed ISO string here rather
+    than racing the clock — the same posture `end_of_day.capture_fence_
+    elapsed_ms`'s own `now` argument already takes one module over.
+    """
+    workspace_root = Path(workspace_root)
+    if brain_path:
+        path, reason = Path(brain_path), "ok"
+    else:
+        # cr1#1582 review: a work stream's own first thread shares the
+        # stream's folder; the stream renders that folder's brain, and the
+        # thread under it never overwrites it (`parent_owns_folder`).
+        path, reason = resolve_brain_path_to_write(workspace_root, thread_id)
+    if path is None:
+        # `reason` distinguishes an empty folder_name from one naming a directory
+        # that is not on disk — different repair cases, and the empty case has no
+        # other reporting path (integrity_check's C9 skips it). See resolve_brain_path.
+        return {"status": reason, "rendered": False, "source_seq": None}
+
+    body, source_seq = format_live_state(workspace_root, thread_id)
+    if not force and not render_brain_block.needs_render(
+            path, BLOCK_ID, source_seq, logic_version=LIVE_STATE_LOGIC_VERSION):
+        return {"status": "unchanged", "rendered": False, "source_seq": source_seq}
+
+    import datetime
+    ga = (str(now_iso) if now_iso else
+          datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))
+    r = render_brain_block.render_block(
+        path, BLOCK_ID, body, generated_at=ga, source_seq=source_seq,
+        logic_version=LIVE_STATE_LOGIC_VERSION, create_after_heading=anchor,
+        create_parents=False)  # FOLDERGUARD belt-and-braces: a brain never digs its own folder
+    r["rendered"] = r["status"] in ("written", "created")
+    r["source_seq"] = source_seq
+    return r
+
+
+if __name__ == "__main__":
+    import sys
+    ws, tid = sys.argv[1], sys.argv[2]
+    bp = sys.argv[3] if len(sys.argv) > 3 else None
+    body, seq = format_live_state(ws, tid)
+    print(f"# source_seq={seq}\n{body}")

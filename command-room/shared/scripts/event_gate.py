@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+"""
+append_event() gatekeeper (Phase 1 Foundation, F1 — 2026-07).
+
+Built as an EXTENSION of atomic_write.atomic_append_jsonl, never a second
+append path: the gate logic below is invoked INSIDE atomic_append_jsonl's
+events.jsonl branch, so every existing caller — skill prose templates,
+shared/scripts writers, orchestrators — is gated from day one without
+migrating a single call site. `append_event()` is the canonical named entry
+for new code; it applies the same gate in STRICT mode (unknown event types
+reject instead of warn) and then delegates the actual locked write to
+atomic_append_jsonl. seq allocation and ts stamping already live inside
+atomic_append_jsonl's writer-lock critical section (v3.13.8.3 / SPEC A1);
+this module adds the identity + validation layer on top:
+
+  1. Type normalization — known drift is corrected on append
+     (`commitment_update` → `commitment_updated`).
+  2. Commitment identity — `type: commitment` events get `data.id` minted as
+     `cmt_<ULID>` at write time when the caller didn't set one (ratified
+     2026-07-01: cmt_<ulid>, minted at write time). Ids are written, never
+     synthesized-only.
+  3. Commitment kind — `data.kind` (promise | task | scheduling | agenda) is
+     REQUIRED AT CAPTURE on commitment events (ratified 2026-07-01; flipped
+     from stamp-promise in Phase 2 Stage D once the producers classified at
+     write time). A provided kind is validated against the enum (bad value =
+     reject). A MISSING kind REJECTS on both entries (Phase 4 2026-07-02 —
+     the F1 burn-in ended with the Phase 1-3 writer migrations). READ-side, a
+     historic event with no kind is a `promise` forever
+     (commitment_state.commitment_kind — never backfilled on disk).
+  4. Fail-loud closure identity — `type: commitment_resolved` with no
+     readable id field is REJECTED (EventGateError). This exact silent
+     failure produced 291 dead-letter closures in the live substrate.
+  5. Reminder-lane hard rules (v4.6.0 W4a) — `reminder` / `reminder_updated` /
+     `reminder_cleared` / `reminder_deleted` (cr1#1221) events REQUIRE `data.origin == "user_explicit"`
+     (unconditional reject on anything else: no skill, sweep, or scheduled
+     task may ever mint a reminder — reminders exist because the USER said
+     "remind me"). `reminder` gets `data.id` minted as `rem_<ULID>` when the
+     caller didn't set one; `reminder_updated` / `reminder_cleared` /
+     `reminder_deleted` without a
+     readable `data.reminder_id` are dead letters and reject. Builders live in
+     shared/scripts/reminders.py.
+  6. Schema-enum validation for ALL event families — the type must be
+     registered in shared/data-schemas/events.schema.json (see
+     event_types.py for the enum-home decision). An unknown type raises on
+     BOTH entries — append_event() and the legacy atomic_append_jsonl path —
+     as of Phase 4 (2026-07-02). Register new types per shared/EVENT_TYPES.md
+     before writing them.
+
+  8. Thread binding (SPEC THREADSTAMP1, 2026-08-23) — a thread-bound event
+     type (`event_types.THREAD_BOUND_TYPES`) arriving with no usable
+     `primary_thread_id` has one DERIVED from the reference its own payload
+     already carries (`event_types.derive_primary_thread_id`). Nothing is
+     invented and no empty-string sentinel is ever written: a row that names no
+     thread anywhere keeps the field exactly as the caller left it and gets a
+     stderr WARN instead. Warn-only this train (DD-2) — fleet substrate exists
+     that a block would refuse; the flip is a later ruling once integrity_check
+     C14's counts drain.
+
+Escape hatch: CR_EVENT_GATE=0 disables the gate entirely (emergencies only —
+e.g. replaying a quarantined batch that predates the contract). The write
+path itself (lock, seq, ts, atomic rename) is unaffected by the env var.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+import time
+from typing import Any, List
+
+try:
+    from event_types import (
+        COMMITMENT_CLOSURE_ID_CHAIN,
+        COMMITMENT_CLOSURE_ID_FIELDS,
+        COMMITMENT_CLOSURE_SEQ_FIELDS,
+        KIND_VALUES,
+        LEGACY_SEQ_ID_RE,
+        THREAD_BOUND_TYPES,
+        derive_primary_thread_id,
+        has_thread_ref,
+        is_known_type,
+    )
+except ImportError:
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    from event_types import (
+        COMMITMENT_CLOSURE_ID_CHAIN,
+        COMMITMENT_CLOSURE_ID_FIELDS,
+        COMMITMENT_CLOSURE_SEQ_FIELDS,
+        KIND_VALUES,
+        LEGACY_SEQ_ID_RE,
+        THREAD_BOUND_TYPES,
+        derive_primary_thread_id,
+        has_thread_ref,
+        is_known_type,
+    )
+
+
+class EventGateError(ValueError):
+    """An event was rejected at append time. Fail loud, not silent — silent
+    success is the disease (291 id-less closures, 5 spellings of one type)."""
+
+
+# Known type drift corrected on append. Extend here (with a CHANGELOG note)
+# when a new drift spelling is discovered — readers never learn drift names.
+TYPE_NORMALIZATION = {
+    "commitment_update": "commitment_updated",
+}
+
+_KIND_DEFAULT = "promise"
+
+# Reminder lane (v4.6.0 W4a). Reminders are user-minted pins, NOT commitments —
+# they never enter buckets, counts, chase, or triage, and ONLY the user may
+# create one. The gate enforces both identities unconditionally (like the
+# id-less-closure rule): origin must be the literal below, and mutation events
+# must reference the reminder they touch.
+REMINDER_TYPES = frozenset({"reminder", "reminder_updated", "reminder_cleared",
+                            "reminder_deleted"})  # cr1#1221
+REMINDER_ORIGIN = "user_explicit"
+
+# Crockford base32 (no I, L, O, U) — standard ULID alphabet.
+_ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _ulid() -> str:
+    """26-char ULID: 48-bit ms timestamp + 80 bits of randomness, Crockford
+    base32. Stdlib-only (no dependency); lexically sortable by mint time."""
+    ts_ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rand = int.from_bytes(os.urandom(10), "big")
+    value = (ts_ms << 80) | rand
+    chars = []
+    for shift in range(125, -1, -5):
+        chars.append(_ULID_ALPHABET[(value >> shift) & 0x1F])
+    return "".join(chars)
+
+
+def new_commitment_id() -> str:
+    """Mint a canonical commitment id: cmt_<ULID> (ratified 2026-07-01)."""
+    return "cmt_" + _ulid()
+
+
+def new_decision_id() -> str:
+    """Mint a canonical decision id: dec_<ULID> (cr1#1011, train 1 section B).
+
+    Same alphabet as the promise and reminder ids, its own prefix. Before,
+    decisions carried no id and every reader made one up from the row's seq
+    (`decision_seq_<n>`), so a decision's name depended on where it sat in the
+    log."""
+    return "dec_" + _ulid()
+
+
+# A decision id spelled like the readers' seq fallback (`decision_seq_<n>`) or
+# like a bare seq would shadow the decision that already answers to that
+# spelling, so a close meant for it would land on the new one.
+_DECISION_SEQ_SPELLING_RE = re.compile(r"^(?:decision_seq_)?0*\d+$")
+_DECISION_CLOSER_TYPES = frozenset({"decision_resolved", "decision_superseded"})
+
+# 3d (cr1#1011): the events that hand a promise to a new owner. Each carries
+# the new owner in data.new_owner_id and gets the new direction stored.
+_OWNER_CHANGE_TYPES = frozenset({"commitment_reassigned", "commitment_updated"})
+
+
+def _decision_key(ev: dict):
+    """The id both decision readers key a decision by (`decision_match.
+    _decision_id`, `render_decision_log._decision_id`): data.id, then the
+    top-level id, then `decision_seq_<seq>` only for a decision with neither."""
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    return data.get("id") or ev.get("id") or f"decision_seq_{ev.get('seq', '?')}"
+
+
+def _decision_universe(ledger_events: list) -> tuple:
+    """(keys, seqs) of every decision in the ledger: the key the readers close
+    it by, and its integer seq, which the seq-field targets name."""
+    keys, seqs = set(), set()
+    for ev in ledger_events:
+        if not isinstance(ev, dict) or ev.get("type") != "decision":
+            continue
+        key = _decision_key(ev)
+        if isinstance(key, (str, int)) and not isinstance(key, bool):
+            keys.add(key)
+        seq = ev.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            seqs.add(seq)
+    return keys, seqs
+
+
+def _decision_close_targets(ev: dict, etype: str) -> tuple:
+    """(ids, seqs) a decision close names, in every spelling a reader closes
+    on: the shared chains, plus `data.id` and the top-level `decision_id` and
+    `id`, which `decision_match.load_open_decisions` also honours."""
+    from event_types import decision_resolve_targets, decision_supersede_targets
+    ids, seqs = (decision_resolve_targets(ev) if etype == "decision_resolved"
+                 else decision_supersede_targets(ev))
+    ids = list(ids)
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    for extra in (data.get("id"), ev.get("decision_id"), ev.get("id")):
+        if extra not in (None, "") and extra not in ids:
+            ids.append(extra)
+    return ids, list(seqs)
+
+
+def _decision_close_resolves(target_ids, target_seqs, keys: set, seqs: set) -> bool:
+    """True when the close lands on a real decision the way the readers match
+    it: an id equal to a decision's key (so `decision_seq_<n>` names only an
+    id-less decision at seq n; a decision with its own id answers to that id),
+    or an integer seq equal to a decision's seq."""
+    for raw in target_ids:
+        try:
+            if raw in keys:
+                return True
+        except TypeError:
+            continue
+    for raw in target_seqs:
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw in seqs:
+            return True
+    return False
+
+
+def new_reminder_id() -> str:
+    """Mint a canonical reminder id: rem_<ULID> (v4.6.0 W4a — same alphabet,
+    distinct prefix so a reminder id can never be mistaken for a commitment)."""
+    return "rem_" + _ulid()
+
+
+def _gate_enabled() -> bool:
+    return os.environ.get("CR_EVENT_GATE", "1") != "0"
+
+
+def _has_closure_id(ev: dict) -> bool:
+    """Presence: the event carries SOME readable target reference. Walks the
+    same COMMITMENT_CLOSURE_ID_CHAIN the read side honors (BUG-8330 item 3
+    unified the two lists) plus the F3 seq aliases. Presence is the floor —
+    `_check_closure_resolves` is the wall."""
+    data = ev.get("data")
+    data = data if isinstance(data, dict) else {}
+    for scope, field in COMMITMENT_CLOSURE_ID_CHAIN:
+        holder_d = data if scope == "data" else ev
+        if holder_d.get(field) not in (None, ""):
+            return True
+    for field in COMMITMENT_CLOSURE_SEQ_FIELDS:
+        if data.get(field) not in (None, ""):
+            return True
+    return False
+
+
+# Closer families the resolvability wall applies to (BUG-8330 item 3). The
+# gate's presence check let `cmt_TYPO` through clean — a dead letter with
+# perfect posture. With the ledger in hand, an unresolvable reference now
+# rejects at append time through the SAME resolver the closure audit uses.
+_RESOLVE_CHECKED_TYPES = frozenset(
+    {"commitment_resolved", "thread_resolved", "commitment_superseded"}
+)
+
+# REFINT1 — the same wall for the commitment-REFERENCE family. A
+# `commitment_review_proposed` or `commitment_updated` whose target was never
+# created is WORSE than a dead-letter closure: the row exists, carries a live
+# question (`proposed_resolution: auto_resolve`), and is unreachable by every
+# surface — the review tier and amnesty derive from `commitment` events, so
+# "nothing has sat unanswered" reads literally true while three live
+# questions sit past the bar (operator workspace, 2026-08-24; the seq-2191
+# tell was a writer UPDATING a commitment that was never created). The class:
+# an event contract with a read and no producer — the reader assumed a
+# producer wrote first; the gate now proves it at append time.
+#
+# `commitment_review_dismissed` is DELIBERATELY absent from this set: a
+# dismissal is the tombstone of a question — it claims no work exists — and
+# it is exactly what the dangling-row drain
+# (`commitment_backlog_sweep.dangling_review_drain`) writes to give the
+# already-orphaned rows a terminal state. Gating it would wall off the only
+# honest exit.
+# Membership lives in event_types.COMMITMENT_REFERENCE_TYPES (the shared
+# vocabulary home, beside the closure chain it mirrors); this is the gate's
+# local name for it, kept so the wall reads like its 4a sibling.
+from event_types import COMMITMENT_REFERENCE_TYPES as _REFERENCE_CHECKED_TYPES  # noqa: E402,E501
+
+
+def _check_closure_resolves(ev: dict, etype: str, holder: str,
+                            by_id: dict, by_seq: dict) -> None:
+    """Raise EventGateError when a closer's target resolves to nothing.
+
+    thread_resolved carve-out: the type legitimately closes non-commitment
+    THREADS too. It is only rejected when its reference claims the
+    commitment namespace (cmt_* / legacy seq spelling / seq aliases) and
+    still resolves to nothing — a plain thread id passes untouched."""
+    from closure_index import (
+        closer_target_id,
+        closer_target_seqs,
+        resolve_closure_target,
+    )
+
+    if resolve_closure_target(ev, by_id, by_seq) is not None:
+        return
+    raw = closer_target_id(ev)
+    if etype == "thread_resolved":
+        claims_commitment = bool(closer_target_seqs(ev)) or (
+            raw.startswith("cmt_") or bool(LEGACY_SEQ_ID_RE.match(raw.strip()))
+            if raw else False
+        )
+        if not claims_commitment:
+            return
+    raise EventGateError(
+        f"{etype} event references {raw!r} "
+        f"(seq aliases {closer_target_seqs(ev)!r}) which resolves to no "
+        f"commitment in the ledger (holder={holder}). An unresolvable "
+        "closure is a dead letter — it closes nothing and the closure audit "
+        "would flag it later; the gate now refuses it at append time. Pass "
+        "the commitment's data.id verbatim (cmt_<ulid>, or its "
+        "commitment_seq_<n> spelling), or write through "
+        "commitment_state.close_commitment."
+    )
+
+
+def _check_commitment_ref_resolves(ev: dict, etype: str, holder: str,
+                                   by_id: dict, by_seq: dict) -> None:
+    """REFINT1 — raise EventGateError when a commitment-REFERENCE event's
+    target resolves to no created commitment.
+
+    THE SAME RESOLVER AS THE CLOSER WALL — `closure_index.
+    resolve_closure_target`, which walks every leg of
+    COMMITMENT_CLOSURE_ID_CHAIN plus the string-coercing seq aliases. The
+    first cut of this function hand-rolled a narrower two-leg ladder, which
+    is exactly the BUG-8330 drift the chain constant exists to prevent: a
+    target spelled at top level, or a digit-string `commitment_seq`, would
+    have been refused as "names no commitment" while every reader in the
+    repo resolved it fine. A missing target refuses too (the id-less
+    degenerate of a never-created id), mirroring the 4b
+    `commitment_reassigned` rule."""
+    from closure_index import (
+        closer_target_id,
+        closer_target_seqs,
+        resolve_closure_target,
+    )
+
+    if resolve_closure_target(ev, by_id, by_seq) is not None:
+        return
+    if not _has_closure_id(ev):
+        raise EventGateError(
+            f"{etype} event names no commitment (need data.commitment_id, "
+            f"another chain leg, or a data."
+            f"{'/data.'.join(COMMITMENT_CLOSURE_SEQ_FIELDS)} seq alias; "
+            f"holder={holder}) — a reference event with no target proposes "
+            "or updates nothing (REFINT1)."
+        )
+    raise EventGateError(
+        f"{etype} event references {closer_target_id(ev)!r} (seq aliases "
+        f"{closer_target_seqs(ev)!r}) which resolves to no CREATED "
+        f"commitment (holder={holder}). A proposal or update against an "
+        "uncreated id is worse than a dead letter: the row exists, is "
+        "unreachable by every surface, and amnesty honestly reports nothing "
+        "waiting while it sits past the bar (REFINT1). Create the "
+        "commitment first (same batch is fine — the gate resolves "
+        "batch-local creations), or pass the id of one already in the "
+        "ledger."
+    )
+
+
+def gate_events(
+    events: List[dict],
+    *,
+    strict_enum: bool = True,
+    holder: str = "event_gate",
+    events_jsonl_path=None,
+) -> List[dict]:
+    """Validate + enrich a batch of events bound for events.jsonl.
+
+    Returns NEW event dicts (callers' dicts are never mutated — same contract
+    as atomic_append_jsonl's stamp step). Raises EventGateError on the
+    fail-loud conditions documented in the module docstring. strict_enum
+    defaults to True (Phase 4 2026-07-02); passing False restores the F1
+    burn-in warn-only posture and exists for controlled replay tooling only —
+    no production writer may pass it.
+
+    events_jsonl_path (BUG-8330 item 3): when the caller supplies the target
+    ledger path (atomic_append_jsonl always does), closer events are checked
+    for RESOLVABILITY, not just presence — a commitment_resolved naming
+    `cmt_TYPO` used to pass the presence check clean and die as a dead
+    letter. The resolution universe is the current ledger plus commitment
+    events earlier in this same batch (by id — batch rows have no seq until
+    the appender stamps them). Skipped when the path is None (direct callers
+    with no ledger in hand) or under the strict_enum=False replay posture.
+    """
+    if not _gate_enabled():
+        return events
+
+    # Lazy resolvability universe — built once per batch, only when a closer
+    # is actually present (a full-ledger read per ordinary append would be
+    # waste; closers are low-frequency).
+    _universe: list = []
+
+    def _resolution_universe():
+        if _universe:
+            return _universe[0]
+        from closure_index import build_commitment_universe, commitment_key
+        ledger_events: list = []
+        try:
+            from cru_match import load_events_defensively
+            loaded, _skipped = load_events_defensively(events_jsonl_path)
+            ledger_events = loaded
+        except Exception:
+            # A missing/unreadable ledger resolves nothing extra; batch-local
+            # commitments below still count (fresh-workspace first append).
+            ledger_events = []
+        by_id, by_seq = build_commitment_universe(ledger_events)
+        for b_ev in events:
+            if isinstance(b_ev, dict) and b_ev.get("type") == "commitment":
+                by_id[commitment_key(b_ev)] = b_ev
+        _universe.append((by_id, by_seq))
+        return _universe[0]
+
+    # cr1#1011: the decisions a decision close may name. Built once per batch,
+    # only when a decision close is present. Every decision in this batch that
+    # carries its own id joins wherever it sits, like the promise universe
+    # (a close may come before its decision); a minted id joins as it is
+    # stamped.
+    _decisions: list = []
+    batch_decision_ids: set = set()
+    for b_ev in events:
+        if isinstance(b_ev, dict) and b_ev.get("type") == "decision":
+            own = _decision_key(b_ev)
+            if isinstance(own, str) and own.strip() and not own.startswith("decision_seq_"):
+                batch_decision_ids.add(own.strip())
+
+    def _decision_targets_known():
+        if _decisions:
+            return _decisions[0]
+        try:
+            from cru_match import load_events_defensively
+            loaded, _skipped = load_events_defensively(events_jsonl_path)
+        except Exception:
+            loaded = []
+        _decisions.append(_decision_universe(loaded))
+        return _decisions[0]
+
+    # 3d: the primary user, read once per batch and only when a promise or
+    # an owner change needs it. No ledger path, no user: nothing is stored.
+    _user: List[Any] = []
+
+    def _you():
+        if not _user:
+            if events_jsonl_path is None:
+                _user.append(None)
+            else:
+                from owed_direction import user_beside_ledger
+                _user.append(user_beside_ledger(events_jsonl_path))
+        return _user[0]
+
+    out: List[dict] = []
+    for i, ev in enumerate(events):
+        ev = {**ev}
+
+        # 1. Normalize known type drift.
+        etype = ev.get("type")
+        if etype in TYPE_NORMALIZATION:
+            etype = TYPE_NORMALIZATION[etype]
+            ev["type"] = etype
+
+        # 7 (SPEC UNDOGUARD, 2026-07-28). seq must be an INTEGER or absent.
+        #
+        # The read side is now defensive (event_seq.py), but that only
+        # protects workspaces already carrying bad rows — it does not stop
+        # the next one being written. This is the half that closes the
+        # source. It lives HERE, not in intel-intake (the one skill known to
+        # have emitted `seq: "1957"`), because a per-skill fix leaves every
+        # other writer free to repeat it; gate_events is the single choke
+        # point BOTH entries pass through (append_event calls it directly,
+        # atomic_append_jsonl calls it inside its events.jsonl branch).
+        #
+        # Absent/None is legal and normal — it is the documented contract
+        # ("omit seq/ts — they are auto-stamped inside the writer lock"), and
+        # the overwhelming majority of writers do exactly that.
+        #
+        # Unconditional (both strict and non-strict), matching the id-less
+        # closure and reminder-origin rules rather than the burn-in enum
+        # rule: a mistyped seq is a data-integrity defect, not a migration
+        # in progress. Nothing legitimate depends on the old behavior —
+        # atomic_write ALREADY discarded a non-numeric seq and reassigned it,
+        # so a writer passing a string never got the value it asked for. It
+        # just did so SILENTLY, which is how "1957" reached disk with nobody
+        # learning anything. CR_EVENT_GATE=0 remains the documented escape
+        # hatch for replaying a quarantined batch that predates the contract.
+        if "seq" in ev:
+            raw_seq = ev["seq"]
+            if raw_seq is not None and (
+                isinstance(raw_seq, bool) or not isinstance(raw_seq, int)
+            ):
+                raise EventGateError(
+                    f"event {i} carries a non-integer seq {raw_seq!r} of type "
+                    f"{type(raw_seq).__name__} (type={etype!r}, "
+                    f"holder={holder}) — seq is the monotonic human counter "
+                    "every ordering, window and back-reference in the "
+                    "substrate hangs off, and it must be an int. A string "
+                    "seq took `undo` down for an entire workspace (SPEC "
+                    "UNDOGUARD): one bad row raised TypeError inside a range "
+                    "comparison and denied the whole listing. Omit seq "
+                    "entirely (it is auto-stamped inside the writer lock) or "
+                    "pass an int."
+                )
+
+        # 6. Schema-enum validation — every family, from day one.
+        if not isinstance(etype, str) or not etype:
+            msg = f"event {i} has no 'type' (holder={holder})"
+            if strict_enum:
+                raise EventGateError(msg)
+            sys.stderr.write(f"[event_gate] {msg}\n")
+        elif not is_known_type(etype):
+            msg = (
+                f"event type '{etype}' is not registered in "
+                f"events.schema.json (holder={holder}) — register it per "
+                f"shared/EVENT_TYPES.md before writing it"
+            )
+            if strict_enum:
+                raise EventGateError(msg)
+            sys.stderr.write(f"[event_gate] {msg}\n")
+
+        # 8. Thread binding — DERIVE, then WARN (SPEC THREADSTAMP1 DD-1/DD-2).
+        #
+        # THE DEFECT. Thread-bound rows arriving with no `primary_thread_id`
+        # are invisible to every daily surface that filters on the field, and
+        # the pile accelerated 32 -> 54 -> 63 -> 181 -> 280 over five weekly
+        # scans. The field is an optional pass-through everywhere it appears,
+        # and ~40 writer sites spell it `x.get("primary_thread_id") or ""` —
+        # they PROPAGATE emptiness, they never derive. Fixing forty callers is
+        # the losing shape (RULED, DD-1): caller fixes rot, and the next writer
+        # copies the old spelling. This is the one place every append passes
+        # through — `append_event` calls `gate_events` directly and
+        # `atomic_append_jsonl` calls it inside its events.jsonl branch — so
+        # it is the only place a derivation cannot be bypassed.
+        #
+        # WHAT IT DOES NOT DO. It never invents an id and never writes an
+        # empty-string sentinel: a row that names no thread anywhere keeps the
+        # field exactly as the caller left it (absent stays absent), and gets a
+        # warning instead. A caller's real id is never overwritten. The whole
+        # change is "promote a reference the payload ALREADY CARRIES into the
+        # slot the surfaces read".
+        #
+        # WHY IT IS SAFE FOR THE PERSONAL LANE (BUG-8330 item 12 / FX-5). The
+        # personal firewall's business-binding override RESOLVES thread ids,
+        # and it resolves the source spellings this ladder derives from in both
+        # scopes already — see the constraint note on
+        # `event_types.THREAD_REF_DERIVE_FIELDS`. The stamp therefore cannot
+        # move a row across the firewall in either direction.
+        #
+        # WARN, NOT BLOCK, THIS TRAIN (DD-2). Fleet substrate exists that would
+        # block; the flip is a later ruling once the C14 counts drain. So this
+        # writes to stderr and returns the row.
+        #
+        # COMPOSITION WITH CLOCKTS1. This runs before the write; a batch whose
+        # `ts` is refused raises `FutureTimestampRefused` inside the writer
+        # lock and reaches the review side file, never the ledger — so a
+        # refused row is never thread-stamped INTO the ledger by construction.
+        if isinstance(etype, str) and etype in THREAD_BOUND_TYPES:
+            existing_tid = ev.get("primary_thread_id")
+            has_real_tid = (
+                isinstance(existing_tid, str) and existing_tid.strip() != ""
+            )
+            if not has_real_tid:
+                derived_tid = derive_primary_thread_id(ev)
+                if derived_tid:
+                    ev["primary_thread_id"] = derived_tid
+                elif not has_thread_ref(ev):
+                    sys.stderr.write(
+                        f"[event_gate] THREADSTAMP1 warn (holder={holder}): "
+                        f"thread-bound event type '{etype}' carries no thread "
+                        f"reference — no primary_thread_id, no thread_id / "
+                        f"project_id / primary_project_id in either scope, and "
+                        f"no related_thread_ids. It will be invisible to every "
+                        f"daily surface that filters on primary_thread_id. "
+                        f"Stamp the thread at capture; nothing is derivable "
+                        f"here and the gate will not invent one.\n"
+                    )
+
+        # 2 + 3. Commitment identity + kind.
+        if etype == "commitment":
+            data = ev.get("data")
+            data = {**data} if isinstance(data, dict) else {}
+            if data.get("id") in (None, "") or (
+                isinstance(data.get("id"), str) and not data["id"].strip()
+            ):
+                data["id"] = new_commitment_id()
+            else:
+                # v4.5.2 R1c — explicit ids must ROUND-TRIP through
+                # normalize_commitment_id (custom-string ids like
+                # commit_lyra_… are legitimate; the failure modes aren't):
+                #   - non-string ids never match the read-side exact-id index;
+                #   - leading/trailing whitespace breaks the strip()-then-look-
+                #     up on close (trimmed here, not rejected);
+                #   - an id shaped like a legacy seq alias (bare digits,
+                #     seq_N, event_N, commitment_seq_N) SHADOWS seq
+                #     references — a closure meaning "the event at seq 86"
+                #     would resolve to this commitment instead. Rejected.
+                raw_id = data["id"]
+                if not isinstance(raw_id, str):
+                    raise EventGateError(
+                        f"commitment event has a non-string data.id "
+                        f"{raw_id!r} (holder={holder}) — an explicit id must "
+                        "be a string that resolves back via "
+                        "normalize_commitment_id. Pass a distinct string id "
+                        "or omit data.id to have a cmt_<ulid> minted."
+                    )
+                trimmed = raw_id.strip()
+                if LEGACY_SEQ_ID_RE.match(trimmed):
+                    raise EventGateError(
+                        f"commitment event data.id {raw_id!r} collides with "
+                        f"the legacy seq-alias namespace (bare digits / "
+                        f"seq_N / event_N / commitment_seq_N; holder="
+                        f"{holder}). Closures referencing that spelling mean "
+                        "'the commitment at seq N' — this id would shadow "
+                        "them and closures would land on the wrong "
+                        "commitment. Use a distinct string id (e.g. "
+                        "cmt_<ulid> or commit_<name>_<date>_<n>) or omit "
+                        "data.id to have one minted."
+                    )
+                data["id"] = trimmed
+            # SUB1 § 3 — parent_id sanity (the referential checks the gate
+            # CAN do without reads; existence/depth live in the writer,
+            # commitment_state.add_subitems, like every closer):
+            #   - non-string never matches the read-side exact-id index;
+            #   - self-parent is incoherent;
+            #   - a seq-alias-shaped parent_id (bare digits / seq_N / event_N
+            #     / commitment_seq_N) is the R1c shadowing class — the writer
+            #     stamps the parent's canonical data.id VERBATIM, so any
+            #     alias spelling here is a hand-built append.
+            if "parent_id" in data:
+                pid = data.get("parent_id")
+                if not isinstance(pid, str) or not pid.strip():
+                    raise EventGateError(
+                        f"commitment event has a non-string/empty "
+                        f"data.parent_id {pid!r} (holder={holder}) — a "
+                        "sub-item must carry its parent's canonical data.id "
+                        "verbatim. Write through "
+                        "commitment_state.add_subitems."
+                    )
+                if pid.strip() == data.get("id"):
+                    raise EventGateError(
+                        f"commitment event is its own parent "
+                        f"(data.parent_id == data.id == {pid!r}; "
+                        f"holder={holder}) — a sub-item cannot parent "
+                        "itself. Write through commitment_state.add_subitems."
+                    )
+                if LEGACY_SEQ_ID_RE.match(pid.strip()):
+                    raise EventGateError(
+                        f"commitment event data.parent_id {pid!r} is shaped "
+                        f"like a legacy seq alias (holder={holder}) — the "
+                        "parent reference must be the parent's canonical "
+                        "data.id verbatim (cmt_<ulid>), never a seq "
+                        "spelling. Write through "
+                        "commitment_state.add_subitems."
+                    )
+            # CTS1 §5 — kind/counterparty consistency check, WARN-LEVEL ONLY
+            # and NEW WRITES ONLY (RULED 2026-07-16: 49 live rows already
+            # violate the promise half — a substrate-wide scan would fire 49
+            # warnings on day one; historical rows converge via the §8.2
+            # drip/batch fixup, never via warnings). The invariant that keeps
+            # the two surfaces un-blurry:
+            #   kind: task    ⇒ counterparty empty (a task with a counterparty
+            #                   is a promise wearing the wrong label)
+            #   kind: promise ⇒ counterparty signal present OR pending_review
+            #                   (a promise with nobody on the other end is
+            #                   either mis-linked — Bug #103 — or a task)
+            # Never rejects: extraction legitimately fails to LINK real
+            # counterparties, and blocking the capture would lose the item.
+            # The warning is the writer-side nudge; surfaces stay correct
+            # either way because they classify on effective kind (§2.2).
+            _cts1_kind = data.get("kind")
+            if _cts1_kind in ("task", "promise"):
+                try:
+                    from commitment_parties import counterparty_ids as _cp_ids
+                    from commitment_parties import counterparty_names as _cp_names
+                    _has_cp = bool(
+                        _cp_ids(data) or _cp_names(data)
+                        or data.get("owner_external")
+                        or data.get("requester_id")
+                        or data.get("requester_person_id")
+                    )
+                    if _cts1_kind == "task" and _has_cp:
+                        sys.stderr.write(
+                            f"[event_gate] CTS1 §5 warn (holder={holder}): "
+                            f"commitment kind=task carries a counterparty — "
+                            f"a task is self-owed by definition; if someone "
+                            f"is waiting on this, capture it as kind=promise "
+                            f"(title={str(data.get('title') or '')[:60]!r})\n"
+                        )
+                    elif (
+                        _cts1_kind == "promise"
+                        and not _has_cp
+                        and not data.get("pending_review")
+                    ):
+                        sys.stderr.write(
+                            f"[event_gate] CTS1 §5 warn (holder={holder}): "
+                            f"commitment kind=promise carries no counterparty "
+                            f"signal — it will render 'counterparty "
+                            f"unresolved' on My Plate; link the counterparty "
+                            f"at capture when known, or classify kind=task "
+                            f"if only the user's clock is running "
+                            f"(title={str(data.get('title') or '')[:60]!r})\n"
+                        )
+                except Exception:
+                    pass  # the check is advisory — never let it break a write
+            kind = data.get("kind")
+            if kind in (None, ""):
+                # Stage D flip: kind is REQUIRED AT CAPTURE. Strict path
+                # rejects; legacy path warns loudly + stamps the
+                # behavior-preserving default (burn-in posture, same as the
+                # enum check) so an un-migrated long-tail writer degrades
+                # visibly instead of breaking a customer workspace.
+                msg = (
+                    f"commitment event carries no data.kind (holder={holder}) "
+                    f"— kind is required at capture (Phase 2 Stage D): "
+                    f"classify as one of {sorted(KIND_VALUES)} when writing "
+                    f"(counterparty promise → promise; self-owed → task; "
+                    f"scheduling intent → scheduling; discuss item → agenda)"
+                )
+                if strict_enum:
+                    raise EventGateError(msg)
+                sys.stderr.write(f"[event_gate] {msg}\n")
+                data["kind"] = _KIND_DEFAULT
+            elif kind not in KIND_VALUES:
+                raise EventGateError(
+                    f"commitment event has invalid data.kind {kind!r} "
+                    f"(allowed: {sorted(KIND_VALUES)}; holder={holder})"
+                )
+            ev["data"] = data
+        elif isinstance(etype, str) and etype.startswith("commitment"):
+            # Kind is only required on creation events, but a bad value on
+            # any commitment-family event is still drift — reject it.
+            data = ev.get("data")
+            kind = data.get("kind") if isinstance(data, dict) else None
+            if kind not in (None, "") and kind not in KIND_VALUES:
+                raise EventGateError(
+                    f"{etype} event has invalid data.kind {kind!r} "
+                    f"(allowed: {sorted(KIND_VALUES)}; holder={holder})"
+                )
+
+        # 5 (reminder lane, v4.6.0 W4a). Origin is a HARD identity: reminders
+        # exist only because the user explicitly asked. Rejection is
+        # unconditional (both entries, strict or not) — a sweep/skill-minted
+        # reminder is a defect, never a burn-in warning.
+        if etype in REMINDER_TYPES:
+            data = ev.get("data")
+            data = {**data} if isinstance(data, dict) else {}
+            if data.get("origin") != REMINDER_ORIGIN:
+                raise EventGateError(
+                    f"{etype} event carries data.origin={data.get('origin')!r} "
+                    f"(holder={holder}) — reminders are minted by the USER "
+                    f"only: data.origin must be '{REMINDER_ORIGIN}'. No skill, "
+                    "sweep, or scheduled task may create or mutate a reminder "
+                    "on its own. Build through shared/scripts/reminders.py."
+                )
+            if etype == "reminder":
+                if data.get("id") in (None, ""):
+                    data["id"] = "rem_" + _ulid()
+            elif data.get("reminder_id") in (None, ""):
+                raise EventGateError(
+                    f"{etype} event carries no data.reminder_id "
+                    f"(holder={holder}) — an id-less reminder mutation is a "
+                    "dead letter; pass the reminder's data.id (rem_<ulid>) "
+                    "verbatim."
+                )
+            ev["data"] = data
+
+        # 3b (cr1#1011). Decision identity: every decision has an id when it
+        # is written. A row with no id gets dec_<ULID>; a top-level id an older
+        # writer put on the row is carried into data.id (the readers already
+        # take data.id first, then the top-level id, so its name is unchanged).
+        if etype == "decision":
+            data = ev.get("data")
+            data = {**data} if isinstance(data, dict) else {}
+            raw_id = data.get("id")
+            if raw_id in (None, "") or (isinstance(raw_id, str) and not raw_id.strip()):
+                top = ev.get("id")
+                raw_id = top if isinstance(top, str) and top.strip() else new_decision_id()
+            if not isinstance(raw_id, str):
+                raise EventGateError(
+                    f"decision event has a non-string data.id {raw_id!r} "
+                    f"(holder={holder}). Pass a string id or omit data.id to "
+                    "have a dec_<ulid> minted."
+                )
+            trimmed = raw_id.strip()
+            if _DECISION_SEQ_SPELLING_RE.match(trimmed):
+                raise EventGateError(
+                    f"decision event data.id {raw_id!r} is spelled like the "
+                    f"seq fallback the readers give an id-less decision "
+                    f"(holder={holder}). A close naming that spelling means "
+                    "the older decision at that seq; this id would take it. "
+                    "Omit data.id to have a dec_<ulid> minted."
+                )
+            data["id"] = trimmed
+            ev["data"] = data
+            batch_decision_ids.add(trimmed)
+
+        # 4c (cr1#1011). A decision close names a decision, and that decision
+        # exists. Before, an empty or mistyped target was written and closed
+        # nothing, while the same mistake on a promise was refused. Presence is
+        # checked always; existence when the ledger is in hand and the posture
+        # is strict, like the promise closers (4a).
+        if etype in _DECISION_CLOSER_TYPES:
+            target_ids, target_seqs = _decision_close_targets(ev, etype)
+            if not target_ids and not target_seqs:
+                raise EventGateError(
+                    f"{etype} event names no decision (holder={holder}). Pass "
+                    "the decision's id in data.decision_id (its dec_<ulid>; "
+                    "decision_seq_<n> only for a decision written with no id)."
+                )
+            if strict_enum and events_jsonl_path is not None:
+                known_ids, known_seqs = _decision_targets_known()
+                if not _decision_close_resolves(
+                    target_ids, target_seqs, known_ids | batch_decision_ids, known_seqs
+                ):
+                    raise EventGateError(
+                        f"{etype} event names {list(target_ids) + list(target_seqs)!r}, "
+                        f"which is no decision in the ledger or this batch "
+                        f"(holder={holder}). A close that names nothing real "
+                        "closes nothing; pass the decision's own id."
+                    )
+
+        # 4. Fail-loud rejection of id-less closures.
+        if etype == "commitment_resolved" and not _has_closure_id(ev):
+            raise EventGateError(
+                "commitment_resolved event carries no readable commitment id "
+                f"(need one of data.{'/data.'.join(COMMITMENT_CLOSURE_ID_FIELDS)}; "
+                f"holder={holder}). An id-less closure is a dead letter — it "
+                "closes nothing. Pass the commitment's data.id verbatim "
+                "(cmt_<ulid> or legacy commitment_seq_<n>)."
+            )
+
+        # 4a (BUG-8330 item 3) — resolvability wall for the closer family.
+        # Presence was never the disease's whole cure: a typo'd id passed
+        # clean and closed nothing. With the ledger path in hand, the target
+        # must RESOLVE (same resolver the closure audit uses). strict_enum
+        # False (controlled replay) keeps the old presence-only posture.
+        if (
+            etype in _RESOLVE_CHECKED_TYPES
+            and strict_enum
+            and events_jsonl_path is not None
+        ):
+            by_id, by_seq = _resolution_universe()
+            _check_closure_resolves(ev, etype, holder, by_id, by_seq)
+
+        # 4d (REFINT1) — the same wall for the commitment-REFERENCE family.
+        # A proposal or update against a never-created id used to land clean
+        # and become permanently invisible (the read side joins commitment
+        # events, so nothing behind the row means no count and no surface).
+        # Same universe, same batch-local amnesty, same replay escape hatch
+        # as 4a. Dismissals are deliberately exempt — see
+        # _REFERENCE_CHECKED_TYPES.
+        if (
+            etype in _REFERENCE_CHECKED_TYPES
+            and strict_enum
+            and events_jsonl_path is not None
+        ):
+            by_id, by_seq = _resolution_universe()
+            _check_commitment_ref_resolves(ev, etype, holder, by_id, by_seq)
+
+        # 4b (v4.6.0 S4) — the same dead-letter rule for the reassign and
+        # unmute references: an event that names no target routes/clears
+        # nothing. Both types are written through their canonical writers
+        # (commitment_state.reassign_commitment / mute_ledger.clear_dismissal),
+        # which always stamp the ids; this gate catches hand-built appends.
+        if etype == "commitment_reassigned":
+            data = ev.get("data")
+            data = data if isinstance(data, dict) else {}
+            if not _has_closure_id(ev):
+                raise EventGateError(
+                    "commitment_reassigned event carries no readable commitment "
+                    f"id (holder={holder}) — an id-less reassignment is a dead "
+                    "letter. Write through commitment_state.reassign_commitment."
+                )
+            # POLICY1-B F-9 — the ONE admitted id-less shape: a restore back
+            # to NO counterparty (`counterparty_cleared` + `counterparty_restored`,
+            # written by commitment_state.restore_counterparty). It routes the
+            # item back to where it was before a default was applied.
+            cleared_restore = (data.get("counterparty_cleared") is True
+                               and data.get("counterparty_restored") is True)  # 4b exception (F-9)
+            if not (data.get("new_owner_id") or data.get("new_counterparty_id")
+                    or cleared_restore):
+                raise EventGateError(
+                    "commitment_reassigned event names no new_owner_id or "
+                    f"new_counterparty_id (holder={holder}) — a reassignment "
+                    "must route the item somewhere. Write through "
+                    "commitment_state.reassign_commitment."
+                )
+        # 4c (v4.6.0 MC1) — the same dead-letter rule for a per-person
+        # receipt: a `commitment_partial_received` that names no commitment
+        # records a delivery against nothing. Written through
+        # commitment_state.mark_partial_received (always stamps the id); this
+        # catches hand-built appends.
+        if etype == "commitment_partial_received" and not _has_closure_id(ev):
+            raise EventGateError(
+                "commitment_partial_received event carries no readable "
+                f"commitment id (holder={holder}) — an id-less partial "
+                "receipt records a delivery against nothing. Write through "
+                "commitment_state.mark_partial_received."
+            )
+        if etype == "chat_dismissal_cleared":
+            data = ev.get("data")
+            data = data if isinstance(data, dict) else {}
+            if not (
+                data.get("dismissal_seq") not in (None, "")
+                or data.get("target_id") not in (None, "")
+                or data.get("fingerprint") not in (None, "")
+            ):
+                raise EventGateError(
+                    "chat_dismissal_cleared event references no dismissal "
+                    f"(need data.dismissal_seq, data.target_id, or "
+                    f"data.fingerprint; holder={holder}) — an unanchored clear "
+                    "unmutes nothing. Write through mute_ledger.clear_dismissal."
+                )
+
+        # 3d (cr1#1011, owner ruling 2026-11-11 option b): direction is
+        # stored on the promise and updated when it changes hands. The gate
+        # is the only writer: a caller's value is replaced, and dropped when
+        # the owner or the primary user is unknown (owed_direction.py).
+        if etype == "commitment" or etype in _OWNER_CHANGE_TYPES:
+            data = ev.get("data")
+            if isinstance(data, dict):
+                import owed_direction as _od
+                if etype == "commitment":
+                    owner = _od.owner_of(ev)
+                    ev["data"] = _od.stamp(data, owner, _you() if owner else None)
+                else:
+                    new_owner = data.get("new_owner_id")
+                    ev["data"] = _od.stamp_new(
+                        data, new_owner, _you() if new_owner else None)
+
+        out.append(ev)
+    return out
+
+
+def append_event(
+    path,
+    events,
+    holder: str = "append_event",
+) -> List[dict]:
+    """Canonical gated append to events.jsonl (Phase 1 F1).
+
+    Same signature semantics as atomic_write.atomic_append_jsonl (single dict
+    or list of dicts; `path` is the events.jsonl path; omit seq/ts — they are
+    auto-stamped inside the writer lock). Both entries gate in STRICT mode
+    (Phase 4 2026-07-02); this one remains the canonical named entry for new
+    code. Delegates the actual write to atomic_append_jsonl — there is
+    exactly one append path.
+    """
+    if isinstance(events, dict):
+        events = [events]
+    if not isinstance(events, list):
+        raise TypeError(
+            f"append_event expects list[dict] or dict, got {type(events).__name__}"
+        )
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            raise TypeError(
+                f"append_event entries must be dicts; entry {i} is "
+                f"{type(ev).__name__}: {ev!r}"
+            )
+
+    events = gate_events(events, strict_enum=True, holder=holder)
+
+    try:
+        from atomic_write import atomic_append_jsonl
+    except ImportError:
+        from pathlib import Path as _Path
+
+        sys.path.insert(0, str(_Path(__file__).resolve().parent))
+        from atomic_write import atomic_append_jsonl
+
+    # Returns the stamped copies (allocated seq/ts) — BUG-8330 item 7:
+    # callers read the seq of what they just wrote from the return value
+    # instead of pre-computing it with next_seq().
+    return atomic_append_jsonl(path, events, holder=holder)
+
+
+__all__ = [
+    "EventGateError",
+    "TYPE_NORMALIZATION",
+    "REMINDER_TYPES",
+    "REMINDER_ORIGIN",
+    "new_commitment_id",
+    "new_reminder_id",
+    "gate_events",
+    "append_event",
+]

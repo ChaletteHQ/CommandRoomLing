@@ -1,0 +1,444 @@
+# Commitment Event Schema (v2.7.15+)
+
+Canonical contract for `type: commitment` events in `_hq/data/events.jsonl`.
+
+Every skill that *produces* commitment events MUST follow this schema. Every skill or aggregator that *reads* commitment events MUST handle both this canonical shape AND the legacy flat shape (pre-v2.7.15) for backward compatibility.
+
+**Why this doc exists:** v2.7.14 shipped commitment views (Workspace Map, Commitments Tracker, People Network thread radar) that all aggregate from `events.jsonl`. As of 2026-04-27, M's events.jsonl had **zero** commitment events despite 11 processed meetings — the extraction pipeline was implicit (the writer contract said "emit commitment events" but the schema and trigger conditions weren't documented). v2.7.15 closes that gap by making the schema explicit and giving every producer skill an unambiguous extraction recipe.
+
+---
+
+## The canonical shape
+
+```json
+{
+  "seq": 142,
+  "ts": "2026-04-27T15:30:00Z",
+  "type": "commitment",
+  "source_skill": "meeting-notes",
+  "primary_thread_id": "project_017",
+  "related_thread_ids": [],
+  "classification_confidence": 0.92,
+  "person_ids": ["person_004", "person_011"],
+  "data": {
+    "owner_id": "person_004",
+    "title": "Send updated pricing deck to Mira",
+    "due": "2026-05-02",
+    "status": "open",
+    "source_event_seq": 138,
+    "source_ref": "granola:abc123def456"
+  }
+}
+```
+
+### Field-by-field
+
+**Top-level (standard event envelope):**
+
+| Field | Required | Notes |
+|---|---|---|
+| `seq` | yes | Reserved by writer helper. Monotonic. |
+| `ts` | yes | ISO 8601. The moment the commitment was *made* (meeting start, email send time), not the moment it was logged. |
+| `type` | yes | Always `"commitment"`. |
+| `source_skill` | yes | Skill that wrote it (e.g., `meeting-notes`, `inbox-triage`, `scan-for-commitments`). |
+| `primary_thread_id` | yes | Project this commitment belongs to. Format `project_NNN`. |
+| `related_thread_ids` | optional | Other projects touched. Usually empty for commitments. |
+| `classification_confidence` | yes | THE capture's confidence — one vocabulary (ATTRIB1-A A2, 2026-09-02). Written ONLY through `capture_gate.stamp_confidence` (every builder — meeting, decision, Slack, inbound, sent, session sweep — clamps into [0, 1] at the seam; a non-numeric value is dropped with a stderr tell, never coerced). `cru_match._COMMITMENT_FIELD_ALIASES` reads it as `confidence`. Below the surface floor (`confidence.surface_min`, baked 0.7) a meeting capture is written `pending_review: true`. **There is no `data.confidence` on a commitment row** — do not create one. |
+| `person_ids` | yes | All people involved in the commitment context. At minimum: `[owner_id]`. Include the user too if they're the counter-party. |
+
+**Inside `data` (commitment-specific payload):**
+
+| Field | Required | Notes |
+|---|---|---|
+| `owner_id` | yes | Canonical `person_NNN` id of who owes the deliverable. If the user owes it, use the user's id (the entity with `is_primary_user: true` or `is_user: true`). |
+| `title` | yes | Short verb-phrase describing the deliverable (e.g., "Send updated pricing deck to Mira"). Lowercase verb start. No trailing period. ≤120 chars. |
+| `due` | optional | ISO date `"YYYY-MM-DD"` if a due date was stated. Empty string if none. |
+| `status` | yes | `"open"` (default) or `"overdue"` (if due date is in the past at write time). Producers should compute `"overdue"` based on `now - due > 0`. |
+| `source_event_seq` | yes | The `seq` of the parent event (meeting / interaction / etc.) that this commitment was extracted from. Lets readers trace back to the source. |
+| `source_ref` | optional | Connector-scoped id of the underlying artifact: `granola:<meeting_id>`, `gmail:<message_id>`, `slack:<permalink>`. Used by `scan-for-commitments` for dedup on re-scan. |
+| `thread_ref` | optional (SENTMATCH) | Connector-scoped id of the CONVERSATION the commitment was captured in: `<provider>:<thread_id>`. Distinct from `source_ref`, which names one message — a message id is not a thread id, so the conversation has to be stated separately or it cannot be read back. Written by `sent_capture.build_sent_commitment_event(thread_id=…)`; read by `cru_match.commitment_thread_refs` for Path 1's thread prior (a later send in the same thread is recognized as the delivery). Absent = the prior does not fire for that item. |
+| `origin` | REQUIRED AT CAPTURE (connector-agnostic-v1, ACCOUNT_SCOPE §4a) | `"connector"` when the commitment was extracted from a connector read (inbox/sent/Slack/meeting scan — the code builders `sent_capture`/`slack_capture`/`meeting_capture`/`capture_gate` promote stamp it automatically); `"user_stated"` when the user stated it in chat ("I'll do X", "remind me to…"). Drives the account-scope wall: connector-origin is STRICT (provenance required + scope-checked); user_stated is exempt. Absent = legacy (provider-sniff scope check + a stderr warning) — new producers MUST stamp it. |
+
+### Optional fields inside `data`
+
+| Field | When to include | Notes |
+|---|---|---|
+| `id` | ALWAYS present after append (Phase 1, 2026-07) | The append gate mints `cmt_<ulid>` at write time when the producer omits it — ids are written, never synthesized-only. Producers MAY still set an explicit id (it is respected). Historic events without one keep resolving via the legacy synthesized `commitment_seq_<seq>` read-side alias. `commitment_resolved` events point back at this value verbatim. |
+| `kind` | REQUIRED AT CAPTURE (Stage D, 2026-07 — was gate-stamped from Phase 1) | Required discriminator, one of `promise` / `task` / `scheduling` / `agenda` (ratified 2026-07-01). **Producers classify at write time:** counterparty determinable → `promise`; self-owed, no counterparty → `task`; scheduling intent → `scheduling`; discuss items stay the separate `commitment_to_discuss` type; ambiguous → `promise` + `pending_review: true`. The strict `append_event()` path REJECTS a missing kind; the legacy burn-in path warns loudly + stamps `promise`. Historic events with no kind read as `promise` forever. **The kind POLICY is code-enforced:** `task` never enters CRU matching (`cru_match.cru_eligible`), tasks auto-stale at 30 days into the Friday triage (`commitment_state.stale_tasks`), never render in commitment aging, and never get chased. Promote/demote is an additive `commitment_reclassified` marker (`commitment_state.promote_task_to_commitment`) — a label change the projector applies read-side; never delete/recreate. |
+| `no_due` | when the extraction genuinely proposes no due date | Boolean (S2 due-date nudge). Every extraction proposes a `due` OR sets this explicitly — silence is not an option. Undated items surface in the weekly triage, not the aging view; target undated share < 30%. |
+| `urgency` | RETIRED (BUG-8330 item 16) | Historic rows may carry `"high"` / `"normal"` / `"low"`; no writer stamps it anymore and no reader ever existed (this row used to claim `morning-briefing` consumed it — it did not). Wire a real reader before re-introducing the write; guard G29 fails a writer-without-reader field. |
+| `evidence` | when extracted from text | Raw quoted phrase (≤200 chars) — useful for "why did you log this?" debugging. Do NOT store full transcripts. |
+| `meeting_date` | when extracted from a meeting transcript | ISO date `"YYYY-MM-DD"` — the date the source meeting occurred (NOT the date the commitment was logged). Use ONLY as a derivation hint for resolving relative phrases ("tomorrow", "by Friday") at extraction time. **Authoritative due-date is `data.due`. Readers MUST compute "overdue/today/upcoming" against `data.due`, never against `data.meeting_date`.** |
+| `owner_external` | when the owner is named but has no entity record yet (`owner_id` is null) | Free-text name string (e.g., `"Bowie"`) so the surface skill can render "owed to you by Bowie — add as contact." When `owner_id` is non-null this field is omitted. v2.14.19+: enables the reachability-filter surfacing pattern. |
+| `counterparty_id` | REQUIRED when determinable (Stage E 2026-07, F5 — extraction receipts) | Canonical `person_NNN` of who the deliverable is owed TO (or, for owed-to-you items, who owes it). Also included in `person_ids`. Feeds the CRU candidacy gate DIRECTLY (`match_send_to_commitments`) — without it the matcher leans on the title-token fallback and misses real completions (the Bug #103 recall class; live yield was 4 closes / 644 scanned). **Retires `requester_id` / `requester_person_id` for NEW writes** — readers keep the `_COMMITMENT_FIELD_ALIASES` chain forever, so the 228 historic requester_* events stay readable. |
+| `counterparty_name` | SHOULD set when the counterparty is named but resolves to no person record | Free-text name (e.g., `"Bowie"`, `"Lyra Stone"`). The matcher's candidacy gate matches recipient display names / email local-parts against it (Stage E), so a receipt survives even when entity resolution couldn't land an id. |
+| `counterparty_ids` | ONE commitment owed to MULTIPLE people (v4.6.0 MC1) — set ONLY when the source explicitly names 2+ recipients ("send the deck to **the board**") | Ordered list of RESOLVED counterparty `person_NNN` ids, primary first. When set, `counterparty_id` is ALSO set to element 0 (the legacy scalar stays valid forever, so any reader degrades to the first counterparty). **No history migration** — single-counterparty commitments never carry this key. Every consumer unions `{counterparty_id} ∪ counterparty_ids` via `shared/scripts/commitment_parties.py` (the ONE reader — `counterparty_ids()` / `primary_counterparty_id()` / `outstanding_counterparties()`). Each id is also in `person_ids`. Build with `commitment_parties.build_counterparty_fields` (keeps single-counterparty output byte-identical). |
+| `counterparty_names` | multi-counterparty items with 2+ UNRESOLVED counterparties (v4.6.0 MC1) | List of free-text names, DISJOINT from `counterparty_ids` (a resolved counterparty carries an id, not a name). Same reader union as above. **Writers still break the disjointness rule, so the reader no longer trusts it (F-28, 2026-07-30):** pass `workspace_root=` to any roster reader on a path that can CLOSE or CHASE a commitment (`counterparty_count` / `has_multiple_counterparties` / `counterparties` / `outstanding_counterparties` / `all_counterparties_received`) and a name that resolves EXACTLY — `entities.json` + aliases, never fuzzy — to an id already in the set is dropped, so one person written both ways counts once. Omitting `workspace_root` keeps the raw union; a name that resolves to a different person, or to nothing, always counts. |
+| `received_from` / `received_from_names` | NEVER written on a `commitment` event — accumulated on the PROJECTION by the loader from `commitment_partial_received` events (v4.6.0 MC1) | Resolved ids / free-text names of counterparties who have delivered. When every counterparty is in, the loader stamps `all_counterparties_received: true` (derived, in-memory) — the PROPOSE-closure signal (never an auto-close). |
+| `pending_review` | DERIVED on meeting captures (ATTRIB1-A D4, 2026-09-02); legacy writers still stamp it | Boolean. If true, surface skill should flag for explicit user review. Bypasses auto-chase paths until confirmed. **On a row `meeting_capture.route_meeting_captures` writes it is never a literal: `meeting_capture.derive_pending_review` sets it iff `attribution.owner_basis == unknown`, OR `kind == promise` and `attribution.counterparty_basis == unknown`, OR the row carries a `floor_code` / `fusion_status: refused`, OR `classification_confidence` is below the surface floor (or malformed). Nothing else may set it.** A caller that passes an explicit value the basis does not support gets the derived value plus a `capture_contract_violation` note (DD-4). |
+| `review_reason` | when `pending_review` is true | One-line plain-English explanation of why review is needed (e.g., "Owner is external person — no entity record yet"). Used by the needs-your-call queue and the Commitments surfaces to compose review prompts (the retired Pulse chat's CRU-review section was the original consumer). On a derived row it is the floor/fusion sentence when one gated it, else the attribution reason. |
+| `attribution` | ALWAYS on a row `route_meeting_captures` writes (ATTRIB1-A DD-1/DD-4); optional on every legacy row | Object `{transcript_class, owner_basis, counterparty_basis, span, turn}` — the typed EVIDENCE the flag is derived from. `transcript_class`: `named` / `me_them` / `unlabelled` / `dictation` / `unknown` (the meeting's declared class — `meeting_capture.transcript_class`, run once before extraction). `owner_basis`: `speaker` / `calendar` / `vocative` / `inferred` / `unknown`. `counterparty_basis`: `calendar` / `vocative` / `speaker` / `person_ids` / `inferred` / `unknown` / `none` (a task has no counterparty slot) / `default_applied` (A6 — the lapse applied the question's default; written on the clearing event's provenance, see `confirmed_by`). `span`: `[start, end]` token offsets of the item's own words in the transcript's fusion token stream (`meeting_capture._fusion_token_spans`), or `null` when nothing locates or no transcript reached the capture. `turn`: the marker the span sits under (`Me` / `Them` / a speaker name), or `null`. ATTRIB1-B (2026-09-04) writes the ladder's rungs: `owner_basis: speaker` when the turn marker AND the grammatical person of the row's own words agree (first person in a `Me` turn, or a named speaker's own first-person promise — the A4 person-agreement fence: disagreement never yields `speaker`), `calendar` when the other voice on a two-party call promised, `inferred` when the extractor's resolution stands or the addressee is implied ("you'll send…" in the user's mouth); `counterparty_basis` from the ladder calendar-2p → vocative → named speaker → meeting `person_ids` (single candidate) → ask (`unknown` + `question`). Rows written before this build carry `inferred` / `unknown` / `none` only. Written ONLY by `meeting_capture.derive_attribution`; a hand-typed basis is refused by `validate_attribution`. |
+| `floor_code` | on EVERY floor-gated meeting capture (ATTRIB1-A D5) | The `FLOOR_*` code of the floor verdict that gated the row — the same code `capture_counts.floor_reasons` tallies. Before this build the verdict computed it and the row builder dropped it (87/87 gated rows in the last 30 days carried only the prose sentence). A gated row without a code is a write defect. |
+| `fusion_status` | on EVERY meeting capture, every lane (ATTRIB1-A D7) | `verified` (the row's words locate verbatim in its transcript), `refused` (they do not — the row routes review with `data.fusion_unverified`), `inert` (the check could not run: no transcript, or fewer than `FUSION_MIN_WORDS` to look for). Before this build the verdict was computed on every row and written on none (`data.fusion_inert` — PREC1 — marked only the inert case). `inert` stays possible on the A lane; EXTRACT1's labelled-paraphrase rule is what makes it impossible on a row that carries a span. |
+| `attribution.question` | on a row whose counterparty the ATTRIB1-B ladder could not resolve (a `promise` or, since ruling 2, a `scheduling` row) | Object `{kind: "who_is_you", options: [person ids — the meeting's parties other than the owner], default: person id or null}` — the ONE question the row may carry. `default` is the ladder's best guess (a heard name that spells exactly one party); door 1 (the meeting card) renders it pre-selected, and the review-expiry drain APPLIES it when nobody answers (A6 — `counterparty_basis: default_applied` on the clearing event's provenance, never `dropped` for a row that had a best guess). Written only by `meeting_capture.attribute_counterparty`. |
+| `speech_act` | on a meeting capture the floor is ALREADY holding whose sentence is a recognisable non-commissive shape (EXTRACT1 dragger 2) | One of: `advice offered, not a promise made` · `a request received, not accepted here` · `a conditional offer the other side declined` · `reported about someone else, not promised here` · `dictated to a tool, not promised to a person`. **A LABEL, NEVER A VERDICT.** It names what the sentence is; the row's lane and its `floor_code` are whatever the shipped floor decided, untouched. It is absent on any row that CLEARS the floor — a promise naming a person and a date is a promise whatever nouns it contains. (Learned 2026-09-04: the first cut made these floor verdicts, which renamed `FLOOR_NOT_ACCEPTED` out from under EXCH1's rescue and cost a hedged row its acceptance check. A lane that wants to name something adds a field; it never renames a verdict another feature reads.) |
+| `evidence_kind` | on every meeting capture whose evidence relation is known (EXTRACT1 dragger 3, D-C) | `verbatim` — the row's words locate in its transcript (the span is real); `paraphrase` — the extractor could not quote and LABELLED the restatement, so `fusion_status` is honestly `inert` rather than falsely `refused`. An unlabelled string that does not locate carries no label and keeps `fusion_status: refused` (the writer defect the label exists to name). |
+| `self_counterparty_stripped` | only when the extractor wrote the owner as their own counterparty (EXTRACT1 D-A / dragger 4) | `true` — the self-reference was STRIPPED at the route before the build (the user can never be their own counterparty — a hard fence, not a heuristic); the counterparty then resolves through the ladder or asks. Every other writer is REFUSED at `capture_gate.gate_commitment_data` for the same shape. |
+| `capture_contract_violation` | only when a caller passed an explicit `pending_review` the basis contradicts (ATTRIB1-A DD-4) | One-line note: what the caller asked for, what was derived, why. The derived value stands; the note is provenance for the reviewer, never a lane. |
+| `proof` | STAMPED AT CAPTURE on every row `capture_gate.gate_commitment_data` admits (EXIT1 / SPEC_FLOW1 Lane B item 1, 2026-09-07); DERIVED read-side on every row without one | **What would show this row done** — one of `mail_to_counterparty` · `their_reply` · `calendar_event_with_counterparty` · `payment_or_agreement` · `your_own_word`. Not a score and not a status: it is the question each exit rail is allowed to answer about this row, written down at the door instead of guessed at by four matchers afterwards. **`your_own_word` is the honest one:** a row with nobody on the other end can never be proved by any message, reply, meeting or payment that will ever exist — 197 of the 317 open rows on the operator's book on 2026-09-07 were that shape — and its only automatic exits are the owner's own word (`exit_doors.apply_own_word_closes`) and silence (`exit_doors.run_silence_pass`). **ONE reader, `exit_doors.stored_proof`:** it returns the stamped value when the row carries a legal one and `exit_doors.proof_for_row`'s derivation otherwise, so a row written before this field existed and a row written after it are never graded by two different ideas of the same question. The one exception (cr1#750): a `payment_or_agreement` stamp on a title where a deal word sits only inside another word is the old classifier's mistake and is derived again. The stamp is additive and never fatal — a derivation that raised would turn a legibility field into a capture outage — and an explicit value a caller already set is respected. Readers: `calendar_close._is_calendar_row` (which rows the calendar closer looks at), `exit_doors.plan_fact_closes` (the paid-or-signed leg), `exit_doors.proof_census` (how many rows nothing can prove). |
+
+---
+
+## Extraction triggers (when to write a commitment event)
+
+A commitment exists when a person makes a forward-looking promise about a specific deliverable, and a reasonable third party reading the source would identify a clear owner. Producer skills MUST emit a commitment event when ALL of the following are true — **this is the capture floor (Stage D 2026-07: clear owner + clear deliverable + real consequence — the teachable rule that cut one live open set 71→33; below-floor items bury real promises):**
+
+1. **Forward-looking** — the deliverable is in the future, not a description of past action.
+2. **Specific** — there's a concrete artifact, decision, or action ("send the deck", "decide on pricing by Friday", "introduce me to your CFO"). Vague intentions ("we should think about that", "let's circle back") DO NOT qualify.
+3. **Owned** — there's an identifiable person taking it on. If the source uses "we" or "the team" without naming an individual, do NOT emit a commitment.
+4. **Consequential** — someone is waiting on it, a date depends on it, or dropping it costs something. Musings with an owner and a deliverable but no stakes are noise.
+5. **Not duplicate** — `(source_ref, title)` is unique. If the same source has been processed before and produced an equivalent commitment, skip.
+6. **Not suppressed** — if `_hq/config/commitment-rules.md` exists, producers read it BEFORE writing and skip items matching a user-taught `never-track` pattern (appended by the triage surface's `never track this` action).
+
+### Linguistic patterns that DO qualify
+
+- "I'll [verb] [thing] by [date]"
+- "Can you [verb] [thing]?" → "Yes / sure / will do"
+- "[Name] is going to [verb] [thing]"
+- "I owe you [thing]"
+- "I'll get back to you with [thing]"
+- "Action item: [name] — [verb] [thing] by [date]"
+- "[Name] to [verb] [thing]"
+
+### Linguistic patterns that DO NOT qualify
+
+- "We should consider X" (no owner, vague)
+- "I want to think about X" (no deliverable)
+- "Let's circle back" (no specific deliverable)
+- "Maybe we could X" (hypothetical)
+- "X would be nice" (wishful)
+
+### Status assignment at write time
+
+```
+if due and parse_date(due) < today_utc():
+    status = "overdue"
+else:
+    status = "open"
+```
+
+Producers do NOT need to update status over time; that's a re-scan/aggregation concern. Specifically: `_aggregate_commitments` re-evaluates overdue at read time using the `due` field, so a commitment written `"open"` with a past due date will surface as overdue in views automatically. The `status` field on the event is the producer's snapshot at write time.
+
+---
+
+## Observed tier — the capture relevance gate (v4.6.1 W4c)
+
+**Principle: capture everything, gate only surfacing.** No setting loses data;
+the observed tier is the full record, so the line is movable retroactively —
+that is what makes user customization of the gate safe.
+
+**The gate (runs at capture, after the Stage-D/S2/Stage-E block — one shared
+implementation, `shared/scripts/capture_gate.py`):** an extracted item enters
+the ledger as an OPEN `commitment` only if the workspace owner is a party
+(owes it or is owed it — owner/counterparty id match, or a confident name
+match; a `task`/`scheduling`/`agenda` item with no party fields is presumed
+self-owed). Everything else is stored as a `commitment_observed` event
+(`data.tier: "observed"`): third-party↔third-party items, and **amber** items
+whose attribution can't be confidently resolved — amber is SILENT by default,
+not ask. Observed items are searchable, feed prep context, and are promotable
+— but create **no open item, no count, no triage row** (a dedicated event
+type keeps them out of every open-set reader by construction; see
+`EVENT_TYPES.md`).
+
+**The confirm queues read the tier (OBSERVED1, 2026-08-24).** Live observed
+items (unexpired, never promoted — `capture_gate.live_observed`) render as a
+labelled SET ASIDE section on needs-your-call and on `show watching`, with
+confirm/drop verbs. Confirm = `promote_observed` + `clear_review_flags` (one
+gesture — an ordinary open commitment); drop = `promote_observed` +
+`close_commitment(resolution="dropped")` (the standard tombstone). Both are
+appends dispatched by `needs_review_queue.confirm_items` / `drop_items`; the
+observed WRITE path is unchanged. This closes the state the tier shipped in
+for six weeks: rows prep cited as live work that no surface could confirm,
+drop, or expire by hand.
+
+**Modes (customize layer — SCL1 directives under `_hq/custom/`, the
+`scan-for-commitments` policy file governs every capture writer; read fresh
+at capture time via `capture_gate.resolve_capture_mode` /
+`workspace_capture_context`):**
+
+| Mode | Behavior |
+|---|---|
+| `party-only` (DEFAULT) | only items where the owner is a party open |
+| `team-delegation` | also open items a team member commits to (people in the workspace's own org — `relationship_type: "self"`) |
+| `track-everything` | pre-W4c behavior; everything opens |
+| `observed-only` (org-override value) | keep everything from that org on file without asking |
+
+Directive grammar: `capture mode: <mode>` (global) · `for <org name or id>:
+<mode>` (per-org override — routed via the capture source's RESOLVED org;
+overrides beat the global mode). Outcome language only, never numeric
+thresholds. Fail-open: when the primary user can't be resolved, the gate is
+inert (track-everything) — a broken entities file must never silently swallow
+real commitments.
+
+**Asymmetric caution rail (beats every mode and override):** an item carrying
+a due date (parseable `data.due`) or a money amount (currency symbol + number,
+or number + currency word — deliberately conservative; bare "5k" doesn't
+match) ALWAYS surfaces as open. Enforced twice: `classify_capture` routes it
+open, and `build_observed_event` refuses to store it observed.
+
+**Corroboration (the checkable promotion rule — never vibes):** an observed
+item is promoted into the confirm flow when a LATER event from a DIFFERENT
+source (`commitment`/`interaction`/`meeting`/`note`, distinct non-empty
+`source_ref`, later timestamp) BOTH (i) shares a party — a person id, or a
+≥3-char name token — AND (ii) overlaps its content — stopword-stripped
+title-token Jaccard ≥ 0.5, or ≥ 3 shared content tokens
+(`capture_gate.corroborates` / `find_corroborations`). An explicit user
+reference ("track that", or the track-it affordance on a prep render)
+promotes unconditionally. Promotion = `capture_gate.promote_observed`:
+appends a REAL `commitment` with `data.pending_review: true`,
+`data.promoted_from: <obs id>`, and a review_reason — the daily confirm
+section picks it up purely by data contract. Idempotent; the observed event
+stays in history (append-only, no rewrite). Prep context
+(`prep_context_observed`) SURFACES observed items for meetings with those
+parties but never auto-promotes — a weekly recurring meeting must not
+re-create the confirm-row volume the gate removed.
+
+**Expiry (HYG1 — derive-on-read, no scheduler):** an observed item that is
+older than `capture_gate.OBSERVED_EXPIRY_DAYS` (30) and was never promoted is
+EXPIRED: it stops counting in `observed_counts` (which reports it under a
+separate `expired` field for the audit line), stops corroborating
+(`find_corroborations` skips it — a stale observation must not promote off a
+fresh event), refuses promotion (`promote_observed` returns not-ok with the
+plain reason; re-capture from a current mention if it's still real), and
+never resurfaces in prep context. Promotion is permanent — an item promoted
+while live is unaffected by its observed source aging. The event itself is
+NEVER deleted (append-only doctrine); expired items stay in the log and stay
+searchable via transcript-search.
+
+**Audit affordance:** the weekly cleanup note carries one line — "N items set
+aside this week — review" — backed by `capture_gate.observed_counts(root,
+since_ts=<7 days ago>)`, which counts LIVE items only (expired items report
+separately and never inflate the sentence). A filter whose rejects are
+cheaply inspectable is a filter the user can trust.
+
+**Verb-driven tuning (consent, never silent):** Not-mine/Drop signals already
+in the log (`commitment_resolved` with a dropped/not-mine resolution,
+`commitment_reassigned`, `chat_dismissal`) are mined per counterparty org by
+`capture_gate.propose_gate_directives` (floors: ≥5 captured, ≥70% dismissed;
+cap 3). **The weekly insights pass consumes these as PROPOSALS** ("You set
+aside 12 of the last 15 things I captured about [vendor] — want me to keep
+those on file without asking?") riding the existing confirm/edit/skip widget;
+an approval calls `capture_gate.apply_gate_proposal` — ONE tap writes ONE
+per-org `observed-only` directive through `skill_custom_writer.add_directive`
+(origin `learned`); a decline lands the fingerprint (`cgd_<hash>`) in the
+proposal ledger's 60-day cooldown. The gate NEVER adjusts itself — a proposal
+the user didn't approve changes nothing.
+
+---
+
+## Resolution (how commitments close)
+
+**THE closure path (Phase 2 Stage B, F2):** every closer writes through `shared/scripts/commitment_state.py::close_commitment(workspace_root, commitment_id, *, resolved_by, evidence, source_skill, resolution="done"|"dropped"|"superseded", user_confirmed=...)`. It normalizes legacy id spellings (bare int `86`, `seq_86`, `event_086`, `commitment_seq_86` → canonical via seq lookup), raises `CommitmentIdError` when nothing matches (no orphan tombstones — 74 existed in the live substrate), is idempotent over the FULL resolved-id set, never auto-resolves a `pending_review` item (`PendingReviewError` unless `user_confirmed=True` from an explicit user action), and appends through the Phase 1 gate. Matching logic (cru_match Paths 1–5) stays with the callers; only the write is centralized. Migrated closers: log-resolution, apply-choices, the workspace-manager catch-all, reconcile-sent, the Commitments orchestrator (2.5/2.6/2.7 + resolved/mark-received verbs), orchestrator-inbox 5.5, orchestrator-past-meetings, calendar-writer 3.5, meeting-notes, follow-up-ritual.
+
+A commitment closes when a `commitment_resolved` event references it:
+
+```json
+{
+  "seq": 167,
+  "ts": "2026-05-02T18:00:00Z",
+  "type": "commitment_resolved",
+  "source_skill": "follow-up-ritual",
+  "primary_thread_id": "project_017",
+  "data": {
+    "commitment_id": "commitment_seq_142",
+    "resolved_by": "person_004",
+    "evidence": "Mira replied confirming receipt of the deck",
+    "source_ref": "gmail:18f2c1a9b4d7e0"
+  }
+}
+```
+
+**Source pointers on the close family (PROV1, 2026-08-16) — ADDITIVE, OPTIONAL, read-back-compatible.** Measured on the live substrate the day this shipped: 258 of 258 `commitment_resolved` events in the trailing 30 days carried evidence PROSE and zero carried a resolvable pointer. Prose is not auditable — "Mira replied confirming receipt" names no message anyone can open. Every close-family writer (`close_commitment`, its cascade child-closer, `supersede_commitment`, `split_commitment`, `resolve_thread`, and the `commitment_updated` / `commitment_partial_received` writes that assert an EXTERNAL fact) now takes a `source_ref` keyword and stamps ONE of two additive `data` keys:
+
+| Key | When | Meaning |
+|---|---|---|
+| `source_ref` | a pointer was supplied | The canonical Layer A4 pointer (`provider:native_id` — `gmail:<message-id>`, `granola:<meeting-id>`, `slack:<channel>:<ts>`, `session:<receipt-id>`), canonicalized by the WRITER through `connector_adapters/provenance.py` so no reader ever re-normalizes a raw spelling. |
+| `source_ref` + `ref_grain: "surface_minted"` | nothing was supplied, and the writer has a floor (PROVMINT1) | The writer's OWN receipt for the act: `session:<source_skill>:<now to the second>`. Real provenance of a smaller grain — it names who closed it and when, never an artifact — and the grain key is what says so. |
+| `provenance_missing: true` | nothing was supplied, and the writer has no floor | An honest "this close cites nothing." |
+
+Four rules, in priority order:
+
+1. **A close is never blocked for want of a pointer.** A human-confirmed chat close has no message id — its pointer is its session/receipt (`session:<id>`, already in the Layer A4 vocabulary). A machine close with nothing in hand still lands, minted or marked.
+2. **Absence is visible, never silent.** The marker is what separates "nothing to point at" from "written before the rule existed"; without it the two are indistinguishable forever.
+3. **A minted pointer always says it was minted.** Never one without the other: a mint with no `ref_grain` is indistinguishable from an artifact pointer, and would silently inflate `closure_index.pointer_coverage` — the exact metric this contract exists to produce. `ref_grain` is written ONLY on a mint, so its ABSENCE means caller-passed, which is what every pre-PROVMINT1 row is. No backfill, no reclassification.
+4. **A malformed pointer is refused loudly** (`provenance.SourceRefError`), before the writer lock, with nothing written. Garbage in `source_ref` is worse than no pointer, because every reader treats that key as resolvable evidence. In the BATCH path (`close_commitments`) the refusal is per-ROW — one bad pointer never loses the run's real closes.
+
+**The module-side floor (PROVMINT1, 2026-08-17).** PROV1 made the pointer a thing each CALLER supplied, and the 2026-08-17 walk measured what that produces: on the human rails the marker had become the normal outcome, because the ask lived in skill PROSE and prose is the layer that flattens. Three writers — `close_commitment` (with its cascade child-closer and the `close_commitments` batch), `clear_review_flags`, and `reopen_commitment` — therefore MINT the floor themselves, and `provenance_missing` is unreachable from them. `supersede_commitment` and `resolve_thread` are deliberately NOT in that set and still stamp the marker when they get nothing.
+
+Two consequences for callers, and they point in opposite directions on purpose:
+
+- **Prose still asks for the better pointer, and callers still owe it.** The mint is the FLOOR, never the ceiling: a caller-passed artifact key always wins and carries no grain marker. Building a good ref for MATCHING and then dropping it at the CLOSE — the class the walk found on three independent auto-resolve rails — is still a defect, and is still what the coverage split will surface.
+- **Nobody has to remember any more for the record to stay auditable.** A caller who passes nothing gets a true, timestamped, per-gesture receipt instead of a hole. Callers that perform ONE act over MANY ids pass `mint_now_iso` (read from the clock once) so the batch reads as one act rather than N.
+
+**A minted receipt names the ACT, and it is NOT an artifact key.** It resolves to one second on one surface and nothing finer, so it is deliberately non-unique in two ways: a batch's N closes all share one receipt (that is the point of `mint_now_iso`), and two separate gestures on the same surface inside the same second collide on the same string. Every one of them still lands an `r:` key in the `.source_refs.idx` sidecar, so that index now holds many non-unique `session:` keys — expected, not corruption. **Never back a `source_ref`-keyed dedup, or an "is this artifact already recorded" lookup, with a minted ref over close-family rows**: it false-positives on every row of a batch after the first. The one live caller on this path already checks a CONTENT hash instead (`session_sweep.already_captured`, whose docstring names this exact hazard) — keep it that way, and give any new dedup its own content key rather than reaching for the pointer.
+
+**Coverage reads the split, not the total — and it reads only the CLOSERS.** `closure_index.pointer_coverage` returns `caller_passed` and `surface_minted` alongside `with_pointer` (they sum to it exactly, so an older reader keeps its number), and `pointer_coverage_line` renders both. Reporting only the total after the mint shipped would climb toward a fake 100% by construction. **Scope, precisely, because the paragraphs above read broader than the metric is:** coverage counts `closure_index.CLOSER_TYPES` — `commitment_resolved`, `thread_resolved`, `commitment_superseded` — and `end_of_day.closures_since` reads a narrower two (`commitment_resolved`, `thread_resolved`). So of the three floor writers only `close_commitment` (with its cascade and batch) reaches either reader. The refs `clear_review_flags` and `reopen_commitment` mint land on `commitment_updated` / `commitment_reopened`, which no reported number counts today: they are AUDIT-ONLY — they make those two writes traceable in the event stream, and they move no percentage anywhere.
+
+**The stored pointer is CASE-PRESERVING; identity is derived from it (PROV2, 2026-08-16).** `data.source_ref` keeps the native id's case verbatim on every lane except chat (see the carve-out below) — the provider half is still normalized (lowercase, `gcalendar` → `gcal`, both Slack spellings still reducing to `slack:<channel>:<ts>`). This is not cosmetic: Outlook immutable ids and Drive file ids are case-sensitive, and the lowercased form PROV1 stored resolved to nothing on those backends, permanently, with nothing going red (Gmail / Granola / `session:` ids are case-insensitive in practice, so a Gmail-backed workspace showed no damage).
+
+Two consequences every reader must honor:
+
+1. **Hand a stored ref to a resolver BYTE-IDENTICAL.** Never lowercase, never re-normalize on read. The writer already canonicalized it. (On chat-lane closes, resolve from `data.chat_source_ref` instead — carve-out below.)
+2. **Never compare two stored refs with a raw `==` or set-membership.** Pre-PROV2 rows are lowercased and post-PROV2 rows are case-preserved, so the same artifact has two spellings on disk. Identity comes from `provenance.dedup_key_of(stored_ref)`, which case-folds a pointer back to the unchanged `canonical_dedup_key` form — a legacy row folds to itself, so the two spellings land on ONE identity. Enforced by guard G30 (`tests/run_guard_g30_stored_ref_identity_test.py`). **No migration, no backfill, no history rewrite** — the derivation is what makes the boundary invisible.
+
+**CARVE-OUT — the chat lane's primary `source_ref` is the REDUCED dedup-form key, not a case-preserved pointer.** `chat_reconcile` mints its pointer as `chat.source_ref_string(ref)` = `chat_ref_key(ref)`, which lowercases the room/channel id **and** the message id before the writer ever sees it; `canonical_source_ref` preserves what it is handed and cannot un-lowercase it. So on a Slack, Teams or Graph workspace the primary `data.source_ref` of a chat-evidenced close is case-folded, and rule 1 above does not apply to it — handing that string to Graph or to the Slack API will not resolve. **The resolvable, case-preserving form on that lane is `data.chat_source_ref`**, the structured pointer written alongside by `chat.pointer_fields` (`chat._norm` trims only, so room and message ids keep their case). It is not optional: `chat_reconcile.assert_pointer_or_refuse` RAISES when the structured half is missing, on both the close branch and the proposal branch, so every chat-evidenced row provably carries it. **Readers: on a chat-lane row, resolve from `data.chat_source_ref`; use `data.source_ref` for identity only.** Every other lane's `source_ref` is case-preserved per PROV2 above. Minting the chat string half through a case-preserving twin of `chat_ref_key` is a sequenced writer change (owed before any Teams/M365-backed promote), deliberately not folded into PROV2 — PROV1's writer API is frozen and PROV2 moved only the canonicalization inside it.
+
+**Legacy rows carry neither key and are never an error** — same read posture as Layer A4's missing `account_id`. Provenance cannot be retrofitted; it is saved at write time or it is gone, so no backfill exists or should be attempted. The coverage metric (`closure_index.pointer_coverage`, rendered by usage-report and operator-report) reports legacy rows as their own number and keeps them OUT of the denominator for exactly this reason.
+
+The aggregator removes the commitment from open queues when it sees a `commitment_resolved` event whose `data.commitment_id` matches an open commitment's `data.id` (or the synthesized `commitment_seq_<seq>` if no explicit id was set). **Read-side amnesty (Phase 2 Stage C, F3):** the closer chain also honors the seq aliases `data.commitment_seq` and `data.source_event_seq` — both map seq → the commitment event at that seq — recovering ~252 of the 289 historic dead-letter closures with no history rewrite. `close_commitment`'s idempotency chain mirrors this exactly. What the read chain cannot recover is repaired ADDITIVELY, once, by `shared/scripts/repair_commitment_closures.py` (preview-by-default; snapshots to `_archive/` before any write; `source_skill: closure-repair-2026-07`; run supervised at dogfood time only).
+
+**In-place mutation is FORBIDDEN (F4, Phase 2 Stage C):** no write path may flip an existing commitment event's `data.status` — the 2026-07-01 audit found 249 commitments closed by in-place mutation (still growing during the audit day), a pattern that violates append-only and correlates with the observed substrate corruption. Closure is a tombstone append through `close_commitment()`, full stop. Readers keep honoring the legacy in-place `status in ("closed", "resolved", "superseded")` values forever — those 249 rows depend on it — and the repair script formalizes them with amnesty tombstones so the class can be retired.
+
+**Attested completions (DONE1 2026-08-03):** the needs-your-call queue's `already done` verb closes with `resolution="done"` through the same path, and its `data.evidence` is the USER'S OWN ATTESTATION — who said it, and when and where — never a match, a score or a synthesized sent-mail line. So that no later reader can mistake it for an evidence-backed closure, the writer (`needs_review_queue.done_items`) also passes an additive `extra_data` stamp: `data.completion_basis: "user_attestation"`, `data.attested_at`, `data.attested_on_surface`. Additive and read by nothing today; `close_commitment` never lets `extra_data` override the canonical keys.
+
+**Fail-loud (Phase 1, 2026-07):** the append gate REJECTS a `commitment_resolved` event that carries no readable id (none of `data.commitment_id` / `data.id` / `data.target_id` / `data.commitment_seq` / `data.source_event_seq`). An id-less closure is a dead letter — 291 of them existed in the live substrate when the gate shipped. Embed the commitment's `data.id` verbatim; never re-derive it.
+
+`thread_resolved` events also close commitments — that's the v2.7.13 batch-resolution path from the DCC's `✓ done` button. Producers can use either; aggregator treats them the same. **Its writer is `commitment_state.resolve_thread()`** (PROV1) — same envelope log-resolution used to hand-compose (`data.id` / `data.kind` / `data.source_artifact`), now gated, locked, and carrying the pointer contract above. A COMMITMENT still closes through `close_commitment` (id normalization, orphan refusal, pending_review floor); `resolve_thread` covers the non-commitment kinds and the back-compat twin.
+
+**Merge / supersession (`commitment_superseded`, v4.6.0 C4):** capture dedup is source-scoped (`(source_ref, title)` content hashes), so the same real-world commitment captured by different writers — meeting transcript (`granola:X`), follow-up email (`gmail:Y`), nightly sweep (`session:Z`) — lands as distinct open items. Two layers close the hole:
+
+1. **Capture-time flagging (`shared/scripts/commitment_dedup.py`, hooked inside the single append path — caller-agnostic like the gate):** each new `commitment` is compared against the OPEN set within a 14-day window under a conservative rule — owner ids must not conflict, counterparty signals must agree (ids, or lenient name-token match with the Bug #103 title fallback), and the name-stripped titles must overlap strongly (higher bar when no person field corroborates). A suspect is NEVER dropped or auto-merged: it lands with `data.pending_review: true` + `data.suspected_duplicate_of: <open item's id>` + `data.suspected_duplicate_score`, so the confirm flow renders "looks like a duplicate of X — merge / keep both". Fail-open: a check failure appends the batch unflagged. `CR_DEDUP_CHECK=0` disables.
+2. **The merge writer (`commitment_state.supersede_commitment(workspace_root, survivor_id, superseded_id, *, merged_by, source_skill, evidence, user_confirmed)`):** emits `commitment_superseded` — `data.commitment_id`/`data.commitment_seq` reference the SUPERSEDED item (closed through the standard closer chains, honored by the loader since v3.14.5), `data.superseded_by` names the survivor, `data.merged_source_refs` unions both sides' provenance. `load_open_commitments` folds the union onto the survivor's in-memory copy (`data.merged_source_refs` / `data.merged_from`) — the survivor "carries" every absorbed source without any history rewrite. Same guards as `close_commitment`: id normalization, loud `CommitmentIdError`, idempotent re-merge, `PendingReviewError` unless `user_confirmed=True` (merging IS the adjudication of a flagged suspect), lock-spanned scan→append. Surfaces: the W4b `merge` verb (v4.6.1 — confirm section + the triage Unconfirmed block) and the chat phrase ("merge those two" / "same commitment") documented in commitment-triage.
+
+**Confirm-flow adjudication (`commitment_updated` markers, v4.6.1 W4b):** two more append-only adjudications ride `commitment_updated`, written ONLY by their `commitment_state` writers and folded read-side by `load_open_commitments`: **Mine** (`confirm_commitment_owner` — `data.owner_confirmed: true` + `data.new_owner_id`; ownership folds to the user and `pending_review` clears, so the item leaves the unconfirmed bucket) and **Keep both** (`clear_review_flags` — `data.review_flags_cleared: true`; clears `pending_review`, `review_reason`, and the C4 `suspected_duplicate_*` flags — confirmed distinct). Adjudication folds are append-order-aware against `commitment_reassigned`: the LATEST adjudication decides `pending_review` (a Mine followed by a later unconfirmed reassignment re-stamps the flag, and vice versa). Unconfirmed items never enter chase and count only in the headline `unconfirmed` bucket; adjudication is always an explicit user action — no writer may auto-confirm. **A third `commitment_updated` marker rides this same shape but is system-written, not user-driven: `flag_duplicate_for_review` (AUTOAPPLY §4c) appends `data.review_flags_set: true` to put a stale auto-merge pair back on the flag tier — it only ever ADDS a question (`pending_review`), never clears or confirms one, so the no-auto-confirm rule stands. **A fourth, UNCONFIRM1 (2026-08-03): `restore_review_flags` — THE un-confirm writer, user-driven, reached from `needs_review_queue.undo_confirm_items` / `undo_done_items`.** It appends the SAME `data.review_flags_set: true` fold key (so there is zero reader change — the projector sorts adjudications by append index and the latest wins, which is what puts the item back in `load_needs_review` carrying its ORIGINAL `review_reason`), plus `data.review_flags_restored: true` as provenance and `data.unconfirmed_by`. It carries NO `suspected_duplicate_of` — the omission is the point: `flag_duplicate_for_review` requires one, is documented for duplicate PAIRS, and reversing a confirm through it wrote an empty target that the projector ignores while the append-only history keeps it forever. Like its sibling it only ever ADDS a question (`pending_review`), never clears or confirms one, so the no-auto-confirm rule stands for both. Both refuse a CLOSED item; undoing an `already done` therefore reopens FIRST and then un-confirms, because the Done wrote a confirm before it closed and a bare reopen would leave an OPEN, CONFIRMED item.
+
+**Per-person receipt (`commitment_partial_received`, v4.6.0 MC1):** a multi-counterparty commitment ("send the deck to the board") is fulfilled one counterparty at a time. `commitment_state.mark_partial_received(workspace_root, commitment_id, *, received_by, source_skill, counterparty_id=|counterparty_name=)` appends a `commitment_partial_received` naming WHICH counterparty delivered (`data.received_counterparty_id` / `received_counterparty_name`; `data.commitment_id` + `commitment_seq` identify the item — the append gate rejects an id-less one as a dead letter). It is NOT a closer — `load_open_commitments` accumulates `data.received_from` / `received_from_names` on the projection and stamps `data.all_counterparties_received: true` when the roster is complete. Closure is then PROPOSED (the daily chase renders "everyone's received — close it?"), never automatic — the user closes via the normal closure path. The CRU matchers (`match_send_/inbound_/calendar_to_commitments`) return `recommendation: "partial_received"` with `matched_counterparty_ids` for a multi-counterparty match instead of `auto_resolve`, so a send/reply/event to ONE counterparty records that person's receipt rather than whole-closing the item. Single-counterparty commitments are entirely unaffected (the matcher downgrade fires only on multi).
+
+**Deferral (`commitment_updated`, read since Phase 2 Stage A):** a commitment's due date moves via a `commitment_updated` event carrying `data.commitment_id` + `data.new_due` (the `push to [date]` verb, written by `commitment_state.apply_later`'s defer leg since APPLYAUDIT1; `due` / `due_date` accepted as variants). The original commitment event is NEVER rewritten — `load_open_commitments` folds the latest due-carrying update into the returned commitment's effective `data.due` (with `data.due_updated_by_seq` provenance), so consumers reading `_commitment_field(ev, "due")` see the pushed date and a deferred item stops rendering overdue. Updates without a due field (scope/summary changes via `change_summary`) don't affect the effective due.
+
+---
+
+## Producer skills (who writes commitment events)
+
+| Skill | Trigger | Source event |
+|---|---|---|
+| `meeting-notes` | After extracting Action Items table | `meeting` event for the same call |
+| `inbox-triage` | When email contains commitment language ("I'll send by Friday", "owe you", etc.) | `interaction` event for the email thread |
+| `follow-up-ritual` | Same trigger as meeting-notes (it invokes meeting-notes internally) | `meeting` event |
+| `scan-for-commitments` | One-shot bulk scan over historic Granola/Gmail data | varies — re-creates source events if missing |
+| `scan-for-commitments` (Slack leg, v4.6.0 MC3) | Recent-window Slack channel/DM scan when the connector is present | none — no parent event; provenance is `source_ref: slack:<permalink>` |
+| `reconcile-sent` (sent-promise capture, v4.6.2 BUG-3719) | Daily silent Sent pass — opens the user's OWN outbound promises nothing tracks yet | none — no parent event (nothing writes outbound `interaction` events); provenance is `source_ref: <provider>:<message_id>` — the DECLARED backend's provider tag (`superhuman:<id>` on a Superhuman workspace), written by `sent_capture.sent_source_ref`; `gmail:` is only the back-compat anchor for rows written before a backend was declared |
+| `scan-for-commitments` (Sent pass, v4.6.2 BUG-3719) | Historical outbound backfill over the mail connector's Sent folder | none — same `<provider>:<message_id>` provenance |
+
+Slack-based commitments are extracted by `scan-for-commitments`'s Slack leg (v4.6.0 MC3) via `shared/scripts/slack_capture.py` — same Stage-D/S2/Stage-E capture block as every writer, `source_ref: slack:<permalink>` (the spelling this schema reserved), user's-own-messages as the promise source / messages-naming-the-user as the owed-to-you source, third-party items refused at the builder. Slack absent = the leg doesn't exist (skip-not-fail). Real-time per-message Slack extraction (an inbox-triage analog) still does not exist — the recent-window scan is the coverage today.
+
+**Sent-mail promises (v4.6.2, BUG-3719):** the user's own outbound email promises are captured via `shared/scripts/sent_capture.py`: the Slack direction doctrine's email analog (the user's sent messages are the PRIMARY promise source; direction is fixed by the surface, so this lane never opens owed-to-you items). Two callers share the one implementation: `reconcile-sent`'s daily capture pass (`reconcile_and_receipt(..., sent_commitment_items=...)`, the rescue for threads read+replied before inbox-triage's `is:unread in:inbox` gate ever saw them) and `scan-for-commitments`' Sent pass (historical backfill). Owner is always the resolved primary user; same capture block, W4c relevance gate, and `(source_ref, title)` idempotency as every writer, PLUS capture-side restatement dedup (`capture_gate.matches_open_commitment`: same owner, same counterparty and the wording effectively the same vs the open set) so a sent restatement of a meeting- or triage-sourced commitment merges into the existing item instead of double-tracking. Note inbox-triage's extractor DOES cover outbound language in the threads it sees, the gap this lane closes is upstream of extraction: read-before-triage threads never became candidates at all.
+
+---
+
+## Consumer skills (who reads commitment events)
+
+| Consumer | Reads via | Surfaces as |
+|---|---|---|
+| `build_workspace_map_input.py` projector | `_aggregate_commitments` | THREADS_JSON + COMMITMENTS_JSON for the orgs-map / people-network / commitments-tracker artifacts |
+| `morning-briefing` | `commitment_state.compute_brief_state` → `counts["headline"]` | "Commitments: X you owe · Y owed to you · U unowned · C unconfirmed · O overdue" line (v4.5.2 R4 — the one bucket export; never label the overdue number "stuck", per R1b) |
+| `follow-up-ritual` | direct events.jsonl scan | per-attendee open commitments listed in the close-the-loop pack |
+| `cleanup` | direct events.jsonl scan | overdue/aging commitment counts in the weekly digest |
+
+Consumers MUST handle both:
+- Canonical shape: `ev["data"]["owner_id"]`, `ev["data"]["title"]`, etc.
+- Legacy flat shape: `ev["owner"]`, `ev["title"]`, top-level fields.
+
+---
+
+## Append example (Python pseudo-code)
+
+```python
+import datetime
+import sys
+from pathlib import Path
+
+# Canonical helpers — every producer skill imports these (see WORKSPACE_API.md §3).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared" / "scripts"))
+from atomic_write import atomic_append_jsonl
+from next_seq import next_seq
+
+def append_commitment(events_jsonl_path, *, primary_thread_id, owner_id,
+                      title, due_iso, source_event_seq, source_ref,
+                      person_ids, classification_confidence,
+                      source_skill="meeting-notes"):
+    seq = next_seq(events_jsonl_path)
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+
+    if due_iso:
+        due_dt = datetime.date.fromisoformat(due_iso)
+        status = "overdue" if due_dt < datetime.date.today() else "open"
+    else:
+        status = "open"
+
+    ev = {
+        "seq": seq,
+        "ts": now_iso,
+        "type": "commitment",
+        "source_skill": source_skill,
+        "primary_thread_id": primary_thread_id,
+        "related_thread_ids": [],
+        "classification_confidence": classification_confidence,
+        "person_ids": list(set([owner_id] + (person_ids or []))),
+        "data": {
+            "owner_id": owner_id,
+            "title": title.strip(),
+            "due": due_iso or "",
+            "status": status,
+            "source_event_seq": source_event_seq,
+            "source_ref": source_ref or "",
+        },
+    }
+    # Canonical append: atomic write + Drive-sync safety + automatic view regen.
+    # NEVER open(events_jsonl_path, "a") directly — that bypasses all of it (WORKSPACE_API.md §3).
+    atomic_append_jsonl(events_jsonl_path, [ev])
+    return seq
+```
+
+In practice, every producer skill uses the writer helper described in `shared/WORKSPACE_API.md` (which handles seq reservation, conflict logging, and view regeneration). The pseudo-code above shows the shape only — do not replicate seq logic by hand.
+
+---
+
+## Owed vs Task — the two-surface split (SPEC CTS1, 2026-07)
+
+The daily experience partitions the ONE open set into two named surfaces plus a confirm tail. This is a **read-side projection** (`shared/scripts/surface_split.py`) — no new field, no second store, and NEVER a `direction` field (direction is derived from `owner_id` vs the primary user; storing it would create a second copy of the same fact).
+
+**Definitions:**
+
+| Term | Definition | Field basis |
+|---|---|---|
+| **Owed** (a promise) | A deliverable a named party is *waiting on*, because it was **communicated** to them. Either direction. | effective `kind` ≠ `task` (post-`commitment_reclassified` fold) |
+| **Task** (a to-do) | Work with **no counterparty** — the user decided it; only their clock is running. | effective `kind` == `task` |
+| **Direction** | Who acts next. Derived, never stored. | `owner_id` present and == user → they do · present and ≠ user → they wait on someone · absent → unowned |
+
+**The trap (encode in every capture prompt): the beneficiary is not the counterparty.** Building a dashboard *for* someone is a personal Task until the user tells them "I'll have it by Friday." Owed-ness is a *communicated expectation*, not who benefits. And a due date does NOT make something Owed — "consolidate by Friday" is a dated Task; deadline is time metadata on either kind.
+
+**The classifier is effective kind, never raw counterparty presence** (RULED 2026-07-16, Option B). ~49 live open promises carry owner=user and NO resolvable counterparty — the Bug #103 class where counterparty LINKING failed on real promises. Those stay Owed, rendered on My Plate · Promised tagged "counterparty unresolved" with a drip + Friday-batch fixup; they are never silently demoted.
+
+**The five-way partition invariant** (asserted by `tests/run_cts1_surface_split_test.py`, over TOP-LEVEL items only — SUB1):
+
+```
+waiting_on + promised + personal + unowned + unconfirmed == total
+```
+
+`waiting_on` == headline `owed_to_you`; `promised + personal` == headline `you_owe`. The surfaces re-group `count_commitments`' buckets — they never re-count them.
+
+**Write-time consistency (warn-level, NEW writes only — the §5 invariant):** `kind: task` ⇒ counterparty empty; `kind: promise` ⇒ counterparty signal present OR `pending_review`. `event_gate.gate_events` warns (stderr, never rejects) when a new commitment violates either half. Historical rows converge via the fixup paths, never via warnings. The counterparty test goes through `commitment_parties` (the MC1 ids/names union) — never the two scalar fields alone.
+
+**Orthogonality guards (keep the line from smearing):**
+- A **Task is NOT a Reminder.** A Task has a deliverable you complete; a Reminder ("renew the domain") is pure surfacing with nothing to finish — its own manual lane (`reminders.py`, user-minted only), never in either surface.
+- **Discuss-later / "big ideas" stay separate** (`commitment_to_discuss`; the list and its skill are retired, cr1#552, and the rows on disk were moved to notes or My Plate tasks). Not deliverables → never in the two surfaces.
+- **Delegated tasks** (owner ≠ user, kind `task`) render on Waiting On (someone else acts next) but stay out of CRU (`cru_eligible` excludes task kind) — manual nudge only, never auto-chased.
+
+## Migration notes
+
+- Pre-v2.7.15 events.jsonl files may have commitment events with flat top-level fields (`project_id`, `owner`, `title`, `due`, `status`). The aggregator handles these. Do NOT rewrite existing events to canonical shape — append-only is non-negotiable per the events schema.
+- New commitment events written by v2.7.15 producers MUST use the canonical shape above.
+- `scan-for-commitments` is the migration path for users who want historic transcripts re-processed into commitment events. It writes canonical-shape events with `source_skill: "scan-for-commitments"` so they're distinguishable from per-meeting writes.
+
+**End of commitment schema contract.**

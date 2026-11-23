@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""
+Render-validate-persist transport for chat widgets (v3.13.8+ — Bug #32;
+delivery reworked T2 — Bug #67).
+
+WHY THIS EXISTS
+---------------
+
+Pre-v3.13.8, every widget surface went through a raw byte-relay of the whole
+validated HTML through `show_widget`'s parameter. Agents observed the cost of
+large parameter payloads and rationally chose freelance render paths for many
+surfaces, bypassing the validators at the final transport step. Root cause was
+structural, not contractual: as long as canonical = expensive relay,
+freelance = cheap direct, agents keep picking freelance.
+
+`render_and_persist()` is the fix: it renders via the canonical path (so all
+validators fire), runs `validate_rendered_widget` internally, and persists the
+validated HTML to a workspace-local file. ONE call = render + full validator
+chain + persist + audit trail.
+
+DELIVERY (reworked T2 — the F2 gate)
+------------------------------------
+
+The integration-2026-07 + full-stack dogfood cycles CONFIRMED that the Claude app's
+`mcp__visualize__show_widget` has NO `file_uri` parameter (CHANGELOG Bug #67;
+schema = loading_messages / title / widget_code only). The former contract —
+"hand transport['file_uri'] to show_widget" — was impossible on the live
+runtime, and the runtime silently improvised a freelance render every time
+(FS-08). The delivery contract is now:
+
+  1. PAGINATE BY DESIGN. Unbounded views (the full commitment set, the Staff
+     Meeting queue) render ONE page of ~10 rows at a time — `page=N`. A page is
+     the unit the runtime relays. `show more` re-fires with `page=N+1`.
+  2. Each page is render+validate+persisted here (validators fire, audit file
+     written), and DELIVERED by relaying `transport["html"]` — the persisted
+     page's validated bytes, VERBATIM — as `show_widget`'s `widget_code`.
+     The scaffold is diet-minified (renderer, T2) so a page fits one Claude app
+     Read (25K-token cap).
+
+The persist step is the validation gate + audit trail, not the delivery
+carrier. `transport["html"]` is the deliverable; `transport["file_uri"]` /
+`transport["path"]` remain for the audit file and any standalone open, but they
+are NOT handed to show_widget (it cannot read them).
+
+USAGE
+=====
+
+    from widget_transport import render_and_persist
+    transport = render_and_persist(
+        data_view=data,
+        wrapper="fragment",
+        persist_dir=workspace_root / "_hq" / ".system" / "widgets",
+        page=1,                   # omit page for bounded/small surfaces
+    )                             # page_size defaults to DEFAULT_PAGE_SIZE
+    # transport["html"]        — the validated PAGE HTML → show_widget widget_code
+    # transport["pagination"]  — {page, total_pages, has_more, total_items}
+    # transport["path"]        — disk audit path (Path object)
+    # transport["file_uri"]    — file:// URI (audit / standalone open only)
+"""
+
+from __future__ import annotations
+
+import datetime
+import os
+import re
+from pathlib import Path
+from typing import Optional
+
+
+_BOM = "﻿"
+
+
+def _atomic_write_widget_html(path: Path, html: str, wrapper: str) -> None:
+    """Atomic write of validated widget HTML.
+
+    Handles two cases:
+      - wrapper="fragment": persist the fragment as-is. When the file is
+        opened standalone in a browser the user will get a working render
+        because the fragment includes <style> + content + <script>; for
+        proper UTF-8 handling we prepend a BOM so the browser doesn't have
+        to guess (Bug #40 — mojibake on standalone open).
+      - wrapper="document": already has <!DOCTYPE> + <head><meta charset>;
+        write as-is.
+
+    Per §3.4 of the v3.13.8 plan, do NOT inject <meta charset> into a
+    fragment that may later be sent to show_widget — that violates the
+    contract. The BOM is invisible to show_widget's parser but tells
+    standalone browsers to use UTF-8.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if wrapper == "fragment":
+        content = _BOM + html
+    else:
+        content = html
+    # Atomic write via temp + rename
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(content, encoding="utf-8", newline="")
+    os.replace(str(tmp), str(path))
+
+
+_SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _safe_filename(stem: str) -> str:
+    s = _SAFE_NAME_RE.sub("-", stem).strip("-")
+    return s or "widget"
+
+
+# T2.1 (RV-1 calibration): the hard cap on a single page's rendered bytes.
+# T2 sized "10 rows/page" on synthetic ~300-char rows (~884B rendered); real
+# commitment rows carry six verb buttons + meta and weigh ~3KB rendered, so a
+# 10-row page hit 50KB and the runtime refused the byte-exact relay. Observed
+# evidence: ~45KB relayed comfortably (prior probe); 50-51KB refused twice.
+# 40KB sits deliberately UNDER that ceiling — the margin absorbs later pages
+# rendering somewhat heavier than the page-1 sizing anchor (accepted trade:
+# the delivered page itself is never re-checked against the budget).
+WIDGET_PAGE_BYTE_BUDGET = 40_000
+_MIN_PAGE_SIZE = 3
+
+
+def _fit_page_size(data_view: dict, wrapper: str, requested: int) -> int:
+    """Return the LARGEST page_size in requested.._MIN_PAGE_SIZE whose PAGE-1
+    render fits the byte budget (T2.2 — replaces the T2.1 halving sequence,
+    which could only pick from {requested, requested//2, ...} and left real
+    density on the table: a 12-row-capable view got 5 because 6-9 were never
+    probed).
+
+    Binary search over the size range — page-1 rendered bytes are monotone
+    non-decreasing in page_size (a bigger page is the same page plus more
+    rows), so the search is sound and needs ~log2(requested) probe renders.
+    (Review F-8 note: the returned size is always VERIFIED-fitting; at edges
+    where page-count chrome shifts the byte total non-monotonically — e.g. a
+    position line growing a digit — it can be one row shy of the true
+    maximum. Fitting is the guarantee; maximality is best-effort.)
+
+    Page 1 stays the deterministic sizing anchor: every call over the same
+    data view converges on the same effective size, so page boundaries stay
+    stable across a fire's show-more sequence. Later pages can in principle
+    render slightly heavier than page 1; the budget carries margin for that
+    (accepted trade, unchanged from T2.1 — the delivered page itself is never
+    re-checked against the budget; the over_budget flag downstream covers the
+    floor-size case).
+
+    PAGESNAP correction: "every call over the same data view" was doing more
+    work in that sentence than it could carry. The claim is true of THIS
+    function and always was — but `surface_drivers.run_surface` re-read the
+    substrate on every page, so page 2 was never the same data view, and the
+    effective size could therefore shift BETWEEN pages of one fire (a second,
+    quieter way the page boundary moved under the user). The page-set snapshot
+    is what actually makes the sentence true: pages 2+ now fit against the
+    same frozen view page 1 was fitted against.
+
+    EVERY-PAGE VERIFICATION (REVIEW_CUTC_2026-09-06 F-1, fix round): "later
+    pages can render slightly heavier than page 1" was not true of the plate.
+    Its page 1 is CONFIRM rows (3 verbs, no input field); its DO IT / CHASE /
+    SCHEDULE pages carry a Later… date field per row — on the 13:30 PT book
+    the page-1 anchor picked 14 rows and 9 of 23 pages then overran the budget
+    (18 of 23 once every Later… button carried its field), each delivered as
+    text. So after the page-1 search the anchored size is checked against
+    EVERY page of the view (`_first_over_budget_page`, early exit) and stepped
+    down one row at a time until every page fits or the floor is reached.
+    The fitted size is still deterministic over the same view; the floor-size
+    over_budget flag downstream still covers a single monster row.
+    """
+    from chat_output_renderer import render_chat_output_widget, paginate_data_view
+
+    def _fits(size: int) -> bool:
+        probe = paginate_data_view(data_view, page=1, page_size=size)
+        return len(render_chat_output_widget(probe, wrapper=wrapper)) <= WIDGET_PAGE_BYTE_BUDGET
+
+    hi = max(_MIN_PAGE_SIZE, int(requested))
+    lo = _MIN_PAGE_SIZE
+    if _fits(hi):
+        size = hi
+    elif not _fits(lo):
+        return lo  # floor-size page still over budget → over_budget flags it
+    else:
+        # Invariant: _fits(lo) is True, _fits(hi) is False. Find the boundary.
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if _fits(mid):
+                lo = mid
+            else:
+                hi = mid
+        size = lo
+    while size > _MIN_PAGE_SIZE and \
+            _first_over_budget_page(data_view, wrapper, size) is not None:
+        size -= 1
+    return size
+
+
+def truncate_rows(data_view: dict, n: int) -> dict:
+    """A shallow copy of `data_view` holding only its first `n` top-level
+    rows, in section order, with empty sections dropped.
+
+    Not `paginate_data_view`: that one is the PAGING slicer and stamps a
+    `pagination` block the renderer paints a position line from. An unpaged
+    surface that fits itself to the budget (R-N10-1's board) is not on page
+    1 of anything, and saying so would be the first plumbing word on a
+    customer surface.
+    """
+    n = max(0, int(n))
+    out_sections: list = []
+    left = n
+    for section in data_view.get("sections") or []:
+        if left <= 0:
+            break
+        items = (section.get("items") or [])[:left]
+        left -= len(items)
+        if items:
+            sec = dict(section)
+            sec["items"] = items
+            if "count" in sec:
+                sec["count"] = len(items)
+            out_sections.append(sec)
+    out = dict(data_view)
+    out["sections"] = out_sections
+    return out
+
+
+def page_row_budget(data_view: dict, *, wrapper: str = "fragment",
+                    requested: int | None = None) -> int:
+    """How many rows the transport will actually put on ONE page of this
+    view — the same measurement `render_and_persist` makes, exposed so a
+    caller can STATE a page count instead of guessing one.
+
+    REVIEW_ONEPLATE1 F-7: `plate_view` carried its own `WIDGET_PAGE_ROWS =
+    9` and computed the plate's page count from it, while the transport
+    asks for `DEFAULT_PAGE_SIZE` (15) and shrinks per view against the byte
+    budget down to `_MIN_PAGE_SIZE`. The two agreed by luck on one book.
+    One measurement, one number.
+    """
+    # Imported here, like every other use in this module: a module-level
+    # import of chat_output_renderer is circular.
+    from chat_output_renderer import DEFAULT_PAGE_SIZE
+    req = DEFAULT_PAGE_SIZE if requested is None else int(requested)
+    return _fit_page_size(data_view, wrapper, req)
+
+
+def fits_budget(data_view: dict, *, wrapper: str = "fragment",
+                budget: Optional[int] = None, read_only: bool = False) -> bool:
+    """Does THIS view, rendered whole and unpaged, fit the relay byte budget?
+
+    The companion to `fit_row_budget` for a caller whose trimmed view is not
+    the same shape as the probe the search measured — a board that regroups
+    its rows after the cut, say, and so carries a different number of group
+    headings than the probe did. Ask the question about the thing you are
+    actually going to relay.
+    """
+    from chat_output_renderer import render_chat_output_widget
+
+    cap = WIDGET_PAGE_BYTE_BUDGET if budget is None else int(budget)
+    return len(render_chat_output_widget(
+        data_view, wrapper=wrapper, read_only=read_only)) <= cap
+
+
+def fit_row_budget(data_view: dict, *, wrapper: str = "fragment",
+                   budget: Optional[int] = None, floor: int = 1,
+                   read_only: bool = False) -> int:
+    """The LARGEST number of top-level rows whose ONE unpaged render fits the
+    relay byte budget (R-N10-1: "as many rows as the widget's size budget
+    holds").
+
+    The paging path answers a different question — `_fit_page_size` finds a
+    rows-per-page that every page of a multi-page view survives. A surface
+    that renders once and names a door for the rest asks only how much fits
+    in the one render, so it gets its own search rather than a page size
+    reinterpreted as a row count.
+
+    Binary search, on the same monotonicity `_fit_page_size` relies on: a
+    board of N+1 rows is the board of N rows plus one more row, so rendered
+    bytes are non-decreasing in N. Returns at least `floor` even when the
+    floor itself overruns — a short surface is recoverable, a raise on a
+    read path is not; the caller can compare the answer against the row
+    count and say what it held back.
+    """
+    from chat_output_renderer import render_chat_output_widget
+
+    cap = WIDGET_PAGE_BYTE_BUDGET if budget is None else int(budget)
+    total = sum(len(s.get("items") or [])
+                for s in (data_view.get("sections") or []))
+    floor = max(0, int(floor))
+    if total <= floor:
+        return total
+
+    def _fits(n: int) -> bool:
+        probe = truncate_rows(data_view, n)
+        return len(render_chat_output_widget(
+            probe, wrapper=wrapper, read_only=read_only)) <= cap
+
+    if _fits(total):
+        return total
+    if not _fits(floor):
+        return floor
+    lo, hi = floor, total          # _fits(lo) True, _fits(hi) False
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _first_over_budget_page(data_view: dict, wrapper: str, size: int):
+    """The number of the first page that renders over the byte budget at
+    `size` rows per page, or None when every page fits. Renders pages in
+    order and stops at the first miss, so a failing size costs a handful of
+    renders and only the accepted size renders the whole view once."""
+    from chat_output_renderer import render_chat_output_widget, paginate_data_view
+
+    first = paginate_data_view(data_view, page=1, page_size=size)
+    total = int((first.get("pagination") or {}).get("total_pages") or 1)
+    for p in range(1, total + 1):
+        probe = first if p == 1 else paginate_data_view(data_view, page=p, page_size=size)
+        if len(render_chat_output_widget(probe, wrapper=wrapper)) > WIDGET_PAGE_BYTE_BUDGET:
+            return p
+    return None
+
+
+#: VOICELOAD1 (cr1#197): the skill whose draft cards are judged against its
+#: calibrated voice file. The other drafting skills are the issue's separate
+#: second step and are left as they were.
+_VOICE_CHECKED_SKILL = "email-writer"
+
+
+def _workspace_of_widgets_dir(persist_dir) -> Optional[Path]:
+    """The workspace root when `persist_dir` is `<root>/_hq/.system/widgets`
+    (where every draft card lands), else None."""
+    p = Path(persist_dir)
+    if p.name == "widgets" and p.parent.name == ".system" and p.parent.parent.name == "_hq":
+        return p.parent.parent.parent
+    return None
+
+
+def _flag_unproven_voice(view: dict, persist_dir, data_view: dict,
+                         name_hint: Optional[str]) -> dict:
+    """VOICELOAD1 (cr1#197, second build after the 2026-10-26 UAT fail).
+
+    The compose step puts the hash `load_draft_constraints` returned on the
+    draft's row (`voice_block_sha256`); the renderer carries it onto the
+    click's tuple. This is the check at the one call every card goes through:
+    when the workspace has a calibrated voice file for email-writer and an
+    email-shaped row does not carry its hash (the read was skipped, or the
+    file changed since), the row gets the one plain sentence as `voice_note`,
+    so a skipped read is flagged on the card even when the click's record
+    never lands. Returns a new view; the caller's is never changed. Never
+    raises: a check that cannot run says nothing it cannot prove."""
+    try:
+        if _VOICE_CHECKED_SKILL not in (data_view.get("source_skill"), name_hint):
+            return view
+        root = _workspace_of_widgets_dir(persist_dir)
+        if root is None:
+            return view
+        from chat_output_renderer import _is_email_shaped
+        from draft_constraints import voice_receipt
+
+        def _item(item):
+            if not isinstance(item, dict) or not _is_email_shaped(item):
+                return item
+            line = voice_receipt(root, _VOICE_CHECKED_SKILL,
+                                 item.get("voice_block_sha256"))["line"]
+            return dict(item, voice_note=line) if line else item
+
+        sections = []
+        for sec in view.get("sections") or []:
+            if isinstance(sec, dict) and isinstance(sec.get("items"), list):
+                sec = dict(sec, items=[_item(i) for i in sec["items"]])
+            sections.append(sec)
+        if "sections" not in view:
+            return view
+        return dict(view, sections=sections)
+    except Exception:  # noqa: BLE001 - never raises into a render
+        return view
+
+
+def render_and_persist(
+    *,
+    data_view: dict,
+    wrapper: str = "fragment",
+    persist_dir: str | Path,
+    name_hint: Optional[str] = None,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    suppress_ids: Optional[set] = None,
+    target: str = "cowork_html",
+    read_only: bool = False,
+) -> dict:
+    """Canonical render-validate-persist transport (delivery = widget_code
+    relay of transport["html"], T2 — see module docstring).
+
+    SPEC_SLACK1 C-1 — `target` selects the render surface INSIDE the one
+    canonical call (never a downstream post-processor):
+
+      - "cowork_html" (DEFAULT): today's behavior, byte-identical — the code
+        path below is untouched when target is defaulted.
+      - "slack": emits Block Kit JSON + a mrkdwn fallback from the SAME
+        data_view through the SAME gate stack (canonical-action / data-shape /
+        pulse-richness / send-class gates, the leak scan extended over the
+        Block Kit text render, the structural block contract), paginated to
+        the slack budget (~50 blocks / ~3k chars — surface_profiles.json),
+        and persists the audit file identically. Returns
+        {"blocks", "text", "pagination", "path", "file_uri"} — the listener
+        posts `blocks` (shared/CHAT_ACTION_WIDGET.md § Transport; the button
+        round-trip contract is references/SLACK_BUTTON_BRIDGE_SPEC.md).
+
+    Mute/dismissal filters and cross-surface dedup run UPSTREAM in the data
+    view build (projectors/orchestrators) exactly as for `cowork_html` — both targets
+    consume the identical, already-filtered view; nothing about the slack
+    target bypasses them.
+
+    Renders the widget via `chat_output_renderer.render_chat_output_widget`
+    (all validators fire), runs `validate_rendered_widget`, writes the
+    validated HTML to an audit file inside `persist_dir`, and returns a
+    transport dict. When `page` is given, the data view is first sliced to that
+    page (paginate-by-design for unbounded views).
+
+    Args:
+      data_view: same data shape that render_chat_output_widget expects.
+      wrapper: "fragment" (default, for show_widget) or "document"
+        (standalone HTML file).
+      persist_dir: directory in which to write the validated HTML audit file.
+        Typically `<workspace>/_hq/.system/widgets/`.
+      name_hint: optional prefix for the on-disk filename (otherwise derived
+        from the data_view's surface tag).
+      page: 1-indexed page to render. None (default) renders the full view —
+        correct for bounded surfaces (the daily ≤5 card, small fires). Any
+        unbounded surface (commitments full set, Staff Meeting queue) MUST pass
+        an explicit page and relay one page at a time — and MUST hand the same
+        frozen view for every page of one fire (see `page_snapshot`).
+      page_size: max top-level rows per page (ceiling). None uses
+        DEFAULT_PAGE_SIZE — one value for the whole stack (PAGESNAP).
+      suppress_ids: wire ids (`n`) to drop AFTER slicing — the rows the user
+        already applied in this page-set. Applied post-slice on purpose: the
+        slice indexes the frozen list so nothing shifts, and dropping a row
+        here shortens this one page rather than pulling the next row across
+        the page boundary. `pagination` is left as sliced, so the reported
+        total stays the page-set's total and the header holds steady across
+        the fire.
+
+    Returns:
+      {
+        "html":       the validated PAGE HTML → relay as show_widget widget_code,
+        "file_uri":   "file:///abs/path" (audit / standalone open ONLY),
+        "path":       Path object for the persisted audit file,
+        "pagination": {page, total_pages, page_size, has_more, total_items}
+                      (present whenever `page` was passed),
+      }
+
+    Raises:
+      Whatever `render_chat_output_widget` raises (CanonicalActionError,
+      DataShapeError, LeakDetectedError), plus WrapperContractError /
+      WidgetFeedbackContractError from the built-in `validate_rendered_widget`
+      pass — the transport runs it so callers can't skip it.
+    """
+    if target == "slack":
+        return _render_and_persist_slack(
+            data_view=data_view,
+            persist_dir=persist_dir,
+            name_hint=name_hint,
+            page=page,
+            page_size=page_size,
+            suppress_ids=suppress_ids,
+            read_only=read_only,
+        )
+    if target != "cowork_html":
+        raise ValueError(
+            f"unknown render target {target!r} — 'cowork_html' or 'slack'")
+
+    # Import here to avoid a circular import at module load time
+    from chat_output_renderer import (
+        DEFAULT_PAGE_SIZE,
+        render_chat_output_widget,
+        validate_chat_output,
+        validate_rendered_widget,
+        paginate_data_view,
+    )
+
+    pagination = None
+    view = data_view
+    if page is not None:
+        # T2.1: fit rows-per-page to the relay byte budget (RV-1: real rows
+        # weigh ~3x the synthetic calibration; requested size is a ceiling).
+        eff_size = _fit_page_size(
+            data_view, wrapper,
+            DEFAULT_PAGE_SIZE if page_size is None else page_size)
+        view = paginate_data_view(data_view, page=page, page_size=eff_size)
+        pagination = view.get("pagination")
+        if suppress_ids:
+            from page_snapshot import suppress_applied
+            view, n_suppressed = suppress_applied(view, set(suppress_ids))
+            if n_suppressed:
+                pagination = dict(pagination or {})
+                pagination["suppressed"] = n_suppressed
+                view["pagination"] = pagination
+
+    # VOICELOAD1 (cr1#197) — an email-writer draft card whose row does not
+    # carry the hash of the voice file on disk says so on the card itself.
+    view = _flag_unproven_voice(view, persist_dir, data_view, name_hint)
+
+    # SPEC_WIDGETRO1 §2-1 (CUT-C item 9) — `read_only=True` renders the
+    # surface's own row verbs and NO batch footer (no Apply all / Reset /
+    # Snooze rest), and the validator reds a read-only page that carries one.
+    # The would-hold review and the revisit page pass it; a normal plate page
+    # keeps its footer (the default is byte-identical to before).
+    html = render_chat_output_widget(view, wrapper=wrapper, read_only=read_only)
+    # EW2+T (F-15): the transport IS the one-call canonical path — the wrapper
+    # contract check runs here so no caller can ship a widget whose input
+    # buttons lost their wrappers. Passes trivially on button-less HTML.
+    # PGUARD1 D2: the data view's `surface` tag is plumbed through so a widget
+    # DECLARED for an org/board/client audience gets the blocking
+    # personal-content scan; owner surfaces (commitments, staff-meeting, the
+    # brief) are untouched — an absent/unknown tag never escalates to org.
+    validate_rendered_widget(html, surface=data_view.get("surface"),
+                             read_only=read_only)
+
+    # T2.1 (review F-5): a floor-size page can still exceed the budget on
+    # monster rows. Flag it so skill text can pre-warn (deliver substance as
+    # text) instead of eating a refused relay downstream.
+    text_fallback = None
+    # R-N10-1 — an UNPAGED surface (the board) fits itself to the budget
+    # before it reaches here, so an overrun on this path is the floor case:
+    # one row that on its own overruns the relay. It has no `pagination` to
+    # carry the flag, and without one it relayed over budget in silence.
+    # Same answer as the paged floor case — say so on the result, and
+    # compose the text form.
+    over_budget = len(html) > WIDGET_PAGE_BYTE_BUDGET
+    if over_budget:
+        if pagination is not None:
+            pagination["over_budget"] = True
+        # CUT-C item 7 (ATTENDED_TEST_v5.28.0 B2.6) — the sanctioned text
+        # form of THIS fitted page: numbered by the persisted page's own
+        # display numbers, every row's verbs by display label including the
+        # block one-tap (`plate_view.page_text_fallback`). The skill relays
+        # it byte-exact instead of assembling a text page from pieces — the
+        # shape that reached the customer with "Done" alone on nine of ten
+        # SCHEDULE rows. REVIEW_CUTC F-3: composed for the PLATE source only
+        # (`plate_view.TEXT_FALLBACK_SOURCES`) — the form runs the plate's
+        # banned-word scan, and a needs-your-call / would-hold page over
+        # budget keeps v5.28.0's behaviour: flagged `over_budget`, no text,
+        # never a PlateJargonError.
+        from plate_view import TEXT_FALLBACK_SOURCES, page_text_fallback
+        if data_view.get("source_skill") in TEXT_FALLBACK_SOURCES:
+            text_fallback = page_text_fallback(view)
+            validate_chat_output(text_fallback, surface=data_view.get("surface"))
+
+    persist_dir = Path(persist_dir)
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    surface = name_hint or data_view.get("surface") or "widget"
+    page_tag = f"_p{pagination['page']}of{pagination['total_pages']}" if pagination else ""
+    filename = f"{_safe_filename(surface)}{page_tag}_{ts}.html"
+    out_path = persist_dir / filename
+
+    _atomic_write_widget_html(out_path, html, wrapper=wrapper)
+
+    # file:// URI — absolute path, forward slashes, three slashes after file:
+    file_uri = "file:///" + str(out_path.resolve()).replace(os.sep, "/").lstrip("/")
+
+    result = {
+        "html": html,
+        "file_uri": file_uri,
+        "path": out_path,
+    }
+    if pagination is not None:
+        result["pagination"] = pagination
+    elif over_budget:
+        # R-N10-1 — the unpaged floor case has nowhere else to say it.
+        result["over_budget"] = True
+    if text_fallback is not None:
+        result["text"] = text_fallback
+    return result
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomic write for the slack audit payload (same temp+rename discipline
+    as the HTML writer; no BOM — the payload is JSON, not a browser file)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(content, encoding="utf-8", newline="")
+    os.replace(str(tmp), str(path))
+
+
+def _fit_page_size_slack(data_view: dict, requested: int, profile: dict) -> int:
+    """Slack analog of `_fit_page_size`: the LARGEST page_size whose PAGE-1
+    emission fits the slack budgets (block count from the profile; a fixed
+    reserve covers header/footer/context chrome). Same binary search, same
+    page-1-as-anchor determinism, same floor-size over-budget flagging
+    downstream."""
+    import json as _json
+
+    from chat_output_renderer import paginate_data_view
+    from slack_render import emit_slack_payload
+
+    block_budget = int(profile.get("block_budget", 50))
+    char_budget = int(profile.get("char_budget", 3000))
+
+    def _fits(size: int) -> bool:
+        probe = paginate_data_view(data_view, page=1, page_size=size)
+        payload = emit_slack_payload(probe, profile)
+        if len(payload["blocks"]) > block_budget:
+            return False
+        # char weight: the largest single text object must fit, and the
+        # fallback digest must fit the ~3k message-text budget.
+        return len(payload.get("text", "")) <= char_budget
+
+    hi = max(_MIN_PAGE_SIZE, int(requested))
+    lo = _MIN_PAGE_SIZE
+    if _fits(hi):
+        return hi
+    if not _fits(lo):
+        return lo
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _render_and_persist_slack(
+    *,
+    data_view: dict,
+    persist_dir: str | Path,
+    name_hint: Optional[str] = None,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    suppress_ids: Optional[set] = None,
+    read_only: bool = False,
+) -> dict:
+    """The slack target (SPEC_SLACK1 C-1). Same shape as the `cowork_html` path:
+    gates → paginate → emit → leak scan + structural contract → persist →
+    return. Raises exactly like the `cowork_html` path (CanonicalActionError,
+    DataShapeError, LeakDetectedError, SlackBlockContractError) — a payload
+    that fails a gate is reported, never degraded (FS-08)."""
+    import json as _json
+
+    from chat_output_renderer import (
+        DEFAULT_PAGE_SIZE,
+        paginate_data_view,
+        validate_chat_output,
+        validate_data_view,
+    )
+    from slack_render import (
+        blocks_text_render,
+        emit_slack_payload,
+        validate_slack_payload,
+    )
+    from surface_context import load_profile
+
+    profile = load_profile("slack", skill=data_view.get("source_skill"))
+
+    # Gate 1 family — the SAME pre-render validators the `cowork_html` path runs
+    # inside render_chat_output_widget (canonical actions, data shape, pulse
+    # richness, send-class emails, voice-tell backstop).
+    validate_data_view(data_view)
+
+    pagination = None
+    view = data_view
+    if page is not None:
+        eff_size = _fit_page_size_slack(
+            data_view,
+            int(profile.get("rows_per_page", DEFAULT_PAGE_SIZE)) if page_size is None else int(page_size),
+            profile,
+        )
+        view = paginate_data_view(data_view, page=page, page_size=eff_size)
+        pagination = view.get("pagination")
+        if suppress_ids:
+            from page_snapshot import suppress_applied
+            view, n_suppressed = suppress_applied(view, set(suppress_ids))
+            if n_suppressed:
+                pagination = dict(pagination or {})
+                pagination["suppressed"] = n_suppressed
+                view["pagination"] = pagination
+
+    payload = emit_slack_payload(view, profile, read_only=read_only)
+
+    # Gate 2 — the leak scan, extended over the Block Kit text render (C-1).
+    # Same scanner, same blocking semantics as the `cowork_html` path; the
+    # PGUARD1 org-surface personal scan rides the same `surface` tag.
+    validate_chat_output(
+        blocks_text_render(payload),
+        surface=data_view.get("surface"),
+    )
+
+    # Gate 3 — the structural block contract (the validate_rendered_widget
+    # analog): budgets, block shapes, platform limits.
+    validate_slack_payload(
+        payload,
+        block_budget=int(profile.get("block_budget", 50)),
+        char_budget=int(profile.get("char_budget", 3000)),
+    )
+
+    if pagination is not None and len(payload["blocks"]) > int(profile.get("block_budget", 50)):
+        pagination["over_budget"] = True
+
+    persist_dir = Path(persist_dir)
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    surface = name_hint or data_view.get("surface") or "widget"
+    page_tag = f"_p{pagination['page']}of{pagination['total_pages']}" if pagination else ""
+    filename = f"{_safe_filename(surface)}{page_tag}_{ts}.slack.json"
+    out_path = persist_dir / filename
+
+    audit = {"blocks": payload["blocks"], "text": payload["text"]}
+    if pagination is not None:
+        audit["pagination"] = pagination
+    _atomic_write_text(out_path, _json.dumps(audit, ensure_ascii=False, indent=1))
+
+    file_uri = "file:///" + str(out_path.resolve()).replace(os.sep, "/").lstrip("/")
+
+    result = {
+        "blocks": payload["blocks"],
+        "text": payload["text"],
+        "path": out_path,
+        "file_uri": file_uri,
+    }
+    if pagination is not None:
+        result["pagination"] = pagination
+    return result
+
+
+__all__ = ["render_and_persist"]

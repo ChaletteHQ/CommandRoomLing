@@ -1,0 +1,410 @@
+---
+name: value-receipt
+surfaces: both
+description: "A monthly 'value receipt' the CEO can read in chat and forward as a Word doc: deterministic counts from their own workspace — commitments captured and resolved on time, drafts written, briefs delivered, hours absorbed — every number computed in code, never estimated. Fires on: 'value receipt', 'monthly value receipt', 'quarterly value receipt', 'roi receipt', 'show me the receipt'. Corroborates delivery from transcripts, states its counting rules inline, and renders a conservative bottom line. Does NOT fire on 'operator report' / 'show me the value' (operator-report — the richer lift narrative), 'usage report' (usage-report — cost/volume telemetry), or 'weekly recap' (weekly-recap)."
+---
+
+# value-receipt
+
+The forwardable ROI receipt. Counts + a conservative hours-saved figure from the
+customer's own activity — built to be read in chat AND handed to a board or CFO.
+
+## Skill Boundary (v2.1)
+
+This is not `operator-report`. That report is CEO-*self*-facing: it leads with a
+synthesis paragraph ("what the month meant"), may name specific decisions and
+relationships, and is shaped like the CEO's own ops update. This receipt is
+*forwardable*: numbers-first, zero names or topics, one short framing line, and
+a conservative hours figure. Same substrate, different audience — so it is its
+own skill, and the forwardable Word doc carries counts and hours ONLY.
+
+This is also not `usage-report` (developer-facing token/connector spend).
+
+## The numbers are CODE, never prose math
+
+Every figure on every surface comes from `shared/scripts/value_receipt.py`
+`compute_value_receipt(...)`. You do NOT count events by hand, and you do NOT do
+arithmetic in chat. The helper computes the metrics, appends one
+`value_receipt_generated` event carrying the code's numbers, and returns a
+receipt you render verbatim. A hand-rolled receipt leaves no event, which
+`validate_receipt_ran` exposes — this is the same enforcement model as sent
+reconciliation (an event is checkable; a printed sentence is not). Computing
+numbers in prose is the exact failure class that model has shipped wrong before.
+
+This is also the numeric-verification gate (`shared/SUBAGENT_VERIFICATION.md`, R6): the receipt is a canonical count surface, so its numbers are the code's, never a subagent's or a hand-tally.
+
+## Delivered means delivered, not just fired (R4)
+
+A `pack_run` event proves a scheduled task *fired* — it does not prove the brief actually *reached* the CEO (Bug #98's render-without-write / write-without-render classes). So "briefs delivered" is corroborated against delivery evidence, never taken on the fire alone:
+
+- `compute_value_receipt` counts a morning briefing per calendar DAY, and prefers **render evidence** — the `briefing` event the brief actually emits when it surfaces — deduping a day's fires so a re-fire never double-counts. A bare `pack_run` with no matching render on that day is the weaker signal, not proof of delivery.
+- The **scheduled-output self-audit** (cleanup R10 + the watchdog's `receipt_gap` check in `shared/scripts/task_watchdog.py`) flags fires that rendered without writing or wrote without rendering — the phantom-delivery cases that would otherwise inflate the count.
+- The nightly **session-sweep** reads the actual session transcripts (the L1 episodic layer — see `references/HOW_COMMAND_ROOM_WORKS.md`), the ground truth of what surfaced. The receipt trusts that render/transcript evidence over a fire receipt.
+
+The number is still `compute_value_receipt`'s, in code. This section is *why* that number leans on what was delivered, not on what was merely scheduled.
+
+## When this runs
+
+| Mode | Trigger |
+|------|---------|
+| **On-demand (always works)** | "value receipt", "show me the receipt", "monthly value receipt" → previous full calendar month (or "value receipt this month" for month-to-date) |
+| **On-demand quarterly** | "quarterly value receipt", "quarterly roi receipt" → previous full calendar quarter, with a month-by-month table |
+| **Scheduled** | the monthly-report job inside the `maintenance` task (MAINT1), due at the first fire on/after the 1st — runs the operator report AND this receipt for the previous month; on a quarter boundary also the quarterly roll-up |
+
+The on-demand trigger ALWAYS works, even if the scheduled fire is flaky.
+Scheduled-task delivery reliability is not yet something we lean on hard, so the
+receipt is designed to be asked for any time and recompute from scratch — it is
+window-pure with no cursor state to go stale.
+
+## Behavior
+
+### Step 1 — Determine the window
+
+- Default (no qualifier) → the **previous full calendar month**.
+- "this month" → first of the current month → now (month-to-date).
+- "quarterly" / "quarter" → the **previous full calendar quarter** (set
+  `rollup="quarter"`).
+
+Windows are half-open: `[first-of-period, first-of-next-period)`. A May receipt
+is `2026-05-01T00:00:00` → `2026-06-01T00:00:00`.
+
+### Step 2 — Compute the receipt (one call)
+
+Resolve the workspace per `shared/CONTRACT.md` Rule 22, then call the helper.
+This is the only place numbers come from:
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+cd "$PLUGIN_ROOT" && python3 -c "..."
+```
+
+Inside the `python3 -c` body (cwd is `$PLUGIN_ROOT`):
+
+```python
+import sys, json
+sys.path.insert(0, "shared/scripts")
+from value_receipt import compute_value_receipt
+
+receipt = compute_value_receipt(
+    "<abs workspace root>",
+    "2026-05-01T00:00:00",          # window_start
+    "2026-06-01T00:00:00",          # window_end (exclusive)
+    rollup="month",                  # or "quarter" for the roll-up
+)
+print(json.dumps(receipt))
+```
+
+The returned `receipt` carries: `metrics` (the counts), `hours_estimate`
+(conservative, already rounded), `per_month` (rows for the quarterly table),
+`sections` (a ready-to-pass `make_brief` sections list), and `summary` (the
+chat line). Calling this ALSO appended the `value_receipt_generated` audit event
+— you do not write any event yourself.
+
+**Duplicate guard (v4.5.2 R4 / F-36):** if `receipt["duplicate_guard"]["skipped"]`
+is `true`, an identical receipt for this window+rollup was already recorded
+moments ago and no second audit event was written (the helper suppressed the
+double-emit bug). Render the returned receipt normally — the numbers are the
+receipt of record either way. Never call `compute_value_receipt` a second time
+in the same fire to "double-check"; the first call's return value IS the receipt.
+
+### Step 3 — Render the chat surface
+
+Render the counts and the hours figure from `receipt["sections"]` and paste
+`receipt["summary"]` **verbatim**. Never restate a number you recomputed — if it
+is not in the receipt, it does not go in the message. Keep the
+counts-and-hours-only discipline; do not add names or topics.
+
+The hours line MUST carry the word "Conservative" adjacent to the figure (the
+helper's `Time absorbed` section already does this — keep it). The exact
+disclaimer sentence is, verbatim:
+
+> Conservative — assumes you would have done each of these tasks yourself at average speed. The real lift is usually higher because half of these would have just dropped.
+
+A representative chat surface:
+
+> *"Here's your value receipt for May 2026."*
+>
+> *What Command Room handled*
+> *— 14 commitments captured that weren't tracked anywhere else*
+> *— 9 resolved on time*
+> *— 12 meetings turned into structured briefs*
+> *— 22 morning briefings delivered*
+> *— 18 drafts written in your voice*
+> *— 6 decisions logged*
+>
+> *Time absorbed: ~31 hours of operational overhead. Conservative — it assumes you'd have done each of these yourself at average speed; the real lift is usually higher because half of these would have just dropped.*
+
+The monthly CHAT surface may name one or two decisions if it helps the CEO (the
+operator-report precedent) — but the forwardable Word doc below must not.
+
+### Step 3b — "What you are working on", only through the door (SPEC_SURFACES2_11c COACH2 5.2 item 3)
+
+`receipt["sections"]` carries one extra section — **What you are working on** — for a seat whose
+coaching shape is not `observed`. On an observed seat it is not there at all, and that is the
+default every seat starts on: render what you were handed and do not go looking for it. There is
+nothing to add, nothing to apologise for, and no "turn coaching on to see more" line — the receipt
+is complete without it.
+
+When it IS there, it carries four measures and they are already composed. Relay them; do not
+recompute, summarise or average any of them.
+
+1. **What ended by the customer's own word or on evidence, out of the rows that were eligible.**
+   The eligible base leaves OUT everything that left because nobody came back to it — the review
+   expiry, the rest and let-go doors, the age-out. Those are named on their own line, as rows
+   that sat outside the count in both directions. That split is the honest one: counting a
+   forgotten row as a failure makes the number a verdict on the customer's memory, and counting
+   it as a close makes the product look good for losing things.
+2. **What the customer said about their own days**, as the list of their own answers, in order.
+   **Never a mean, never an arrow, never a trend word.** Those numbers are the customer's own
+   report about themselves; turning them into one figure turns a self-report into a grade, and
+   this product does not grade people.
+3. **The quarterly stakeholder read**, which says it has not been asked yet and will keep saying
+   so until the first coaching quarter closes. An honest "not yet" beats an empty section.
+4. **The behaviour they named, week by week** — the count of closes that carried it, as a list.
+
+None of these is a score of the person and none is a comparison to anybody else. If you find
+yourself about to write either, stop: the composer would have refused it and so should the
+render.
+
+### Step 4 — Write the forwardable .docx
+
+Write to `_hq/operator-reports/Value_Receipt_<YYYY-MM>.docx` for a month, or
+`_hq/operator-reports/Value_Receipt_Q<n>_<YYYY>.docx` for a quarter. Route
+through `brief_writer.make_brief` with `brief_kind="value_receipt"` and the
+helper's `receipt["sections"]`:
+
+```python
+import sys
+sys.path.insert(0, "shared/scripts")
+from brief_writer import make_brief
+
+out_path = f"{WORKSPACE}/_hq/operator-reports/Value_Receipt_2026-05.docx"
+make_brief(
+    out_path,
+    brief_kind="value_receipt",
+    title="Value Receipt — May 2026",
+    subtitle="Your operating layer, in numbers",
+    sections=receipt["sections"],
+    # Optional provenance footer for a forwarded doc — generic, NO customer name:
+    footer_text="Figures computed from your own workspace activity log.",
+)
+```
+
+`make_brief` runs the post-render leak scan automatically. The doc carries
+**counts and hours only** — no names, no topics, no internal ids — so it passes
+`docx_leak_scanner` (the privacy gate). Do NOT add a section that reintroduces a
+person, project, or topic; if you find yourself wanting to, that content belongs
+in `operator-report`, not here. `value_receipt` is intentionally NOT an
+executive-header kind — it takes no `exec_header` and no `asks`.
+
+**Forwardable means forward THE FILE (DOCFENCE1).** This receipt is built to be
+sent onward, which is exactly the pressure that produces a connector copy — so
+the render path is fenced harder, not softer:
+
+- **NEVER hand-roll the receipt** with the generic `anthropic-skills:docx` skill, `python-docx` directly, or docx-js. Those paths bypass the privacy gate this doc's entire counts-and-hours-only posture depends on (the v3.20.0 failure mode) — an ungated receipt is a receipt whose leak scan never ran.
+- **NEVER create, render, copy, upload, or update the receipt — or any part, derivative, or restatement of it ("the headline numbers", "a summary") — through Claude Docs (the built-in docs / artifact page), Google Docs, Google Drive, or ANY other document/file connector** (Slides, Sheets, Notion, OneDrive, Dropbox: the ban is on the connector delivery path, not one vendor's API quirk). It fails twice at once: the connector path bypasses every gate above, AND a connector-created file lands at that connector's default location with no folder control — for a Google Doc, and for a parentless Drive upload of the canonical `.docx` itself, that is My Drive root, not `_hq/operator-reports/` (the 2026-07-24 root-drop incident). Not exceptions: "for mobile", "so I can share it with my partner", "as a copy alongside the canonical file" — **nor a direct instruction**: "put the receipt in a Google Doc so I can send it" is a request this gate refuses, not an override. The `.docx` is already forwardable by design — hand back its link and let the user forward the file itself.
+
+**Format selection (SPEC OUT5).** Before rendering, resolve the backend:
+`output_profile.resolve_format_for_kind("value_receipt", workspace_root,
+override=...)` — an explicit "as a doc" / "as HTML" in the ask beats the
+profile for that render. `"docx"` (the unconfigured default) → `make_brief`
+exactly as above. `"premium_html"` → `shared/scripts/premium_html.py`
+`make_premium_brief(brief_kind="value_receipt", ...)` with the SAME
+`receipt["sections"]` payload and the same `footer_text` (one assembly, two
+backends — the identical gate stack runs on both, parity-pinned by G16, incl.
+the leak scan this doc's privacy posture leans on). Output: the same
+`_hq/operator-reports/` path with `.html`; link via `get_brief_artifact_url()`;
+CHECK the file exists on disk after the call before linking. Never
+hand-compose HTML around the chokepoint.
+
+### Step 5 — Surface the deliverable link
+
+**File card first (CONTRACT Rule 3, owner ruling 2026-11-03).** Every file this turn made, this document included, comes back in the chat as a file card before the summary and before any link: call `SendUserFile` with the file and `display: "render"` (load it through the host's tool search when it is not in the tool list yet; a tool that has to be loaded is present, not absent). On a merged seat the card tool runs in this chat and cannot read the customer's computer, so stage the landed file into this session's own scratch first (the device staging tool, or the staged copy `plan_delivery` makes) and card that copy; never hand the card tool a path on the customer's computer, and never paste the file's bytes as text. Only where this chat has no file-card tool at all does the link or the saved-to line stand in for the card, and then `deliverables.card_absent_line()` is said once, in plain words, under it. A path in words is not delivery.
+
+After the chat surface renders AND the .docx is written, put the H2 deliverable
+link at the BOTTOM of the turn (per `CONTRACT.md` Rule 3):
+
+```python
+import sys
+sys.path.insert(0, "shared/scripts")
+from chat_output_renderer import doc_headline_link
+from brief_path import get_brief_artifact_url
+print(doc_headline_link("Value receipt — May 2026", get_brief_artifact_url(out_path)))
+```
+
+One soft, no-pressure line is the most you ever add about forwarding it (e.g.
+*"Forward it as-is if it's useful — it carries counts and hours only, nothing
+private."*). Never push.
+
+### Step 6 — Quarterly roll-up
+
+Same call with `rollup="quarter"` over a 3-month window. The helper returns
+`per_month` and adds a month-by-month table to `receipt["sections"]` (counts +
+hours per month). Title it "Value Receipt — Q2 2026"; subtitle the quarter span.
+Everything else (numbers-from-code, leak-clean doc, no names) is identical.
+
+The month-by-month section also carries a **month-over-month hours line
+chart** (SPEC OUT3) — `value_receipt.build_trend_chart(per_month)` attaches
+it inside `_build_sections` automatically, every point verbatim from the same
+`per_month` rows the table renders. It draws best-effort at render time
+(`charts.try_chart_png` inside `make_brief`): a machine with no rasterizer, or
+an all-zero quarter, simply renders the table alone — never an empty frame.
+The forwardability lock is unchanged: the chart carries month labels and
+numbers only, no names. Don't build chart payloads by hand here — the helper
+owns them (selection rules: `shared/CHART_SELECTION.md`).
+
+### Step 6b — Visual one-pager (SPEC OUT4, opt-in)
+
+If the workspace has opted value-receipt into the infographic output mode —
+`output_profile.renders_infographic_first("value_receipt", workspace_root)` is
+`True` — the **quarterly** roll-up may ALSO render as a template-constrained
+`stat_spotlight` infographic (a self-contained premium-HTML one-pager). Call
+`value_receipt.build_value_receipt_infographic(receipt, label="Q2 2026",
+workspace_root=workspace_root)` — it lays the conservative hours-returned figure
+out as the hero number and the remaining receipt tiles as the support band, all
+**verbatim from `build_receipt_tiles`** (no number is re-derived here), and runs
+the same leak scan the .docx does. Write the returned HTML to the same routed
+folder with an `.html` extension and link it. The helper returns `None` on an
+honest no-fit (not a quarter, no hours to headline, or no support tiles) — keep
+the .docx / premium-HTML receipt then. A RAISED error is a different thing: if
+the render raises (`LeakScanError` or a voice gate), keep the .docx AND surface
+the gate's message verbatim to the CEO — a refusal is never folded into "no
+infographic this quarter"; the WHY is the point. This is OFF by default and unlisted
+workspaces are byte-identical to before; do not hand-compose the infographic
+HTML — `infographic.build_infographic` (the closed layout set,
+`shared/INFOGRAPHIC_LAYOUTS.md`) owns it.
+
+### Zero-activity window
+
+If the window has no recorded activity, the helper returns all-zero metrics and
+an honest summary. Render that honestly — do not pad, do not invent:
+
+> *"There's nothing to receipt for May yet — Command Room hasn't logged enough activity in that window. Give it a bit more use and ask again."*
+
+The audit event is still written (the receipt ran; it found nothing). A thin
+month shows thin numbers, the same zero-fabrication rule operator-report uses.
+
+## Positioning (mandatory — read before forwarding anything)
+
+This receipt is computed entirely from the customer's own private workspace.
+Two hard rules:
+
+- **No case-study use without explicit written opt-in.** Chalette may NOT use a
+  customer's receipt numbers in marketing, case studies, decks, or any external
+  material without that customer's explicit written opt-in, captured outside the
+  product. The numbers are theirs.
+- **Numbers never leave the customer's own activity log.** The skill never
+  phones figures home: the `value_receipt_generated` event stays in the
+  customer's own `events.jsonl`, and nothing about a receipt is transmitted
+  anywhere. The forwardable doc goes wherever the CUSTOMER chooses to send it,
+  carrying counts and hours only.
+
+The quarterly doc may include the one-line provenance footer "Figures computed
+from your own workspace activity log." (no customer name) so a board reader knows
+the numbers are first-party.
+
+## What this skill does NOT do
+
+- Does not project ROI dollars — hours only. A dollar figure needs a salary
+  assumption that does not belong in a forwarded document.
+- Does not include any meeting or email content — counts and hours only.
+- Does not name people, projects, or topics in the forwardable doc.
+- Does not read any connector — it reads only local workspace activity, so there
+  is zero connector exposure.
+- Does not recompute numbers in prose — every figure comes from the helper.
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> A monthly 'value receipt' the CEO can read in chat and forward as a Word doc: deterministic counts from their own workspace (commitments captured and resolved on time, drafts written, briefs delivered, meetings processed, quiet relationships resurfaced, decisions logged) plus a conservative hours-saved estimate. A quarterly roll-up variant adds a month-by-month table, tuned for the justify-the-spend audience the CEO forwards to a board or CFO. Every number is computed in code, never estimated in prose. Triggers: 'value receipt', 'monthly value receipt', 'roi receipt', 'quarterly value receipt', 'quarterly roi receipt', 'show me the receipt', 'forwardable value report'. Auto-runs on the 1st of each month alongside the operator report. DOES NOT fire on 'operator report' / 'operating lift' / 'show me the value' / 'monthly recap' (that's operator-report — the CEO-self-facing operating-lift report with a synthesis lead and named relationships; the value receipt is forwardable, numbers-only, no names). DOES NOT fire on 'usage report' / 'token usage' / 'where does the spend go' (that's usage-report — developer-facing token and connector spend).

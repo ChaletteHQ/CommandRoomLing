@@ -1,0 +1,582 @@
+---
+name: follow-up-ritual
+surfaces: both
+description: "Meeting transcript or recording → 60-second close-the-loop pack: summary, per-attendee action items, personalized follow-up email drafts ready to send. Triggers: 'follow up on that call', 'follow up on the meeting', 'follow up the meeting', 'follow up on the call', 'process the call and draft follow-ups', 'close the loop', 'close the loop on', 'follow-up ritual', 'draft follow-ups', 'draft follow ups', 'send follow-ups from my last call'. Plus 'tune follow-up-ritual'. Owns meeting-context `follow up` phrasing — meeting-notes does not fire on these. DOES NOT fire on 'follow up with [name] about [topic]' with no meeting in context (email-writer — a plain outbound draft; same for dormant-customer-scan hand-offs from either lens, people or threads)."
+voice_block_last_refreshed: 2026-04-21
+calibration_level: default
+template_version: 2.7.1
+---
+
+**Personal sources, before the first connector read (cr1#1179).** Render `cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_helper --json '{"name": "connector_reads:chat_wall", "args": {"workspace_root": "<WS>"}}'`, paste what it prints and run that, once, before any connector is read here, and follow `shared/CHAT_WALL.md`: call no tool on a server in `connectors`, show no message from a mailbox in `mailboxes` unless its sender is in that entry's `except_senders`, write nothing from either, and say nothing about what was left out.
+
+**Say a skipped guard (cr1#1413).** This skill has no recap of its own, so its reply says when a guard did not run. Keep a list, `receipts`, through the turn. When it reads a connector, add the personal-sources wall's receipt: `result.receipt` of its read door answer above (on a seat whose files are local, the `receipt` field of what `chat_wall` returns), never the envelope's own `receipt`. Run the output check (`output_check`) on the prose you compose, as the prose check below says, and add what it answers. Then call `guard_closing(receipts, read_connector=<True when this turn read a connector, else False>)` from `chat_output_renderer.py`, a pure call run in this shell on any seat, and print a non-empty answer verbatim as the last line of the reply, after any widget; an empty answer prints nothing. Pass only receipts copied exactly from this turn's guard answers; one made up or from an earlier turn counts for nothing and the guard is named.
+
+## Entity-resolve + canonical-helper enforcement (mandatory, v3.13.8+)
+
+Before resolving any attendee from the meeting transcript or trigger phrase, you MUST call `shared/scripts/entity_resolve.py::resolve_all(workspace_root, query)`. For the action-item / commitment scan that feeds the follow-up pack, use `shared/scripts/cru_match.py::load_open_commitments` — do NOT hand-roll an events.jsonl scan — and pass it the org-scoped rows: `load_open_commitments(events_path, events=org_events)` where `org_events` comes from `events_io.load_events_org_scoped` (PGUARD2 D2 — attendee-facing output must not see personal-lane or masked-account commitments). See `shared/ENTITY_RESOLVE_PROTOCOL.md` for the full contract.
+
+## Skill Boundary (v2.1)
+
+- **Owns:** post-meeting close-the-loop — logging + drafted emails + tracker/decision updates in one pass.
+- **Invokes `meeting-notes` internally** for the structural logging step — **silent-invocation contract (P1.3, mirrored in meeting-notes Step 9b):** the internal meeting-notes run does logging ONLY and MUST skip its own Step 9b (which invokes this skill) — the guard that stops the pair looping. Conversely, when meeting-notes runs top-level it invokes THIS skill silently for drafts, and this skill then must not re-invoke meeting-notes (the transcript is already logged — reuse its output) (including v2.2 thread classification with `primary_thread_id` + `related_thread_ids[]` + `classification_confidence`), then adds the email-draft layer on top. Never produces duplicate SESSION_NOTES entries.
+- **Does NOT fire on "prep me for…"** — that's `call-prep`.
+- **Does NOT fire on bare "meeting notes"** without follow-up language — that's `meeting-notes` standalone.
+- **Inherits thread classification from meeting-notes.** The meeting's primary thread determines the folder for the follow-up pack; related threads get cross-ref lines. Follow-up-ritual does not run its own classifier.
+
+If user says "just log the meeting, no follow-ups" — route to meeting-notes. If user says "process the call and draft follow-ups" — this skill.
+
+## Voice Protocol (v3.0 — v2.7.1 architecture)
+
+This skill follows the two-step draft-then-critique protocol defined in `shared/VOICE_CALIBRATION.md`. Voice lives in the `## Voice Block` section of this SKILL.md — NOT in a separate `VOICE_SAMPLES.md`. That file is deprecated as of v2.7.1.
+
+**Customer voice-block override (B1):** before drafting, read `_hq/voice/voice-block-follow-up-ritual.md` if it exists — it supersedes this SKILL.md's `## Voice Block` section-by-section (override sections replace same-named defaults; absent sections fall through). The universal banned-phrase list still applies except where the override's Taboos explicitly carve out an item. Staleness reads the override's `Last refreshed:` first.
+
+Every follow-up email draft:
+1. Uses this skill's Voice Block (cadence, openers, vocabulary, punctuation, taboos — tuned for post-meeting follow-up register).
+2. Applies recipient modifier based on the attendee's `entities.json` record (board/peer/customer/team/vendor).
+3. Passes the Step 2 critique pass against the Voice Block + universal banned-phrase list.
+4. Strips any banned LLM tells before return.
+
+Corrections on user-edited drafts append to `_hq/voice/corrections-follow-up-ritual.jsonl`. The corrections corpus drives the next Voice Block refresh when the operator runs the calibration protocol.
+
+## Personification Contract (v3.13.8.4+)
+
+Before surfacing the pack-drafted acknowledgment, read `shared/PERSONIFICATION.md`. The chat acknowledgment after drafting the pack is FIRST PERSON, plain text (no backticks around the meeting name): "Drafted {N} follow-ups for you, {first_name} — pulled straight from [Meeting Name]. Ready to review." Never the third-person "{brain_name} pulled…" shape — the AI speaks as itself. Outbound EMAIL drafts close with the customer's own signature block (read from `workspace.user_signature`), NEVER the brain_name — the brain_name never appears in the email body the recipient sees.
+
+## Writer Contract
+
+Every outbound follow-up email drafted AND sent through this skill emits an `interaction` event to `events.jsonl` per `shared/PASSIVE_CAPTURE.md` using the v2.2 shape (`primary_thread_id` + `related_thread_ids[]` + `classification_confidence` + `org_ids[]` + `source_ref_hash`). The primary thread is inherited from the meeting's classification. Direction: outbound, channel: email, counterparty_person_ids resolved from attendees. Idempotent with Gmail-side capture via `source_ref_hash`.
+
+**Commitment events (v2.7.15+).** This skill invokes `meeting-notes` internally for the logging step (decisions / commitments / SESSION_NOTES). `meeting-notes` Step 5e produces the canonical `type: commitment` events for every qualifying action item. Do NOT double-emit — if `meeting-notes` already wrote commitment events for this transcript, this skill consumes them (Step: Surface Open Commitments, below) but does not re-write them.
+
+**Pack-drafted event (v3.7.1+).** Beyond the per-recipient `interaction` events, this skill also appends ONE `followup_pack_drafted` event per ritual run with `{meeting_event_seq, attendee_count, draft_email_count, decisions_logged, commitments_extracted, pack_artifact_path}`. The `meeting_event_seq` links back to the source `meeting` event written by `meeting-notes`, so consumers can resolve "which meeting did this pack come from" without filename heuristics. This is the substrate signal `operator-report` reads to count delivered-without-being-asked work.
+
+**Commitment seq linking (v3.7.1+ formalization).** Every commitment event `meeting-notes` writes during this ritual MUST carry `data.source_event_seq` pointing at the parent `meeting` event's seq. This was implicit before — the v3.7.1 spec formalizes it so consumers (`cr-commitments`, `decision-revisit`, `thread-resurrection`) can traverse the meeting → commitment graph deterministically. If `meeting-notes` is currently failing to set `source_event_seq` on commitment writes invoked from this skill, that's a follow-on fix to land in the same release.
+
+---
+
+# Follow-Up Ritual
+
+**Correction in passing (shared contract — `shared/CORRECTION_IN_PASSING.md`).** Before answering any turn, pass the user's message to `correction_turn.handle_correction_turn(workspace_root, text, skill="follow-up-ritual")`. When it returns a result, say its `receipt` in one clause inside your real answer and then answer the request — never instead of it, never as a question, never as a card. When it returns `None`, proceed exactly as you would have. The module applies the change, writes the correction to the store with `origin: asked`, and logs a `router_miss` when the complaint was about routing; you neither re-apply nor re-record any of that. When the turn is someone holding up a document and saying to make it like that, pass the document body as `document=<the text>` in the same call — that is the only path that banks a structural correction, and without it the shape they just showed you is lost. On a merged seat this call is a writer (cr1#518): write `{"text": "<the message, verbatim>"}` (with `"document"` beside it when there is one) as JSON into THIS SESSION'S OWN scratch on the host that runs the door, never under the workspace, then render `cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_writer --json '{"args": {"workspace_root": "<WS>", "skill": "follow-up-ritual"}, "args_file": "<your scratch>/cr_correction_turn.json", "name": "correction_turn:handle_correction_turn"}'`, paste what it prints and run that; the envelope's `result` is the answer described above.
+
+**Learned constraints, read BEFORE composing (SPEC_SURFACES2 §1).** Once the recipient is resolved and before you write a single line, load what they have already corrected:
+
+```python
+from draft_constraints import load_draft_constraints, apply_draft_constraints
+c = load_draft_constraints(workspace_root, "follow-up-ritual",
+                           recipient_id=<person id or None>,
+                           domain=<the draft's domain or None>)
+```
+
+`c["lines"]` are CONSTRAINTS, not suggestions — obey each one. `c["override_block"]` is this skill's learned voice block and supersedes the `## Voice Block` below section by section. Anything the person has STATED in this request outranks all of it. When you have a draft, run it through `apply_draft_constraints(draft, c)` before you show it — that is what actually holds the learned paragraph ceiling and drops the phrases they keep taking out. Do not skip this because the corrections log looks short: a recipient who cut two drafts down is the whole reason it exists.
+
+
+**For:** Operator-CEOs who run 5-10 meetings a day and currently spend 20 minutes per meeting on the "and now I email everyone with their action items" tax. This skill collapses that to 60 seconds of review.
+
+## What It Does
+
+Take a meeting (Granola transcript, uploaded recording, or pasted notes) and produce the complete post-meeting close-the-loop pack in one pass:
+
+1. **Structured summary** — what was discussed, what was decided
+2. **Per-attendee action items** — clearly attributed, with dates where stated
+3. **Personalized follow-up emails** — drafted in the user's voice, one per attendee who owns an action, ready to review and send
+4. **Decisions logged** — `decision` events via the `decision-log` skill if any decisions were made (the `_hq/views/DECISION_LOG.md` view regenerates from them)
+5. **Tracker updates** — `commitment` events written by the internal `meeting-notes` run (MASTER_TRACKER is a regenerated view; nothing writes it directly)
+
+The demo-critical moment: a 60-second mock call → artifacts generated on screen → user hits send.
+
+This is the group's #1 stated pain (Bo's direct feedback). It's the demo beat of the May 14 CEO-group pitch.
+
+## First-Run Personalization (SPEC FRP1)
+
+This skill adopts the First-Run Personalization Protocol (`shared/FIRST_RUN_PROTOCOL.md`). Read
+config through `get_config` — never the raw file.
+
+```python
+# Run the Access preamble first (CONTRACT Rule 22 v6, the block in shared/WORKSPACE_ACCESS.md): it resolves $PLUGIN_ROOT, exports CR_ENV, and cds there.
+import sys; sys.path.insert(0, "shared/scripts")  # valid because cwd == $PLUGIN_ROOT per the preamble above
+from skill_config_writer import get_config, save_skill_config, wipe_skill_config, is_configured
+
+DEFAULTS = {
+    "send_timing": "show_now_send_on_click",  # AF — show_now_send_on_click | queue_same_day | queue_next_morning
+    "recipient_default": "attendees_who_owe", # STT — attendees_who_owe | all | me_only
+}
+cfg = get_config(workspace_root, "follow-up-ritual", DEFAULTS)
+```
+
+`send_timing` gates OUTBOUND email behavior, so it is **ask-first (AF)** — the one exception to
+output-first. `show_now_send_on_click` (default) keeps the lazy contract email-writer uses (the
+pack renders as editable widgets; Gmail is only touched on a click). `queue_same_day` /
+`queue_next_morning` create the Gmail drafts and schedule them. `recipient_default` is STT (who
+gets a follow-up by default).
+
+**Mode dispatch (4 modes):**
+
+| Mode | Trigger | Behavior |
+|---|---|---|
+| **Detect** (default) | "follow up on that call", "draft follow-ups" | first relevant request only: ask the ONE AF send-timing question (below) BEFORE drafting the pack, then `save_skill_config(workspace_root, "follow-up-ritual", DEFAULTS)`; subsequent fires skip straight to the pack with the saved timing. |
+| **Show settings** | "show follow-up-ritual settings" | render current config in plain English; no pack. |
+| **Tune** | "tune follow-up-ritual" | pre-filled re-questionnaire OR freeform (table below) → `save_skill_config(..., is_reconfigure=True)` → confirm. |
+| **Reset** | "reset follow-up-ritual to defaults" | `plan run_writer` naming `skill_config_writer:reset_skill_config` with `{"skill_name": "follow-up-ritual", "workspace_root": "<WS>"}` as its args (in-shell on a seat whose files are local: `reset_skill_config(workspace_root, "follow-up-ritual")`); say its `line` → next fire is a first-fire again. |
+
+**First fire — the ONE AF question (asked once, before the first pack, with a working default-escape):**
+
+On the very first follow-up-ritual fire only (`not is_configured(workspace_root, "follow-up-ritual")`), before drafting the pack, render a single fixed-option micro-widget:
+
+> *First time closing the loop for you. How should I handle the follow-up emails?*
+> **[Show me first ▸ recommended]** — I'll show you the drafts right here to review; nothing sends until you click.
+> **[Queue same day]** · **[Queue next morning]** — I create the Gmail drafts and schedule them.
+> *Just go ahead and I'll use Show-me-first.*
+
+This is the documented current-state fixed-option row (`shared/CHAT_ACTION_WIDGET.md` preselect
+exception). Default-escape: proceeding applies `show_now_send_on_click`. After the choice (or skip):
+`save_skill_config(workspace_root, "follow-up-ritual", {**DEFAULTS, "send_timing": choice})` with
+`origin="first_fire_override"` if changed, else plain DEFAULTS. Then draft the pack. `recipient_default`
+is NOT asked at first run (one AF question max; the pack ends in email widgets, so a trailing footer
+would violate `CHAT_ACTION_WIDGET.md` MUST-NOT rule 5) — it's discoverable via `tune follow-up-ritual`
+and the freeform table. The block renders exactly once ever.
+
+**Freeform tune (natural language → config):**
+
+| User says | Config change |
+|---|---|
+| "queue my follow-ups for the same day" | `send_timing = queue_same_day` |
+| "queue follow-ups for the next morning" | `send_timing = queue_next_morning` |
+| "always show me first" / "stop auto-queuing follow-ups" | `send_timing = show_now_send_on_click` |
+| "follow up with everyone" | `recipient_default = all` |
+| "only draft for people who owe something" | `recipient_default = attendees_who_owe` |
+| "just draft my own follow-ups" / "me only" | `recipient_default = me_only` |
+
+After applying: `save_skill_config(..., is_reconfigure=True)` + confirm in one line. `recipient_default` shapes which attendees get a drafted email; `send_timing` gates the pack's send behavior (still never sends without a click when `show_now_send_on_click`).
+
+## How to Use
+
+```
+"Follow up on that call"
+"Follow up the [meeting / with Client X / with the team]"
+"Process the call and draft follow-ups"
+"Close the loop on the [meeting name]"
+"Draft follow-ups from my last call"
+"Follow-up ritual for the [project] sync"
+```
+
+The skill auto-detects the meeting — most recent Granola note, pasted transcript, or named meeting — and builds the pack.
+
+## How It Works
+
+1. **Locate the meeting.**
+   - Priority: pasted transcript > uploaded file > most recent Granola note > named meeting (search Granola by name/time).
+   - If ambiguous, ask ONE question: "Last call was [Title] at [Time] — use that one?"
+2. **Extract attendees, decisions, action items.**
+   - Identify each attendee with role context (pull from `_hq/PEOPLE.md` if available — orientation only / static-tier lookup; outstanding-state reads come from events.jsonl via `load_open_commitments(events_path, events=org_events)` over the org-scoped load — PGUARD2 D2, never the no-arg owner form and never from this Tier 2 view).
+   - Surface explicit decisions, not just discussion.
+   - Attribute action items by owner + due date. If no date was stated, mark TBD, don't invent.
+3. **Pull voice.**
+   - Use the baked-in `## Voice Block` in this SKILL.md (Voice Protocol v3.0) as the sole voice source — do not read external `VOICE_SAMPLES.md` files.
+   - Default register for uncalibrated workspaces is sharp and warm ("Good talk. Quick recap — …").
+4. **Draft the follow-up emails.**
+   - One per attendee who owns ≥1 action item.
+   - Subject: "Follow-up: [Meeting topic], [Date]" — dash-free (S3 subject gate: no dashes as punctuation in subjects; run the drafted subject through the detector with `--context subject`, same bash gate as the body below)
+   - Body: 1-sentence opener → bullet list of their actions → their dates → sign-off.
+   - If a decision concerns them, surface it in one line.
+   - **Warm-but-brief formula.** Apply the Universal writing standards in `shared/VOICE_CALIBRATION.md`:
+     - Open with one specific line about THIS meeting ("Good call — the pricing discussion unblocked us"), never politeness filler ("Thanks for taking the time").
+     - Actions as facts: "You're sending the deck Thursday" — never "hopefully" / "if you have time."
+     - Three sections max, blank lines between. Warmth lives in specificity, not in pleasantries.
+   - **Mechanical voice-tell gate (B2 — bash-gated, not prose).** After drafting each follow-up email and before surfacing it, run its body through the deterministic detector. It hard-fails on the exact banned phrases in `shared/VOICE_CALIBRATION.md`; structural tells warn. This backstops the Step 2 critique, it does not replace it:
+
+     ```bash
+     # >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+     # The substrate is on the customer's machine; this process may not be. Every
+     # read, helper and write goes through workspace_access ON the host that holds
+     # the data. Never open, copy or tar a workspace file into this session, and
+     # never write one from here.
+     #  1 RESOLVE, once per call. The four lines below name the plugin root, the
+     #    environment, and -- on a seat whose files are local -- the workspace. On a
+     #    merged seat resolve instead with `workspace_access.py discover`, hand the
+     #    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+     #    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+     #    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+     #    before the first plan, so a saved document can name the folder the
+     #    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+     #    reports, spelled as it reports it>" in front of that first plan, in the
+     #    same command, so each write names the computer it came from (plan keeps
+     #    it for the session). Then hand that answer to `workspace_access.py
+     #    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+     #    runtime is absent, or its manifest_sha is not this plugin's -- the version
+     #    alone no longer changes between builds) is a STOP: run the update-bridge
+     #    install step once, resolve and compare again, and if it still lags say
+     #    `lags_line` and stop. There is no container fallback.
+     #  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+     #    CONTEXT, always, one call: `plan run_helper` with name
+     #    `context_loader:load_context` and args {"workspace_root": "<WS>",
+     #    "skill": "<this skill's folder name>"}. Follow every rule in its
+     #    `rules`; an answer a rule shaped says so in the rule's own plain words.
+     #    Asked about the owner's own records and nothing on file answers, say
+     #    "I do not have that." The owner's rules are read through this loader
+     #    only.
+     #  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+     #    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+     #    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+     #    variables in front of python3, which carry the writer identity and the
+     #    run mode to the host that holds the data. The reply is one JSON
+     #    envelope; ok:false is a stop, never a hand retry.
+     #  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+     #    redirect, an in-place edit, a heredoc into the workspace, or a python body
+     #    that opens a substrate file.
+     #  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+     #    sandbox seat, or a Code session on the customer's own machine -- the same
+     #    verbs run in this shell, and the four lines below resolve it for them.
+     #  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+     #    sentence with no file, script, path, variable, shell text or mechanism
+     #    in it -- "One step could not run here; what is below is complete." or
+     #    "... is partial." Never narrate a workaround, never say what you tried.
+     #  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+     #    render -- lives in this session's own scratch, never under the
+     #    workspace. Nothing under `_hq/` is created, copied or removed by a
+     #    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+     #    removed by `plan remove`, and a removal is reported in the envelope's
+     #    own words -- removed, moved aside, or still there -- never as done.
+     #  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+     #    `plan run_writer` naming a writer on its list -- never by importing a
+     #    writer in a shell. The door forwards who you are; a writer with no
+     #    identity on this seat refuses in one sentence, and that sentence is the
+     #    whole answer.
+     #  9 FOLDER. Three tiers, one wording here and in the block the customer
+     #    pastes into the account's Claude instructions (claude_instructions.py,
+     #    TIER_LINES). If the owner's computer is connected, work in the Command
+     #    Room folder; if it is not attached, ask for it by name before doing any
+     #    work. If the owner's computer is not connected, ask for the Command Room
+     #    folder to be attached from OneDrive or Google Drive before doing any
+     #    work. If neither is possible, answer as plain Claude and do not go
+     #    through Command Room. A scheduled chat asks nothing: it works in the
+     #    folder it was registered with, or stops in one sentence.
+     SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+     PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+     eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+     WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+     [ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+     # <<< CR ACCESS PREAMBLE v6 <<<
+     printf '%s' "$DRAFT_BODY" | python3 "$PLUGIN_ROOT/shared/scripts/voice_tell_detector.py" - --context email
+     ```
+
+     On exit 1 (`FAIL`), rewrite the flagged lines and re-run until it exits 0 (`pass`/`warn`). Never surface a draft the detector still fails. A phrase the recipient's calibrated Voice Block demonstrably allows is exempt via `allow_phrases` (the Voice Block Taboos carve-out); never improvise the override.
+5. **Write artifacts.**
+   - Save the meeting-recap pack to `[Primary Thread folder_name]/meetings/FollowUp_[Meeting]_[YYYY-MM-DD].docx` (primary thread comes from meeting-notes classification — `.docx` per CONTRACT Rule 27, no .md deliverables). **v3.13.0+ — the .docx pack does NOT include the email body.** Per M's 2026-05-20 feedback #13: the document is the synthesis/recap; the emails are a separate artifact that belong in the widget where they can be edited. Email bodies stay in the chat-action widget (step 6) and Gmail Drafts only.
+   - For each `related_thread_ids[]`, append a cross-ref line to that thread's session notes per the `meeting-notes` Step 4 convention.
+   - Log decisions by invoking the `decision-log` skill (it appends `decision` events; the DECISION_LOG view regenerates).
+   - Append new commitments to `_hq/MASTER_TRACKER.md` (invoke `workspace-manager` activity log).
+   - Generate the follow-up email TEXT only — do NOT create Gmail drafts at fire time (lazy creation per `shared/EMAIL_DRAFT_PROTOCOL.md` §1). The text surfaces in the widget (step 6); a Gmail draft is created only when the user clicks `draft` / `send` / `edit then send`, never auto-send.
+6. **Surface in chat via the canonical chat action widget** (v3.13.0+ — per `shared/EMAIL_DRAFT_PROTOCOL.md` universal scope). One widget item per attendee with a follow-up draft, plus a separate H2 link to the .docx recap at the bottom. Data view shape:
+
+   ```python
+   data_view = {
+       "widget_mode": "all_batch_widget",
+       "header": f"Follow-ups: {meeting_topic} — {meeting_date}",
+       "sub_header": f"{n_drafts} drafts ready · Recap doc: [link below]",
+       "sections": [{
+           "title": None,
+           "count": None,
+           "items": [
+               {
+                   "n": i,
+                   "icon": "✉️",
+                   "name": draft.attendee_display_name,
+                   # metadata is LIST OF [key, value] PAIRS — required for
+                   # email-shaped item validation.
+                   "metadata": [
+                       ["To", attendee_email],
+                       ["Subject", subject],
+                   ],
+                   "context_tag": "Ready for your review — nothing sends until you click",
+                   "body_lines": [f"> {line}" for line in draft.body.split(chr(10))],
+                   "actions": [f"{i} send", f"{i} draft", f"{i} snooze 3d"],
+               }
+               for i, draft in enumerate(per_attendee_drafts, start=1)
+           ],
+       }],
+   }
+   from widget_transport import render_and_persist
+   transport = render_and_persist(data_view=data_view, wrapper="fragment",
+                                  persist_dir="<WORKSPACE>/_hq/.system/widgets",
+                                  name_hint="follow-up-ritual")
+   # Pass transport["html"] to mcp__visualize__show_widget as widget_code (persisted page bytes, verbatim) (EW2+T, F-15 —
+   # shared/CHAT_ACTION_WIDGET.md § Transport). Never hand-compose or post-process the HTML.
+   # Load the widget tool first (shared/CHAT_ACTION_WIDGET.md § Finding the widget tool first): a listed deferred tool counts as present; ToolSearch select:mcp__visualize__show_widget,mcp__visualize__read_me, call read_me, then relay.
+   ```
+
+   After posting the widget, surface the .docx recap link separately at the bottom per `shared/CONTRACT.md` Rule 3: build it with `chat_output_renderer.doc_headline_link(label, brief_path.get_brief_artifact_url(absolute_docx_path))` — never hand-encode a `computer:///` URL. One-line summary above the link: "Drafted 3 follow-ups for Aria, Bowie, and Lyra. Logged 2 decisions. Added 4 new commitments to your tracker."
+
+   **File card first (CONTRACT Rule 3, owner ruling 2026-11-03).** Every file this turn made, this document included, comes back in the chat as a file card before the summary and before any link: call `SendUserFile` with the file and `display: "render"` (load it through the host's tool search when it is not in the tool list yet; a tool that has to be loaded is present, not absent). On a merged seat the card tool runs in this chat and cannot read the customer's computer, so stage the landed file into this session's own scratch first (the device staging tool, or the staged copy `plan_delivery` makes) and card that copy; never hand the card tool a path on the customer's computer, and never paste the file's bytes as text. Only where this chat has no file-card tool at all does the link or the saved-to line stand in for the card, and then `deliverables.card_absent_line()` is said once, in plain words, under it. A path in words is not delivery.
+
+   **Output guard:** no internal tokens, paths, event names, or version numbers in anything the CEO sees — vocabulary per `shared/VOICE_CALIBRATION.md` § Plain-language glossary.
+   - Bad: "I draft them as editable widgets — Gmail draft fires on click."
+   - Good: "I'll show you the drafts right here to review — nothing sends until you click."
+
+## Step: Surface Open Commitments (v2.7.15+)
+
+Before drafting follow-up emails, scan `_hq/data/events.jsonl` for **open commitments** that involve the meeting's attendees. **Read via the org-scoped reader, never a raw load** (PGUARD2 — the follow-up emails reach the attendees): `from events_io import load_events_org_scoped; org_events, skipped = load_events_org_scoped(workspace_root)`, then feed the open-set projection through the seam — `load_open_commitments(events_path, events=org_events)` (PGUARD2 D2 — the injection keeps personal-lane and masked-account commitments out of the pack; never the no-arg owner form here). The pack must surface them so the user knows what's already on the floor before adding more — and so each attendee's follow-up email can include a "still open from before" line where relevant.
+
+### Read recipe
+
+From the org-scoped `load_open_commitments(events_path, events=org_events)` result, for each attendee `person_id`, keep events where:
+- `type == "commitment"` AND
+- `data.status` (or top-level `status`, for legacy events) is `"open"` or `"overdue"` AND
+- the commitment hasn't been closed by a later `commitment_resolved` / `thread_resolved` event referencing its id (the projection already applies the closer chain) AND
+- `data.owner_id == <attendee_person_id>` OR `data.owner_id == <user_id>` for outbound (you owe this attendee) AND
+- `data.pending_review` is NOT true — those are UNCONFIRMED extractions, not open commitments. They belong to the needs-your-call queue (`needs your call`), never to an attendee pack or an outbound draft: telling someone "still open from before" about a promise the extractor merely guessed at is a claim the workspace cannot stand behind. Use `cru_match.split_pending_review(...)` and keep the confirmed half.
+
+Group by attendee. For each attendee with ≥1 open commitment, include a "Still open" subsection in their per-attendee section of the pack:
+
+```
+### Still open with [Attendee]
+- They owe: [title] (due [date], aged [N] days)  ← from prior meeting/email
+- You owe: [title] (due [date])
+```
+
+If the meeting just closed one of these (e.g., the attendee delivered the thing or the user did), hand the transcript to the policy pass — **never call `commitment_state.close_commitment` from this step** (CUT-A 2026-09-06, M ruling R-A; the writer's door refuses a direct follow-up-ritual close on transcript evidence by name, `TranscriptCloseWithheldError`). The pass is the same one meeting-notes Step 5e-bis and Phase 4.6 of the past-meetings orchestrator run:
+
+```python
+from commitment_policy_pass import apply_meeting_closes
+counts = apply_meeting_closes(
+    workspace_root,
+    meeting_ref="granola:<meeting_id>",          # PROV1 — the TRANSCRIPT this was read out of; also the self-evidence fence
+    # Pass nothing only when there genuinely is no source — since SPEC PROVMINT1 the writer
+    # mints `session:follow-up-ritual:<now>` for it, marked `surface_minted`; PROV1's bare
+    # marker is no longer reachable from this writer. That floor points at the ACT, never at
+    # a transcript, so dropping a meeting id you HAVE trades a real pointer for a receipt —
+    # and the coverage split reports it as exactly that.
+    transcript_ts="<THIS meeting's own start ts, offset-carrying or UTC>",  # never the processing clock
+    transcript_text="<full transcript text>",
+    attendee_person_ids=["<resolved attendee person_id>", ...],
+    attendee_records=<this meeting's attendee list, or None>,  # cr1#882: a close lands only when tight
+    user_names=["<the CEO's own canonical name>"],
+    source_skill="follow-up-ritual",
+)
+```
+
+With closing on evidence OFF (the shipped default) the pass writes at most a review proposal on the row — the `needs your call` confirm shape — and `counts["n_close_withheld"]` says how many rows it would have closed. With it ON (`turn on closing on evidence`) the tightened pass closes only with the meeting's own start time, only a row captured before that start, only on one verbatim turn that says done and names the item, and only when that turn is tight (cr1#882): the CEO's own report names the other person and `attendee_records` shows exactly the CEO and that person. Anything else is withheld as a proposal for the CEO, which the timeout withdraws and never closes. A close is stamped with this rail, on a batch, one `undo` away. It normalizes legacy id spellings, refuses no-match ids loudly, is idempotent over the full resolved-id set, and never closes a `pending_review` item except through the transcript door with the switch on. Nothing here is narrated in chat.
+
+This is how commitments stop accumulating in views over time — without resolution events, every commitment stays "open" forever.
+
+### Surface count in the pack header
+
+Add to the pack header line, **read off `counts`, never asserted**: `"Open before this call: 3 (they owe 2, you owe 1)."` — plus, only when the count is non-zero, `"Closed on this call: N."` from `counts["n_closed"]`, or `"N look kept — say `needs your call`."` from `counts["n_close_withheld"]` (while closing on evidence is OFF, the shipped default, and, with it ON, the reports that were not tight). With the switch off `n_closed` is 0 and the closed half of the line does not render.
+
+If zero on either side, omit that half of the line.
+
+---
+
+## Output Structure
+
+`FollowUp_[Meeting]_[YYYY-MM-DD].docx` content structure (rendered via brief_writer):
+
+**The pack is rendered, never assembled by hand (DOCFENCE1).** `make_brief` is the only path that produces it:
+
+- **NEVER hand-roll the pack** with the generic `anthropic-skills:docx` skill, `python-docx` directly, or docx-js. Those paths bypass every gate and ship a substandard or PII-leaking recap (the v3.20.0 failure mode).
+- **NEVER create, render, copy, upload, or update the pack — or any part, derivative, or restatement of it ("talking points", "a summary", "just the action items") — through Claude Docs (the built-in docs / artifact page), Google Docs, Google Drive, or ANY other document/file connector** (Slides, Sheets, Notion, OneDrive, Dropbox: the ban is on the connector delivery path, not one vendor's API quirk). It fails twice at once: the connector path bypasses every gate above, AND a connector-created file lands at that connector's default location with no folder control — for a Google Doc, and for a parentless Drive upload of the canonical `.docx` itself, that is My Drive root, not the thread's meetings folder (the 2026-07-24 root-drop incident). Not exceptions: "for mobile", "for sharing", "as a copy alongside the canonical file" — **nor a direct instruction**: "put the recap in a Google Doc" is a request this gate refuses, not an override. Say the canonical pack already exists and hand back its link. Attendee-facing delivery is the per-attendee email drafts in the widget; the recap itself stays the `.docx` link.
+
+> **Executive Output Standard (EXEC1, v3.20.0+).** Per `shared/EXECUTIVE_OUTPUT_STANDARD.md`: the pack **opens with "What YOU committed to in this room" before others' items** — the `owner_id == user_id` split is already computed (Step: Surface Open Commitments), so this is pure ordering. Pass `make_brief(brief_kind="followup_pack", ...)` an `exec_header` whose verdict names what the user walked out owing ("You own 2 items from this call — pricing redline by Thu, intro by Fri"); CHANGED = what got decided/closed; DECIDE/NEEDED follow the floor or the nothing-form. The **drafts widget IS the ASK block** (element 4, one-ask-surface) — the per-attendee draft widget is the reader-action surface; do NOT also render a prose "What I need from you" twin in the .docx.
+
+> **Exemplar anchor (SPEC OUT8).** Before composing, load the kind's structural exemplar — `exemplars.get_exemplar("followup_pack", workspace_root)` (`shared/scripts/exemplars.py`) — and anchor STRUCTURE on it: section order, visual placement, proportions. Workspace exemplar (`_hq/exemplars/followup_pack/`) beats the shipped seed; `None` = compose on the structure below, unchanged. **Contract beats exemplar beats default** — an exemplar never licenses skipping the exec header, the YOUR-items-first ordering, or the one-ask-surface rule, and it anchors structure, never facts: no name, number, or claim from the exemplar may appear in the pack. After saving, run `exemplars.scan_docx_for_exemplar_tokens(docx_path, exemplar["text"])`; a finding means exemplar placeholder content leaked — fix the sections payload and re-save AT MOST ONCE (shared with the visual pass below, warn-only). When the user gives structural feedback on a delivered pack ("make it like this", reorder/drop a section), capture it with `exemplars.append_structural_correction(workspace_root, kind="followup_pack", direction=..., section=...)` — capture only; the exemplar itself is updated by the weekly `learning` job's exemplar leg, automatically at the shipped floors and narrated in the morning brief with a one-word undo (`shared/EXECUTIVE_OUTPUT_STANDARD.md` § "The exemplar anchor").
+
+**Visual pass (SPEC OUT2 §3, after the .docx save):** run the render-then-critique pass per `shared/EXECUTIVE_OUTPUT_STANDARD.md` § "The visual pass" — call `shared/scripts/visual_gate.py` `render_preview(<saved path>)`, LOOK at the returned page images against the 7-item checklist (orphaned heading at a page break · empty/placeholder tile · table overflow/wrap damage · cramped spacing · header/footer intact · brand palette applied · chart unreadable / overplotted), fix the sections payload + re-save AT MOST ONCE, then log `visual_gate.log_visual_gate(WORKSPACE_ROOT, doc, rendered, findings, fixed)` either way. `None` from the ladder = no renderer on this machine — log `rendered: false` with a `skipped_reason` and proceed exactly as before (warn-only forever: a finding never refuses a save, and the pass never loops).
+
+```
+# Follow-Up: [Meeting Name]
+Date: YYYY-MM-DD | Attendees: Aria, Bowie, Skyler | Project: [Project]
+Open before this call: 3 (they owe 2, you owe 1). 1 looks kept — say `needs your call`.
+
+[EXEC HEADER — verdict names what YOU walked out owing; CHANGED = decided/closed]
+
+## What you committed to in this room   (EXEC1 — YOUR items first, owner_id == user_id)
+- Send the revised pricing model — Thu Apr 25
+- Intro Bowie to procurement — this week
+
+## Summary
+[3-5 sentence recap]
+
+## Decisions
+- [Decision 1]
+- [Decision 2]
+
+## Action Items (others)
+| Owner | Action | Due |
+| Aria | Send pricing redline | Apr 25 |
+| Bowie | Intro me to procurement | This week |
+| Skyler | Circulate revised SOW | Apr 24 |
+
+## Logged
+- 2 decisions added to your decision log
+- 4 new commitments added to your tracker
+- 3 follow-up drafts ready to review and send
+```
+
+## Voice Block
+
+**Last refreshed:** 2026-04-21
+**Calibration level:** default
+**Sample count:** 0 (uncalibrated — generic warm-but-brief exec defaults)
+
+### Sentence cadence
+- Typical length: 10-18 words
+- Maximum: 25 words
+- Short-punch openers: common ("Quick recap.", "Two things.")
+
+### Openers
+- Preferred: "Quick recap from this morning", "Following up on our call", "Two action items from today"
+- Avoided: "Per our discussion", "As discussed", "Pursuant to", "I wanted to circle back"
+- Never use: "I hope this email finds you well", "Happy to help", "Let me know if you have any questions"
+
+### Vocabulary
+- Uses: "quick recap", "next step on your side", "on my side", "you're on point for", "I'll send", "confirmed"
+- Avoids: "pursuant to", "per our discussion", "going forward", "touch base", "circle back", "reach out"
+- Domain-specific: action-item language ("you own X by [date]", "I'll send Y by [date]", "still open: Z")
+
+### Punctuation
+- Em-dashes: occasional
+- Semicolons: rare
+- Parentheticals: rare
+- Line breaks: use liberally between sections (recap / their actions / my actions / open items)
+
+### Structure
+- Lead with: the purpose (following up on [meeting]) and a one-line recap.
+- Body: 3 sections max — your actions, my actions, open items. Each section 1-3 lines.
+- Close: simple sign-off. "—Mira" or first name.
+
+### Tone markers
+- Register: warm-but-brief exec, efficient
+- Self-reference: first-person used freely
+- Hedging: minimal — confirmed action items stated as facts
+
+### Taboos (per-skill)
+- Never: "I hope this email finds you well", "pursuant to", "please don't hesitate"
+- Never send drafts with vague action items — "touch base next week" gets rewritten as "I'll send the revised doc by Thursday EOD."
+
+### Examples
+
+**Example 1 — Short follow-up to peer:**
+```
+Good call. Two things:
+
+- You're sending the updated deck by Thursday
+- I'm introducing you to Skyler on Monday
+
+Open: pricing on the service tier — we'll revisit next week.
+
+—Mira
+```
+
+**Example 2 — Follow-up to customer:**
+```
+Quick recap from this morning:
+
+- We're moving forward with the pilot starting May 1
+- Your team will send the data template by Friday
+- My team will have the onboarding deck ready by April 28
+
+I'll circulate a brief project plan by Wednesday so we all have the same
+picture.
+
+Mira
+```
+
+## Triggers
+
+- "follow up on that call"
+- "follow up the meeting"
+- "follow up with [person]"
+- "process the call and draft follow-ups"
+- "close the loop on [meeting]"
+- "draft follow-ups"
+- "send follow-ups"
+- "follow-up ritual"
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## Gotchas
+
+- **Drafts only, never auto-send.** User reviews in Gmail. This is non-negotiable.
+- **If no mail connector is available, the email bodies stay in the chat-action widget** (they're already there per step 6 — the widget is the edit surface) with a friendly line above it: "Email isn't connected yet — you can copy these drafts straight from the cards for now." There is no markdown pack; the .docx recap never carries email bodies.
+- **Never invent action items, decisions, or dates.** If the meeting transcript is unclear, say so in the summary ("Unclear whether Bowie committed to Friday or Monday — ask").
+- **Attribute carefully.** If transcript speaker labels are wrong (Granola sometimes misattributes), flag it rather than confidently draft the wrong email.
+- **If the meeting is internal (only team members), skip email drafts — still produce summary + tracker entries.** Ask first if ambiguous.
+- **If a decision was made that should be logged as a major decision, tag it clearly** so `decision-log` skill catches it on its next pass.
+
+## Integration
+
+- **Enhances `meeting-notes`** (doesn't replace). `meeting-notes` produces structured notes — this adds the close-the-loop layer on top. If `meeting-notes` already ran for this meeting, reuse its output and add the email drafts.
+- **Deal-signal post-step (PIPE1 Part 2 — silent tier, MANDATORY).** After the substrate writes land, run meeting-notes Step 5h's exact recipe scoped to this meeting's counterparty org(s): `detect_deal_signals("<WORKSPACE>", org_ids=[...])` → `propose_candidates(...)` (never `run_deal_signal_job` — the Sunday job owns that receipt). When the internal meeting-notes run already executed Step 5h for THIS meeting, skip the propose call (open-fingerprint dedup makes a double-call harmless, but one call is the contract) — still render the lines: each returned candidate's `nudge_line` goes under **Logged** in the pack chat card, verbatim, every candidate (Bug #92b — no re-deciding inclusion). Zero candidates → zero lines. Propose-and-confirm only; nothing here writes a deal field.
+- **Commitments** — land as `commitment` events via the internal `meeting-notes` run; MASTER_TRACKER regenerates from the substrate (never written directly).
+- **Decisions** — invokes `decision-log` skill (event append; DECISION_LOG view regenerates).
+- **Appends to `SESSION_NOTES_<folder name>.md`** (the file `session_notes_file:notes_file` names) — 1-line log entry: "Closed the loop on [Meeting] — 3 follow-up emails drafted, 2 decisions logged."
+
+## Demo Beat (May 14)
+
+Live demo flow for the CEO group:
+1. Record a 60-second mock call ("Aria, please redline the pricing by Friday. Bowie, please intro me to procurement this week. Agreed we're moving to net-30 terms.")
+2. Run: "follow up on that call"
+3. Artifacts appear on screen: summary, action items, 2 drafted emails, decision logged.
+4. CEO reads, clicks send on one draft, done.
+
+Total stage time: ~90 seconds. Installable mental model.
+
+## What It Doesn't Do
+
+- Doesn't attend the meeting or take live notes (use Granola / `meeting-notes`)
+- Doesn't schedule follow-up meetings (use a calendar scheduling flow)
+- Doesn't auto-send email — always drafts
+- Doesn't handle multi-meeting rollups (use `weekly-recap` for that)
+
+## Connected Tools
+
+- **Transcript connector** (Granola / Fireflies / Otter / Read.ai / Zoom / Teams — resolved via `discover_transcript_tool()`) — transcript retrieval
+- **Gmail connector** — draft creation
+- **PEOPLE.md** — attendee context
+- **Voice Block** (baked into this SKILL.md) — voice calibration (v3.0)
+- **events.jsonl substrate** — commitment + decision logging (MASTER_TRACKER / DECISION_LOG views regenerate from it)
+- **meeting-notes skill** — reuse structured notes if already generated
+- **decision-log skill** — decision writer
+
+## Narration leak scan (CUT-C item 8 — MANDATORY on every composed line)
+
+Widget bodies are scanned inside `widget_transport.render_and_persist`; the PROSE this skill composes around them is not, unless this step runs. Before posting any sentence you composed — an ack, a header, a summary, a pointer, a "why" line — run `output_check(<the text>)` from `chat_output_renderer.py` (`shared/scripts/`; on a merged seat the read door's `chat_output_renderer:output_check`) and add what it answers to this turn's `receipts` (cr1#1413). It is the same scan as `validate_chat_output` and raises `LeakDetectedError` on a raw id (`person_NNN`, `project_NNN`, `org_NNN`, a `cmt_` / `bp_` / `pcand:` wire id), an event or field name, a file name or path, or a score. ABORT the post and rewrite the sentence with the entity's name (`narration_names.humanize(text, narration_names.name_index(<WORKSPACE>))` is the one substitution). NEVER catch the error and post anyway. Text relayed byte-exact from a driver or the transport is already scanned and is not re-composed.
+
+## Routing (full trigger corpus)
+
+The settings-trigger family for this skill, relocated verbatim from the pre-G11-diet description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> Also handles first-run personalization settings — use when the CEO says 'tune follow-up-ritual', 'show follow-up-ritual settings', 'reset follow-up-ritual to defaults'.
+## Draft date scan (DRAFTDATE1 — MANDATORY on every rendered draft)
+
+**A draft never states a date, day or deadline the row does not hold.** On 2026-09-07 the drafts on this product invented three: "I'll have it finished by Friday" and "this is on your calendar today" on rows with no due date and no calendar event, and "let's get this paid this week" on a row with neither. Nobody had promised any of those days; sending one makes a commitment the book does not know about.
+
+Before you show or save ANY draft you composed — status note, nudge, chase, follow-up, reply, invite body — run it through the scan:
+
+```python
+from draft_date_scan import assert_draft_dates
+assert_draft_dates(<the draft text>, <the row>, today=<the workspace's own day>)
+```
+
+It raises `DraftDateError` naming every phrase the row cannot support. A date phrase is allowed only when it traces to (1) the row's due date, (2) a calendar event on the row, or (3) a date in the row's OWN words — its title, its quote, the thread subject. `today` is the workspace's day (`tz.py`), never a UTC re-slice.
+
+**NEVER catch the error and send anyway, and never invent a date so the sentence reads better.** The fix is one of two things: drop the day from the draft ("I'll come back to you with a date" is honest and costs nothing), or set a real date on the row first and then say it. A draft with no date at all is always allowed.
+

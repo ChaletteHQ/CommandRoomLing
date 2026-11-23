@@ -1,0 +1,229 @@
+# First-Run Personalization Protocol (SPEC FRP1)
+
+Every major skill's FIRST fire ends with 2–3 one-tap decisions that make the skill
+personally theirs — delivered **output-first, always**, stored in the existing
+`skill_config` layer, re-tunable forever. The first-run moment must feel like the
+product getting smarter, never like a settings form.
+
+`stalled-projects/SKILL.md` is the shipped **Reference Implementation** (v3.14.1) this
+protocol generalizes. When in doubt, copy its shape.
+
+---
+
+## The storage layer (already exists — do NOT rebuild)
+
+`shared/scripts/skill_config_writer.py`, path `_hq/data/skill_config/<skill>.json`:
+
+- `is_configured(ws, skill)` — has this skill been configured? **Gates the first-run block forever.**
+- `save_skill_config(ws, skill, config, *, is_reconfigure=None, origin=None)` — atomic write
+  + emits `skill_first_run_configured` / `skill_reconfigured` with `data.origin`.
+- `get_config(ws, skill, defaults)` — **the read path.** Deep-merges the saved config OVER
+  `defaults`, so a v+1 skill that adds a decision never breaks an old config (new key falls
+  back to its default; saved choices honored). Always read config through this.
+- `wipe_skill_config(ws, skill)` — reset; next fire is a first-fire again.
+
+`origin` values (on the event, for usage-report/coach to read): `first_fire_defaults`
+(silent default acceptance) · `first_fire_override` (changed a knob at first fire) ·
+`m1_batch` (set during onboarding) · `tune` (later reconfigure) · `drift_reoffer`
+(accepted a re-offered knob). Default is auto: `first_fire_defaults` on first fire,
+`tune` on reconfigure.
+
+---
+
+## The 4 modes (dispatch, lifted from stalled-projects)
+
+Every adopting skill carries these four modes. The trigger decides which fires:
+
+1. **Detect** — the normal fire. On the FIRST fire only: `save_skill_config(ws, skill,
+   DEFAULTS)` immediately (defaults are applied-and-persisted, not pending), produce the
+   real output, THEN append the first-run block (below). `is_configured` gates the block —
+   it appears exactly once, ever.
+2. **Show settings** — `show [skill] settings` → render the current config in plain English
+   (no questionnaire), each value with its options.
+3. **Tune** — `tune [skill]` → the pre-filled re-questionnaire (current value marked), OR a
+   freeform natural-language tune ("be more aggressive" → the skill's mapping table lowers
+   the relevant threshold). `save_skill_config(..., is_reconfigure=True)` → re-render.
+4. **Reset** — `reset [skill] to defaults` → `wipe_skill_config` → next fire is a first-fire.
+
+---
+
+## Show-then-tune (STT) is the default. Ask-first (AF) is the narrow exception.
+
+**STT (default):** apply defaults, show the output, offer one-tap changes AFTER. Used for
+anything that only changes what the user **reads**. Never blocks the first output behind a
+question (CONTRACT Rule 17, speed over perfection).
+
+**AF (reserved for irreversible / outward-acting defaults only):** ask ONE question, only on
+the first relevant request, with a working default-escape. The entire AF class:
+- **email-writer draft posture** — gates whether anything auto-queues to the declared mail backend's Drafts (outbound). Closes the long-standing CLAUDE.md "draft posture: TBD".
+- **follow-up-ritual send timing** — gates outbound email.
+- **contract-review standard-terms** — already AF; keeps its skip-escape.
+- **workspace-manager relationship_type** — already AF; permanently shapes the entity graph.
+- **board-pack-assembler KPI set** (OUT2 §5) — the KPI list is the board pack's spine; edits to it
+  always confirm before saving (the pack goes straight to a board — a silently-changed KPI list is
+  an outward-acting default). The skill's other two knobs stay STT.
+
+Everything else is STT. If you're unsure, it's STT.
+
+---
+
+## The render — transport split (resolves CHAT_ACTION_WIDGET MUST-NOT rule 5)
+
+**On-demand skills:** a 2–4 line footer + micro-widget after the output —
+> *"First time doing this for you. I set 3 defaults: **[A]** · **[B]** · **[C]**. Tap any
+> to change it, or say 'tune [natural skill name]' later."*
+
+**Footer language rules (PL.8 2026-07-02 — the family had drifted; this is the one shape):**
+- **"I set N defaults"**, never "I made N calls" — "calls" collides with phone/meeting vocabulary
+  (call-prep's old footer read "First time prepping you. I made 2 calls" — about a meeting prep).
+- **Each default described in plain English**, never config-key or jargon shorthand: "how eagerly
+  I discard junk" not "discard aggressiveness"; "formal tone (for outside readers) · signed close"
+  not "external-formal register · signed"; "flag someone after twice their usual gap, or 30 days"
+  not "2× cadence + 30-day threshold".
+- **The tune hint uses the natural spoken form** ("tune the dormant scan", "tune meeting notes"),
+  verified to route; the hyphenated skill ID stays an accepted trigger but is never advertised.
+- **stalled-projects' footer is the reference implementation** — warm, lists the defaults in
+  plain words, ends with "or just tell me what you'd change and I'll figure out which setting
+  that maps to."
+
+**Scheduled orchestrators:** the choices ride as `fr1`/`fr2`/`fr3` items in a **"Make this
+yours"** section at the BOTTOM of the existing all-batch widget — NO second surface (that's
+what would violate MUST-NOT rule 5).
+
+Each decision is a fixed-option button row with the **saved default rendered in a "current"
+visual state** — a DOCUMENTED exception to the no-preselect rule (it's not a pending
+selection, it's the already-saved state; the buttons are an override surface). The exception
+is written into `shared/CHAT_ACTION_WIDGET.md` itself. Tap → standard apply-choices
+`{n:"fr1", action, sub?, input?}` payload → `save_skill_config(..., is_reconfigure=True,
+origin="first_fire_override")` → one-line ack ("Done — tomorrow's brief runs full-detail.").
+Free-text is never required; `[text]` only for optional extras (e.g. a VIP-sender add).
+
+---
+
+## The per-skill decision catalog (max 3 decisions, max 4 options each)
+
+More than 3 decisions, or more than 4 options, belongs in freeform tune — not the first-run block.
+
+| Skill | Decisions (default first) | Mode |
+|---|---|---|
+| email-writer | **draft posture: show-first / auto-queue** · sign-off · length | posture AF, rest STT |
+| morning-briefing | depth · what-leads · going-quiet on/off | STT (fr-items) |
+| inbox-triage | discard aggressiveness · seed top-5 VIPs · default action | STT |
+| call-prep | depth · auto-fire timing | STT |
+| meeting-notes | commitment capture silent/confirm · verbosity · new-person handling | STT |
+| follow-up-ritual | **send timing** · recipient default | timing AF, rest STT |
+| weekly-recap | theme-led / numbers-led · internal-backlog split/external | STT |
+| dormant-customer-scan | threshold · revenue weighting · watch-list | STT |
+| stalled-projects | (Reference Implementation) | STT |
+| decision-log | auto-log / confirm · revisit reminders | STT |
+| commitments orchestrator | group by person/project · chase tone | STT (fr-items) |
+| memo / one-pager | default register · signed/unsigned | STT |
+| board-pack-assembler (OUT2 §5) | pack length · deck companion · **KPI set** | KPI set AF, rest STT |
+| decision-memo-composer (OUT2 §5) | criteria persistence per decision type · weight display | STT |
+| stress-test (OUT2 §5) | depth (passes 3/5) · risk framing | STT |
+| automation-scanner (OUT2 §5) | ranking weights · horizon buckets | STT |
+| pipeline-tracker (PIPE1) | rot thresholds preset (standard/relaxed/aggressive) · weekly digest opt-in + day (preference only — registration stays propose-never-auto via the schedule setup's optional set) · value capture (exact number vs ranges-as-notes) | STT |
+| system-health (LB1 — the Living Brain card) | **daily_confirm_card: on / off** (default on — the ≤5-item "Needs your eyes" card on **coach**; off keeps the queue reachable via `staff meeting` / `what's waiting on me`. FB-20: the morning brief no longer renders this card on any setting — it is read-only, and points at the staff meeting instead) | STT (fr-item on the card's own first render) |
+
+**Domain-config aliases (OUT2 §5 — verbs without a second store):** `contract-review` and
+`team-intelligence` answer the same `tune / show settings / reset to defaults` vocabulary, but the
+verbs are ALIASES onto their existing domain config files (`_hq/contracts/standard-terms.md` and
+`_team-config.md` respectively) — no `skill_config` JSON, no migration, storage unchanged. Their
+SKILL.md "Settings verbs" sections define the mapping.
+
+**The output profile is NOT in this catalog — by design (OUT2 §5 fence, graduated by STYLE1 D1).**
+The cross-skill `_hq/data/skill_config/output_profile.json` (density / visual_bias / page_cap /
+default_format — read by `make_brief`, contract in `EXECUTIVE_OUTPUT_STANDARD.md` § "The output
+profile") has **no first-run block and no first-fire footer, ever** — no skill offers it
+proactively at first fire of anything. Its sanctioned writers are: an explicit `tune output` /
+`tune my documents` (workspace-manager), a confirmed insight-generator proposal, and — since SPEC
+STYLE1 (D1 ruling 2026-08-25) — the onboarding style proposal: `style_inference.py` may derive
+document-shape knobs from the client's own record and onboarding writes ONLY the knobs the
+inference confidently proposed (origin `inferred_provisional`, disclosed at the reveal, D7).
+Unproposed knobs stay byte-stable defaults. Do not add a first-fire row for it here.
+
+**The binding gauge's READY thresholds are NOT in this catalog — same fence, same reason
+(GAUGECAL1).** `_hq/data/skill_config/binding_gauge.json` carries two knobs read by
+`binding_gauge.ready_thresholds(workspace_root)`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ready_min_substance` | `20` | Substance events bound to a thread before it can be READY. Positive whole number; anything else falls back to the default. |
+| `ready_min_ratio` | `0.75` | Bound / (bound + name-matched-unbound) a thread must clear to be READY. Float in `(0, 1]`; anything else falls back to the default. |
+
+Both defaults are the gauge audit's, measured on the operator's own ledger — which is exactly why
+they are knobs and not constants: a workspace with a shorter history or a different capture cadence
+has no reason to inherit another workspace's bar. **The gauge is substrate infra, not a skill.** It
+has no first-run block, no first-fire footer, and no `tune` verb — nothing offers these
+proactively, and onboarding should leave them alone unless a client's own coverage audit says
+otherwise. Both floors must be cleared for READY, so RAISING either makes the reader's ask-first
+posture *more* cautious and LOWERING either makes it less; `load_thread_knowledge` trusts the
+artifact's stored verdict and never re-derives, so a change takes effect on the next gauge refresh
+(`binding-gauge` maintenance job) and moves `coverage.gauge.state` with it — there is no second
+place to keep in sync. **Onboarding note for fan-out:** the generic-term calibration that sits
+underneath these thresholds needs no per-client tuning at all — it derives the client's own
+org/brand from `entities.json` (self-org / primary user's org). Nobody lists anything.
+
+---
+
+## Lifecycle
+
+- **Trigger family** (in every adopting skill's description): `tune [skill]` ·
+  `show [skill] settings` · `reset [skill] to defaults`. FUZZY_ROUTER carries one generic
+  rule: bare `tune X` → skill X.
+- **Freeform tune is first-class** — each skill carries a natural-language → config mapping
+  table (per the stalled-projects precedent).
+- **Un-tuned high-use** (coach / insight-generator, monthly): a skill with >N fires whose
+  only config event has `origin: first_fire_defaults` gets ONE offer EVER — *"You've used
+  inbox-triage 30 times on factory settings — want the 60-second tune?"*
+- **Override-drift** (cleanup, weekly — MECHANIZED in LB2 via
+  `shared/scripts/config_drift_detector.py`, called from cleanup Phase 3k): config > 6 months
+  old AND ≥ 5 tagged contradicting signals (corrections rows fighting the configured sign-off;
+  `data.config_override` events from per-fire overrides of a configured default) → ONE
+  `brain_proposal` row (`kind: config_drift`, tier confirm, **staff meeting only** — a config
+  nudge is never urgent). Confirm → the re-offer `note` event the next coach session consumes
+  to re-offer THAT KNOB only; dismiss → the standard 60-day ledger cooldown per knob (the
+  mechanical upgrade of the old once-ever prose rule); snooze 7d.
+  **Cleanup is READ-ONLY on prefs — it never writes config, only the proposal, and on the
+  user's confirm the re-offer note. The tune flow remains the only config writer.**
+- **Reset** → wipe → next fire is a first-fire again.
+- **Multi-workspace:** prefs are per-workspace, full stop (a holding-co operator legitimately
+  wants different inbox aggressiveness per entity).
+
+---
+
+## Collision rules (encoded in triggers.yaml)
+
+- `tune`/`reset` vs change-schedule / enable-command-room-schedules: the **object**
+  disambiguates. Scheduled-task names → schedule skills; skill names → tune. The dangerous
+  phrase is `reset morning-brief` (task AND skill): bare `reset [task-name]` → schedules;
+  `reset [skill] to defaults` (**suffix required**) → prefs. Both directions are tested.
+- The no-preselect exception lives in `CHAT_ACTION_WIDGET.md`, not only here.
+- The footer-vs-fr-item split (on-demand footer / orchestrator fr-items) is stated in BOTH
+  this doc and CHAT_ACTION_WIDGET.md.
+
+---
+
+## Anti-settings-form guardrails (why this doesn't feel like a form)
+
+Output-first always · "I set 3 defaults" framing (the product decided, you adjust) ·
+one-tap only · rendered exactly once ever · re-render-after-tune where cheap. If a first-run
+block reads like a questionnaire the user must complete before getting value, it's wrong —
+the value already shipped above it.
+
+---
+
+## Adoption status
+
+`skill_config` is adopted by **stalled-projects** (the Reference Implementation). The per-skill
+adoption of the catalog above proceeds per SPEC FRP1 §5 (email-writer / morning-briefing /
+inbox-triage first, then the rest). The storage + read path + `origin` + the `fr*` dispatch
+rails are complete (S1); each skill adopts by adding its DEFAULTS, the first-run block, the
+freeform tune table, and the trigger family to its SKILL.md.
+
+The OUT2 §5 composer wave (board-pack-assembler, decision-memo-composer, stress-test,
+automation-scanner) is adopted. **G11-constrained trigger placement:** the description budget was
+at cap when this wave landed, so these four carry their `tune / show settings / reset to defaults`
+family in the body's `## Routing (full trigger corpus)` section instead of the frontmatter
+description — the runtime router and the trigger tests read both (v4.5.1 rule). Moving the primary
+phrase up into the description is a ship-session option if budget is ever freed.

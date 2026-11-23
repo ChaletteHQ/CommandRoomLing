@@ -1,0 +1,1004 @@
+#!/usr/bin/env python3
+"""
+Deliverable content sweep (SPEC GATE2 D2/D3) — the load-bearing detector.
+
+WHY THIS EXISTS
+---------------
+GATE1 tried to FORCE every deliverable through `brief_writer.make_brief` so the
+save-time voice + leak gates would run. The live legacy Cowork app proved that fails: given a
+realistic batch, the LLM hand-rolled all three .docx via one `python-docx`
+script — 0 `gate_ran`, every gate bypassed. The bypass routes can't be removed
+(the generic docx skill is a Claude app built-in; the LLM can `pip install docx`).
+
+So GATE2 stops trying to guarantee the route and instead SCANS WHAT WAS ACTUALLY
+PRODUCED. This module sweeps the deliverables on disk + any chat-rendered
+deliverable text and flags anything carrying a voice tell or a privacy/substrate
+leak — regardless of how it was made. `docx_leak_scanner.scan_docx_for_violations`
+reads the file itself, so a hand-rolled doc is caught exactly like a make_brief one.
+
+CLIENT SAFETY (non-negotiable — runs on 5 live client workspaces)
+-----------------------------------------------------------------
+- READ + FLAG ONLY. This module NEVER deletes, moves, renames, or edits a user's
+  file. "Quarantine" here means SURFACE LOUDLY, not relocate.
+- The only writes are CR-owned telemetry: a findings record under
+  `_hq/.system/gate2_findings/` and a best-effort `gate_ran` event. Both are
+  wrapped so they can never raise into the caller.
+- NEVER raises. A sweep that hit one unreadable file flags it ("couldn't verify
+  this doc") and keeps going.
+
+The walk covers three deliverable formats — `.docx`, deliverable-shaped
+`.md`/`.markdown`, and `.html`/`.htm` (SPEC FU1) — dispatched to a per-format
+scanner via `_SCANNER_REGISTRY` in `scan_path_for_violations`. Adding a fourth
+format is a three-line change; the recipe is documented at the registry.
+
+Used by:
+  - cleanup/SKILL.md (Phase 3f) — the weekly backstop sweep.
+  - check-deliverables/SKILL.md — the on-demand + point-at-target sweep.
+  - writer_gate_report.py — the maintenance-run census over what the writer
+    chokepoints already emit (OUTGATE1, 2026-09-08).
+
+RETIRED (OUTGATE1, 2026-09-08): `gate2_turn_sweep.py`, the best-effort
+same-turn `Stop`-hook runner, and `hooks/hooks.json` that wired it. M ruled
+2026-09-07 that the legacy Cowork app never runs plugin hooks — confirmed by
+BUG_2026-08-04_no-alarm-when-scheduled-surfaces-stop's sibling finding that
+the hook silently stopped emitting for two weeks and nothing noticed. Its one
+detector that this module did not already cover —
+`last_assistant_text_from_transcript` below, extracting the just-finished
+assistant turn from a Stop-hook's transcript payload — is kept here as a
+plain importable function so the capability survives the hook's removal even
+though nothing currently calls it automatically (there is no longer a hook
+to hand it a transcript path); `scan_chat_text` immediately below remains the
+manual route `check-deliverables` uses when the CEO pastes drafted text.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+# Directory name parts we never sweep: archives, backups, quarantines, caches,
+# VCS, and the system dir itself. Matched case-insensitively against each path
+# part so `_archive`, `_hq/backups`, `.system/quarantine`, `.git` are all pruned.
+_EXCLUDED_DIR_PARTS = frozenset(
+    {
+        "_archive",
+        "backups",
+        ".system",
+        "quarantine",
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        "session-notes-archive",
+    }
+)
+
+# Markdown/text deliverable extensions. The LLM hand-rolls deliverables as .md
+# (the live GATE2 re-run: a drafted email + a decision memo both escaped as .md,
+# uncaught, because the sweep only walked .docx). These get scanned too.
+_TEXT_DELIVERABLE_EXTS = (".md", ".markdown")
+
+# CONTEXT/MEMORY markdown is NOT a deliverable (CONTRACT Rule 27 model — the same
+# distinction run_no_md_deliverables_test enforces): session notes, the workspace
+# brief, memory, analytical views, build specs, voice corpus, transcripts. These
+# legitimately contain "Phase N"/substrate language and would be pure
+# false-positive noise if scanned. We scan .md only when it looks like a
+# deliverable that escaped — i.e. NOT one of these infra surfaces. The .docx walk
+# needs none of this (a .docx is a deliverable by definition).
+_INFRA_TEXT_DIR_PARTS = frozenset(
+    {
+        "build-specs",
+        ".claude",
+        ".backups",
+        "_people",
+        "views",
+        "briefings",
+        "insights",
+        "intel",
+        "transcripts",
+        "voice",
+        "meetings",
+        # SPEC FU1 D3 — live html infra clusters that are not deliverables.
+        # These also apply to the .md walk, which is desired: a template /
+        # design-library / email-template markdown is not a deliverable either.
+        "templates",
+        "design-library",
+        "email-templates",
+        # FB-plumbing item 2 — engineering docs ABOUT the system are not
+        # client deliverables. The coordinator handoff folder (`Command
+        # Room/handoffs/`) holds build handoffs / runbooks / review notes;
+        # they legitimately quote real org names inside fenced blocks and
+        # would be pure false-positive noise if voice/leak-scanned.
+        "handoffs",
+        # SPEC WALKSMALL1 Part A — same reasoning, same semantics, the build
+        # pipeline's INTAKE QUEUE (`Command Room/intake/**`). A capture is a
+        # bug report or a feature idea about this system: it quotes substrate
+        # shapes, event ids and skill internals because that is what makes it
+        # actionable, and nobody ever hands one to a client. The 2026-08-17
+        # walk produced ~14 gate FAILs (seq 9634 … 9704) whose artifacts were
+        # the walk's OWN capture files — seq 9675 is the gate failing on the
+        # capture that reported this. Internal build-pipeline material, not a
+        # deliverable.
+        "intake",
+    }
+)
+# Filename stems (case-insensitive startswith) that mark a .md as context/memory.
+_INFRA_TEXT_NAME_STEMS = (
+    "session_notes",
+    "claude",
+    "memory",
+    "readme",
+    "changelog",
+    "contract",
+    "skill",
+    "timeline",
+    "decision_log",
+    "master_tracker",
+    "relationships",
+    "dormant",
+    "themes",
+    "commitment_aging",
+    "people",
+    "business_context",
+    "project_context",
+    "project_",
+    "positioning",
+    "infrastructure",
+    "working_style",
+    "conventions",
+    "brand",
+    "start_here",
+    "future_work",
+    "testing_guide",
+    "assumptions",
+    "validation",
+    "md_deliverable_policy",
+    "voice_calibration",
+    "voice_samples",
+    "how_command_room_works",
+    "dashboard",  # SPEC FU1 D3 — a dashboard render (html/md) is infra, not a deliverable
+    # FB-plumbing item 2 — the system's own engineering-doc name families.
+    # A build/coordinator artifact is not a deliverable, wherever it lands.
+    "handoff_",        # HANDOFF_* coordinator/build handoffs
+    "review_",         # REVIEW_* build-review notes
+    "build_report_",   # BUILD_REPORT_* post-build reports
+    "substrate_",      # SUBSTRATE_* substrate/schema notes
+)
+
+# FB-plumbing item 2 — name-CONTAINS infra tokens (the stems above are
+# startswith-only). A runbook is infra no matter what precedes it in the
+# filename (e.g. `BIG_TEST_RUNBOOK_2026-07.md`), so it matches as a substring.
+_INFRA_TEXT_NAME_CONTAINS = (
+    "runbook",
+)
+
+# Skip text files larger than this — a deliverable email/memo is small; a huge
+# .md is almost certainly a log/export, not something to voice-check. (HTML has
+# its own larger cap `_MAX_HTML_BYTES` in docx_leak_scanner — self-contained
+# renders with inline CSS/data-URIs run bigger; SPEC FU1 D4.)
+_MAX_TEXT_BYTES = 2_000_000
+
+# .html/.htm deliverable extensions (SPEC FU1 D1). Premium-HTML briefs /
+# scorecards / infographics land as .html and, until FU1, the sweep never
+# re-scanned them.
+_HTML_DELIVERABLE_EXTS = (".html", ".htm")
+
+
+def _is_infra_path(path: Path) -> bool:
+    """True if a candidate path is context/memory/infra, not a deliverable.
+
+    Shared by the .md AND .html walks (SPEC FU1 D3): the dir-part and
+    name-stem lists cover both formats' infra (session notes, build specs,
+    views, intel, meetings, templates, design-library, email-templates,
+    dashboards). Applied to a walk to drop paths that would only add noise."""
+    if {p.lower() for p in path.parts} & _INFRA_TEXT_DIR_PARTS:
+        return True
+    stem = path.name.lower()
+    if any(stem.startswith(s) for s in _INFRA_TEXT_NAME_STEMS):
+        return True
+    return any(tok in stem for tok in _INFRA_TEXT_NAME_CONTAINS)
+
+
+# Back-compat alias — pre-FU1 name (the filter also served the .md-only walk).
+_is_infra_text = _is_infra_path
+
+
+def _now_iso() -> Optional[str]:
+    try:
+        from cru_match import _now_iso as _ts  # type: ignore
+
+        return _ts()
+    except Exception:
+        return None
+
+
+def _iter_candidate_files(
+    workspace_root: str | Path,
+    exts: tuple[str, ...],
+    *,
+    since_ts: Optional[float],
+    max_files: int,
+    infra_filter=None,
+) -> List[Path]:
+    """Workspace-wide walk for files ending in any of `exts`, newest first.
+
+    A hand-rolled deliverable can land ANYWHERE (the live test wrote one to the
+    Drive root), so this is a full walk minus the excluded archive/backup/cache
+    dirs. `infra_filter`, when given, drops paths it returns True for (used to
+    skip context/memory markdown). `since_ts` is a POSIX mtime floor; None →
+    every candidate (bounded by `max_files`).
+    """
+    root = Path(workspace_root)
+    if not root.exists():
+        return []
+    found: List[tuple] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune excluded dirs in-place so os.walk doesn't descend into them.
+        dirnames[:] = [
+            d for d in dirnames if d.lower() not in _EXCLUDED_DIR_PARTS
+        ]
+        for fn in filenames:
+            low = fn.lower()
+            if not any(low.endswith(e) for e in exts):
+                continue
+            if fn.startswith("~$"):  # Word lock/temp file
+                continue
+            p = Path(dirpath) / fn
+            if infra_filter is not None and infra_filter(p):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if since_ts is not None and mtime < since_ts:
+                continue
+            found.append((mtime, p))
+    found.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in found[:max_files]]
+
+
+def find_candidate_docx(
+    workspace_root: str | Path,
+    *,
+    since_ts: Optional[float] = None,
+    max_files: int = 500,
+) -> List[Path]:
+    """Walk `workspace_root` for `.docx` deliverables, newest first.
+
+    cleanup passes "7 days ago" so the weekly sweep covers freshly-produced docs
+    and never re-flags a client's old files. `max_files` is a hard cap so a huge
+    workspace can't make the sweep run away.
+    """
+    return _iter_candidate_files(
+        workspace_root, (".docx",), since_ts=since_ts, max_files=max_files
+    )
+
+
+def find_candidate_text(
+    workspace_root: str | Path,
+    *,
+    since_ts: Optional[float] = None,
+    max_files: int = 500,
+) -> List[Path]:
+    """Walk for `.md`/`.markdown` DELIVERABLES, newest first — skipping the
+    context/memory markdown (`_is_infra_text`) that would only add noise."""
+    return _iter_candidate_files(
+        workspace_root,
+        _TEXT_DELIVERABLE_EXTS,
+        since_ts=since_ts,
+        max_files=max_files,
+        infra_filter=_is_infra_text,
+    )
+
+
+def find_candidate_html(
+    workspace_root: str | Path,
+    *,
+    since_ts: Optional[float] = None,
+    max_files: int = 500,
+) -> List[Path]:
+    """Walk for `.html`/`.htm` DELIVERABLES, newest first — skipping infra html
+    (`_is_infra_path`: dashboards, templates, design-library, email-templates,
+    intel/meetings views, etc.) that would only add noise.
+
+    (SPEC FU1 D1 — premium-HTML briefs / scorecards / infographics land as
+    .html; a hand-rolled or later-edited one is invisible to the sweep until
+    it joins the walk here.)"""
+    return _iter_candidate_files(
+        workspace_root,
+        _HTML_DELIVERABLE_EXTS,
+        since_ts=since_ts,
+        max_files=max_files,
+        infra_filter=_is_infra_path,
+    )
+
+
+def find_candidate_deliverables(
+    workspace_root: str | Path,
+    *,
+    since_ts: Optional[float] = None,
+    max_files: int = 500,
+) -> List[Path]:
+    """Every candidate deliverable (.docx + deliverable-shaped .md + .html),
+    newest first. This is what the sweep walks — the LLM emits all three
+    formats. One merge point → all three consumers (cleanup, check-deliverables,
+    the Stop hook) inherit .html coverage with zero edits (SPEC FU1 D1)."""
+    merged = find_candidate_docx(
+        workspace_root, since_ts=since_ts, max_files=max_files
+    ) + find_candidate_text(
+        workspace_root, since_ts=since_ts, max_files=max_files
+    ) + find_candidate_html(
+        workspace_root, since_ts=since_ts, max_files=max_files
+    )
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    merged.sort(key=_mtime, reverse=True)
+    return merged[:max_files]
+
+
+def scan_text_file(path: str | Path) -> dict:
+    """Scan a `.md`/`.markdown` (or any plain-text) DELIVERABLE file for voice
+    tells + privacy/substrate leaks. Returns the SAME result shape as
+    `scan_docx_for_violations` (path, leaks, voice, has_violation,
+    has_voice_warn, optional error) so it flows through the sweep + summary
+    unchanged. Reads the file and runs the chat-text scanner (context="brief",
+    so markdown bullets don't false-trip). NEVER raises."""
+    path = Path(path)
+    result: dict = {
+        "path": str(path),
+        "leaks": [],
+        "voice": {"verdict": "pass", "findings": []},
+        "has_violation": False,
+        "has_voice_warn": False,
+    }
+    try:
+        if not path.exists():
+            result["error"] = f"file not found: {path}"
+            return result
+        if path.stat().st_size > _MAX_TEXT_BYTES:
+            result["error"] = f"file too large to scan: {path.name}"
+            return result
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        result["error"] = f"unreadable file ({type(e).__name__}): {path.name}"
+        return result
+    scan = scan_chat_text(text, context="brief")
+    result["leaks"] = scan["leaks"]
+    result["voice"] = scan["voice"]
+    result["has_violation"] = scan["has_violation"]
+    result["has_voice_warn"] = scan["has_voice_warn"]
+    return result
+
+
+def _scan_docx_path(p: Path) -> dict:
+    from docx_leak_scanner import scan_docx_for_violations
+
+    return scan_docx_for_violations(p)
+
+
+def _scan_html_path(p: Path) -> dict:
+    from docx_leak_scanner import scan_html_for_violations
+
+    return scan_html_for_violations(p)
+
+
+# Extension → per-format scanner registry (SPEC FU1 D6). This is the
+# "future formats join cheaply" seam. To add a format:
+#   1. add its extension tuple + `find_candidate_<fmt>` walk helper above, merged
+#      into `find_candidate_deliverables`;
+#   2. add `scan_<fmt>_for_violations(path)` in `docx_leak_scanner.py`
+#      (same result dict, never raises — route its leak step through
+#      `sweep_leak_scan` so it inherits forbidden-token + personal coverage);
+#   3. add one row here.
+# Anything not in the table falls through to `scan_text_file` (plain-text).
+_SCANNER_REGISTRY = {
+    ".docx": _scan_docx_path,
+    ".html": _scan_html_path,
+    ".htm": _scan_html_path,
+}
+
+
+def scan_path_for_violations(path: str | Path) -> dict:
+    """Dispatch a single path to the right scanner by extension via
+    `_SCANNER_REGISTRY`: `.docx` reads the rendered document, `.html`/`.htm`
+    read the rendered page (visible text + link targets), everything else is
+    treated as a plain-text deliverable. Never raises (the scanners swallow
+    internally; the caller also belts)."""
+    p = Path(path)
+    scanner = _SCANNER_REGISTRY.get(p.suffix.lower())
+    if scanner is not None:
+        return scanner(p)
+    return scan_text_file(p)
+
+
+def sweep_paths(paths: List[str | Path]) -> List[dict]:
+    """Run the right scanner over each path (docx or text). Returns ONLY the
+    results that carry something worth surfacing: a leak, a fail/warn voice tell,
+    or a read error. Clean files are dropped (no false-positive noise). Never
+    raises."""
+    flagged: List[dict] = []
+    for p in paths:
+        try:
+            r = scan_path_for_violations(p)
+        except Exception as e:  # belt — the scanners already swallow internally
+            r = {"path": str(p), "error": f"scan failed ({type(e).__name__})",
+                 "leaks": [], "voice": {"verdict": "pass", "findings": []},
+                 "has_violation": False, "has_voice_warn": False}
+        if r.get("has_violation") or r.get("has_voice_warn") or r.get("error"):
+            flagged.append(r)
+    return flagged
+
+
+# Back-compat alias for docx-era callers; the body now dispatches by extension.
+def sweep_docx_paths(paths: List[str | Path]) -> List[dict]:
+    return sweep_paths(paths)
+
+
+def scan_chat_text(text: str, *, context: str = "email") -> dict:
+    """SPEC GATE2 D4 — scan a chat-rendered deliverable body (an email or a memo
+    drafted as chat prose) for voice tells AND privacy/substrate leaks.
+
+    Returns {"leaks": [...], "voice": {...}, "has_violation": bool,
+             "has_voice_warn": bool}. Never raises."""
+    out = {
+        "leaks": [],
+        "voice": {"verdict": "pass", "findings": []},
+        "has_violation": False,
+        "has_voice_warn": False,
+    }
+    if not text:
+        return out
+    try:
+        # SPEC FU1 M-2 — the flag-only sweep leak scan (forbidden tokens +
+        # personal-lane substrate fingerprints, surface-less). Covers the .md
+        # sweep path (scan_text_file → here) and the Stop-hook chat scan.
+        from docx_leak_scanner import sweep_leak_scan
+
+        out["leaks"] = sweep_leak_scan(text)
+    except Exception:
+        out["leaks"] = []
+    try:
+        from voice_tell_detector import scan_text
+
+        out["voice"] = scan_text(text, context=context)
+    except Exception:
+        out["voice"] = {"verdict": "pass", "findings": []}
+    vf = out["voice"].get("findings", [])
+    out["has_voice_warn"] = any(f.get("severity") == "warn" for f in vf)
+    out["has_violation"] = bool(out["leaks"]) or any(
+        f.get("severity") == "fail" for f in vf
+    )
+    return out
+
+
+def last_assistant_text_from_transcript(transcript_path: str | Path | None) -> str:
+    """Extract the just-finished assistant turn's text from a Stop-hook style
+    transcript JSONL (SPEC GATE2 D4's chat-prose path, folded in from the
+    retired `gate2_turn_sweep.py` — OUTGATE1, 2026-09-08).
+
+    A memo/email drafted entirely as chat text (no skill fired, no .docx
+    saved) never reaches a file, so a file sweep can't see it; when a caller
+    DOES have a transcript path (a Stop hook's own payload, historically —
+    there is no automatic caller today since hooks are retired), this is how
+    it recovers the text to hand to `scan_chat_text`.
+
+    Defensive across transcript shapes: content as a string or a list of
+    `{type: text, text: ...}` blocks. Returns `""` on any problem — a missing
+    path, an unreadable file, a transcript with no assistant turn — never
+    raises."""
+    if not transcript_path:
+        return ""
+    try:
+        p = Path(transcript_path)
+        if not p.is_file():
+            return ""
+        last_text = ""
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") not in ("assistant", None) and entry.get(
+                "role"
+            ) not in ("assistant", None):
+                continue
+            msg = entry.get("message") if isinstance(entry.get("message"), dict) else entry
+            if (msg.get("role") or entry.get("type")) != "assistant":
+                continue
+            content = msg.get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text") or "")
+                    elif isinstance(block, str):
+                        parts.append(block)
+                text = "\n".join(parts)
+            if text.strip():
+                last_text = text  # keep the most recent assistant text
+        return last_text
+    except Exception:
+        return ""
+
+
+# Phase 6 Quick Win A — filename → producing-skill attribution for the voice
+# corrections feed. Best-effort: a well-attributed tell trains the right skill's
+# voice block; an unrecognized deliverable falls to the generic "deliverables"
+# corpus (read by the `learning` job's corrections-*.jsonl glob). Never a
+# user write.
+_SKILL_FILENAME_HINTS = (
+    ("call_prep", "call-prep"),
+    ("call prep", "call-prep"),
+    ("board_pack", "board-pack-assembler"),
+    ("board pack", "board-pack-assembler"),
+    ("one_pager", "one-pager-composer"),
+    ("one pager", "one-pager-composer"),
+    ("memo", "memo-writer"),
+    ("insights", "insight-generator"),
+    ("operator", "operator-report"),
+    ("decision_memo", "decision-memo-composer"),
+    ("board_minutes", "board-pack-assembler"),
+)
+
+# Map a voice-tell rule id to a correction_type bucket so the voice leg groups these
+# alongside user edit-corrections. Voice tells are all "banned phrasing" for the
+# purposes of the corpus — the offending phrase is the pattern to stop using.
+_VOICE_RULE_TO_TYPE = {
+    "structural_em_dash_pileup": "structure",
+    "structural_tri_colon": "structure",
+    "structural_bullets_in_email": "structure",
+    "structural_hedging_stack": "tone",
+}
+
+
+def _infer_skill_from_path(path: str) -> str:
+    name = Path(path or "").name.lower()
+    for token, skill in _SKILL_FILENAME_HINTS:
+        if token in name:
+            return skill
+    return "deliverables"
+
+
+def _document_ref(workspace_root: str | Path, path: str) -> Optional[str]:
+    """A stable reference to one produced document: its path inside the
+    workspace, so it reads the same wherever the folder is synced to. The
+    extension is dropped because one document can render as a .docx and an
+    .html side by side, and that is still one document."""
+    if not path:
+        return None
+    root = Path(workspace_root).resolve()
+    full = (Path(path) if Path(path).is_absolute() else root / path).resolve()
+    full = full.with_suffix("")
+    try:
+        return "doc:" + full.relative_to(root).as_posix()
+    except ValueError:
+        return "doc:" + full.as_posix()
+
+
+def feed_voice_corrections(workspace_root: str | Path, result: dict) -> int:
+    """Quick Win A — append each FAIL-severity voice tell found in a produced
+    deliverable to the relevant `corrections-<skill>.jsonl`, giving
+    the `learning` job's voice leg more training data for free. FLAG-ONLY: this never
+    edits, moves, or rewrites the user's deliverable — it only appends a
+    CR-owned correction row under `_hq/voice/` (same class as the findings
+    record). The offending phrase is stored as `original` with an empty
+    `corrected` (there is no user rewrite to compare against — the signal is
+    "this tell was produced; stop using it"), so the voice leg can ban it. Each
+    row carries its document as `draft_ref`: a re-sweep of one file counts once,
+    and the same tell in three documents reaches the per-phrase floor.
+    Privacy/substrate leaks are NOT fed here — they are not a voice pattern and
+    stay flag-only. Returns the number of rows written. NEVER raises."""
+    written = 0
+    try:
+        from voice_corrections import append_correction
+    except Exception:
+        return 0
+    for f in result.get("flagged", []) or []:
+        findings = (f.get("voice") or {}).get("findings") or []
+        fails = [x for x in findings if x.get("severity") == "fail"]
+        if not fails:
+            continue
+        skill = _infer_skill_from_path(f.get("path", ""))
+        ref = _document_ref(workspace_root, f.get("path", ""))
+        seen = set()
+        for x in fails:
+            phrase = (x.get("match") or "").strip()
+            if not phrase or phrase.lower() in seen:
+                continue
+            seen.add(phrase.lower())
+            ctype = _VOICE_RULE_TO_TYPE.get(x.get("rule", ""), "phrasing")
+            try:
+                if append_correction(
+                    workspace_root,
+                    skill=skill,
+                    domain="deliverable",
+                    recipient_id=None,
+                    original=phrase,
+                    corrected="",
+                    correction_type=ctype,
+                    notes=f"check-deliverables: {x.get('rule', 'voice_tell')} "
+                          f"in {Path(f.get('path', '')).name}",
+                    draft_ref=ref,
+                ):
+                    written += 1
+            except Exception:
+                continue
+    return written
+
+
+def sweep_workspace(
+    workspace_root: str | Path,
+    *,
+    since_ts: Optional[float] = None,
+    emit: bool = True,
+    source: str = "sweep",
+) -> dict:
+    """Find + scan every candidate .docx under the workspace. FLAG-only.
+
+    Returns:
+      {"scanned": int, "flagged": [ <scan result>, ... ],
+       "violation_count": int, "warn_count": int, "error_count": int}
+
+    When `emit` is True and at least one file was scanned, appends a best-effort
+    `gate_ran` event (`surface=<source>`) so the result is detectable in
+    substrate — the cheap complement to the gate_ran join (D5)."""
+    candidates = find_candidate_deliverables(workspace_root, since_ts=since_ts)
+    flagged = sweep_paths(candidates)
+    violation_count = sum(1 for f in flagged if f.get("has_violation"))
+    warn_count = sum(
+        1 for f in flagged if f.get("has_voice_warn") and not f.get("has_violation")
+    )
+    error_count = sum(1 for f in flagged if f.get("error"))
+    result = {
+        "scanned": len(candidates),
+        "flagged": flagged,
+        "violation_count": violation_count,
+        "warn_count": warn_count,
+        "error_count": error_count,
+    }
+    if emit and candidates:
+        _emit_sweep_event(workspace_root, result, source=source)
+        _write_findings_record(workspace_root, result, source=source)
+        feed_voice_corrections(workspace_root, result)  # Quick Win A
+    return result
+
+
+def sweep_targets(
+    paths: List[str | Path],
+    *,
+    workspace_root: Optional[str | Path] = None,
+    emit: bool = False,
+    source: str = "on_demand_targets",
+) -> dict:
+    """Scan an EXPLICIT list of files (the on-demand 'scan this' path), returning
+    the same result shape as `sweep_workspace` so `summarize_for_user` consumes
+    it unchanged. FLAG-only + read-only. Telemetry (gate_ran + findings record)
+    is written only when `emit` and `workspace_root` are both given."""
+    paths = list(paths)
+    flagged = sweep_paths(paths)
+    violation_count = sum(1 for f in flagged if f.get("has_violation"))
+    warn_count = sum(
+        1 for f in flagged if f.get("has_voice_warn") and not f.get("has_violation")
+    )
+    error_count = sum(1 for f in flagged if f.get("error"))
+    result = {
+        "scanned": len(paths),
+        "flagged": flagged,
+        "violation_count": violation_count,
+        "warn_count": warn_count,
+        "error_count": error_count,
+    }
+    if emit and workspace_root and flagged:
+        _emit_sweep_event(workspace_root, result, source=source)
+        _write_findings_record(workspace_root, result, source=source)
+        feed_voice_corrections(workspace_root, result)  # Quick Win A
+    return result
+
+
+def _emit_sweep_event(workspace_root: str | Path, result: dict, *, source: str) -> None:
+    """Best-effort detectable signal. Reuses the existing `gate_ran` enum member
+    (no schema change) with surface=<source>; the verify loop / cleanup can join
+    against deliverable events. NEVER raises."""
+    try:
+        from atomic_write import atomic_append_jsonl as _append  # type: ignore
+    except Exception:
+        return
+    ts = _now_iso()
+    try:
+        events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+        # UNIFIED gate_ran shape (FB-plumbing item 1): carry `artifact` — the
+        # basename(s) of the docs this sweep flagged — alongside the `result`
+        # this emitter already wrote. Same {result, artifact:[…]} contract the
+        # brief_writer emitter now honors, so a reader never has to guess which
+        # gate_ran shape it holds. Names only (never the user's full path).
+        artifacts = [
+            Path(f.get("path", "")).name
+            for f in (result.get("flagged") or [])
+            if f.get("path")
+        ]
+        ev = {
+            "type": "gate_ran",
+            "source_skill": "deliverable_sweep",
+            "data": {
+                "surface": source,
+                "gates": ["voice", "leak"],
+                "result": "fail" if result["violation_count"] else "pass",
+                "artifact": artifacts,
+                "scanned": result["scanned"],
+                "violation_count": result["violation_count"],
+                "warn_count": result["warn_count"],
+                "error_count": result["error_count"],
+            },
+        }
+        if ts:
+            ev["ts"] = ts
+        _append(events_path, [ev], holder="deliverable_sweep.gate_ran")
+    except Exception:
+        pass
+
+
+def _write_findings_record(workspace_root: str | Path, result: dict, *, source: str) -> None:
+    """Write a durable findings record to the CR-owned system dir so the flags
+    survive the turn (the Stop hook's stdout may not reach the user in every
+    runtime). Writes ONLY under `_hq/.system/gate2_findings/`. NEVER raises and
+    NEVER touches a user file."""
+    if not result["flagged"]:
+        return
+    try:
+        import json
+
+        out_dir = Path(workspace_root) / "_hq" / ".system" / "gate2_findings"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = (_now_iso() or "unknown").replace(":", "").replace(" ", "_")
+        rec = {
+            "ts": _now_iso(),
+            "source": source,
+            "scanned": result["scanned"],
+            "violation_count": result["violation_count"],
+            "warn_count": result["warn_count"],
+            "error_count": result["error_count"],
+            # Store basenames + findings only — never the user's full content.
+            "flagged": [
+                {
+                    "doc": Path(f.get("path", "")).name,
+                    "leaks": sorted({x["match"] for x in f.get("leaks", [])}),
+                    "voice": sorted(
+                        {x["rule"] for x in f.get("voice", {}).get("findings", [])}
+                    ),
+                    "error": f.get("error"),
+                }
+                for f in result["flagged"]
+            ],
+        }
+        (out_dir / f"{ts}-{source}.json").write_text(
+            json.dumps(rec, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+# ---- Plain-English surfacing (CONTRACT Rule 4 safe — no paths, no jargon) ----
+
+def _why_phrase(f: dict) -> str:
+    """One human phrase describing what's wrong with a flagged doc. No internal
+    token names, no `_hq/` paths — just what a CEO would understand."""
+    if f.get("error"):
+        return "couldn't be checked (the file wouldn't open)"
+    bits = []
+    leaks = sorted({x["match"] for x in f.get("leaks", [])})
+    if leaks:
+        # Surface the literal offending words — that's the actionable part for a
+        # rewrite — but cap the list so the note stays tight.
+        shown = ", ".join(repr(w) for w in leaks[:4])
+        more = f" +{len(leaks) - 4} more" if len(leaks) > 4 else ""
+        bits.append(f"language that doesn't sound like you ({shown}{more})")
+    voice_rules = {x["rule"] for x in f.get("voice", {}).get("findings", [])}
+    if any(r.startswith("opener_") or r.startswith("filler_") or r.startswith("closer_") or r.startswith("preamble_") for r in voice_rules):
+        bits.append("a generic-assistant phrase")
+    if "structural_tri_colon" in voice_rules:
+        bits.append("a colon-chained construction that reads as AI-written")
+    if "structural_em_dash_pileup" in voice_rules:
+        bits.append("an em-dash pile-up")
+    if not bits:
+        bits.append("a possible voice tell")
+    return " + ".join(bits)
+
+
+def summarize_for_user(result: dict, *, max_docs: int = 5) -> Optional[str]:
+    """Plain-English summary for the cleanup Monday note / Stop-hook surface.
+
+    Returns None when there's nothing to flag (clean sweep). Otherwise a short,
+    forward-action paragraph naming docs by FILENAME only — no `_hq/` paths, no
+    internal token names beyond the literal offending words the CEO can search
+    for. NEVER includes event-type names or version refs (CONTRACT Rule 4)."""
+    flagged = result.get("flagged") or []
+    if not flagged:
+        return None
+    lines = []
+    real = [f for f in flagged if f.get("has_violation") or f.get("error")]
+    target = real or flagged
+    n = len(target)
+    head = (
+        f"{n} document{'s' if n != 1 else ''} produced recently didn't pass the "
+        f"quality gate — worth a glance before any of them go out:"
+    )
+    lines.append(head)
+    for f in target[:max_docs]:
+        doc = Path(f.get("path", "")).name or "a document"
+        lines.append(f"• {doc} — {_why_phrase(f)}")
+    if n > max_docs:
+        lines.append(f"• …and {n - max_docs} more")
+    return "\n".join(lines)
+
+
+# ---- gate_ran join (SPEC GATE2 D5 / GATE1 §3b standing detector) ----
+
+# Deliverable events that SHOULD have routed through a render chokepoint —
+# brief_writer.make_brief (gate_ran surface="docx") or, since SPEC OUT5,
+# premium_html.make_premium_brief (surface="premium_html"; board_pack /
+# one_pager / value_receipt are launch kinds a profile can flip to HTML). A
+# deliverable event in the window with no matching gated-render event is a
+# suspected bypass (the composer hand-rolled the doc, dodging the save-time
+# gates). This is the cheap complement to the content sweep — it can't see a
+# hand-rolled doc that emitted NO deliverable event either, which is exactly
+# why scan-the-file (D2) is primary.
+_GATED_DELIVERABLE_EVENTS = frozenset(
+    {
+        "one_pager_drafted",
+        "memo_drafted",
+        "decision_memo_drafted",
+        "board_pack_assembled",
+        "followup_pack_drafted",
+        "operator_report_generated",
+        "value_receipt_generated",
+    }
+)
+
+
+def detect_gate_bypass(
+    workspace_root: str | Path, *, since_ts: Optional[float] = None
+) -> dict:
+    """Join deliverable events against gated-render gate_ran events (surface
+    "docx" or "premium_html" — both chokepoints run the same stack, SPEC OUT5)
+    over a window.
+
+    Returns {"deliverables": int, "docx_gate_ran": int, "suspected_bypass": int,
+             "by_type": {<event_type>: count}}. `docx_gate_ran` keeps its
+             pre-OUT5 name for reader stability but counts BOTH deliverable
+             surfaces. A positive suspected_bypass count means more gated-
+             deliverable events were produced than gated renders ran — i.e.
+             some deliverable skipped the chokepoints. FLAG-only; never
+             raises."""
+    import json
+
+    result = {
+        "deliverables": 0,
+        "docx_gate_ran": 0,
+        "suspected_bypass": 0,
+        "by_type": {},
+    }
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    if not events_path.exists():
+        return result
+
+    def _ts_ok(ev) -> bool:
+        if since_ts is None:
+            return True
+        try:
+            from event_time import event_time
+        except ImportError:  # pragma: no cover
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from event_time import event_time
+        ts = event_time(ev)
+        if not ts:
+            return True  # undated event — don't exclude it
+        try:
+            from datetime import datetime, timezone
+
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp() >= since_ts
+        except Exception:
+            return True
+
+    deliverables = 0
+    docx_gate_ran = 0
+    by_type: Dict[str, int] = {}
+    try:
+        from events_io import merged_lines as _merged_lines  # cr1#1061: every computer's log
+        for line in _merged_lines(events_path, encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue  # defensive — tolerate a malformed line
+            if not isinstance(ev, dict):
+                continue
+            etype = ev.get("type")
+            if etype in _GATED_DELIVERABLE_EVENTS and _ts_ok(ev):
+                deliverables += 1
+                by_type[etype] = by_type.get(etype, 0) + 1
+            elif etype == "gate_ran" and _ts_ok(ev):
+                if (ev.get("data") or {}).get("surface") in ("docx", "premium_html"):
+                    docx_gate_ran += 1
+    except Exception:
+        return result
+
+    result["deliverables"] = deliverables
+    result["docx_gate_ran"] = docx_gate_ran
+    result["suspected_bypass"] = max(0, deliverables - docx_gate_ran)
+    result["by_type"] = by_type
+    return result
+
+
+__all__ = [
+    "find_candidate_docx",
+    "find_candidate_text",
+    "find_candidate_html",
+    "find_candidate_deliverables",
+    "scan_text_file",
+    "scan_path_for_violations",
+    "sweep_docx_paths",
+    "sweep_paths",
+    "sweep_targets",
+    "scan_chat_text",
+    "last_assistant_text_from_transcript",
+    "sweep_workspace",
+    "summarize_for_user",
+    "detect_gate_bypass",
+]
+
+
+def _main(argv: List[str]) -> int:
+    """CLI: `deliverable_sweep.py <workspace_root> [--days N] [--no-emit]`.
+    Prints the plain-English summary (or 'clean'). Exit 0 always (flag-only)."""
+    import time
+
+    if not argv:
+        print("usage: deliverable_sweep.py <workspace_root> [--days N] [--no-emit]",
+              file=sys.stderr)
+        return 2
+    workspace_root = argv[0]
+    since_ts = None
+    emit = True
+    i = 1
+    while i < len(argv):
+        if argv[i] == "--days" and i + 1 < len(argv):
+            since_ts = time.time() - float(argv[i + 1]) * 86400
+            i += 2
+        elif argv[i] == "--no-emit":
+            emit = False
+            i += 1
+        else:
+            i += 1
+    result = sweep_workspace(workspace_root, since_ts=since_ts, emit=emit)
+    summary = summarize_for_user(result)
+    if summary is None:
+        print(f"clean — scanned {result['scanned']} document(s), nothing to flag")
+    else:
+        print(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    raise SystemExit(_main(sys.argv[1:]))

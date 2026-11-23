@@ -1,0 +1,361 @@
+{
+  "_comment": "SPEC EVT1 — per-type `data` payload shapes for the load-bearing event types. events.schema.json constrains only the `type` enum; `data` was free-form, so two skills could emit the same type with different shapes and readers crashed or silently dropped fields. This is a CUSTOM mini-schema (no jsonschema dependency): each type maps to {required, properties, description}. `required` is a list of ALIAS-GROUPS — a group is satisfied if ANY key in it is present (absorbs the documented drift: due~due_date, status~state, owner~owner_id~owner_person_id, the resolver closer-id chain). `properties` type-checks declared keys when present. Unknown keys are always allowed (permissive forward-compat). Enforced WARN-ONLY at write time (never blocks); promotion to blocking is a later release after a zero-warning burn-in. Canonical for the consumers in cru_match.py / brief_state.py / value_receipt.py / render_decision_log.py.",
+
+  "commitment": {
+    "description": "An open promise. Aliases tolerated by cru_match._commitment_field: due~due_date, status~state, owner_id~owner_person_id~owner, id (minted cmt_<ulid> at write time by the append gate when absent; read by _commitment_id). kind (promise|task|scheduling|agenda) is REQUIRED AT CAPTURE (Stage D; strict path rejects, legacy path warns+stamps promise). Stage E receipts: counterparty_id (REQUIRED when determinable — feeds the CRU candidacy gate; retires requester_* for new writes) + counterparty_name (free-text fallback). Closers reference it via data.commitment_id. ATTRIB1-A (2026-09-02, additive; optional on every legacy row): on a meeting capture `attribution` is the typed basis {transcript_class, owner_basis, counterparty_basis, span, turn} written by meeting_capture.derive_attribution — `pending_review` is DERIVED from it (owner_basis unknown, or a promise whose counterparty_basis is unknown, or a floor/fusion refusal, or classification_confidence below the surface floor; meeting_capture.derive_pending_review is the only rule); `floor_code` is the FLOOR_* code on every floor-gated row (D5); `fusion_status` is verified|refused|inert on every row (D7); `capture_contract_violation` is the note a row carries when its caller asked for a flag value the basis does not support (DD-4 — the derived value stands).",
+    "required": [["title"]],
+    "properties": {"owed_direction": "string", "owed_direction_owner": "string", "owed_direction_user": "string", "title": "string", "id": "string", "kind": "string", "due": "string", "due_date": "string", "no_due": "boolean", "status": "string", "state": "string", "owner_id": "string", "owner_person_id": "string", "owner": "string", "counterparty_id": "string", "counterparty_name": "string", "source_ref": "string", "pending_review": "boolean", "review_reason": "string", "suspected_duplicate_of": "string", "suspected_duplicate_score": "number", "attribution": "object", "floor_code": "string", "fusion_status": "string", "capture_contract_violation": "string", "evidence_kind": "string", "self_counterparty_stripped": "boolean", "speech_act": "string"}
+  },
+  "visual_gate": {
+    "description": "Render-then-critique audit (SPEC OUT2 §3): one event per STANDARD_KINDS .docx the visual pass examined (or tried to). data.doc = the deliverable path; rendered = whether the preview ladder (Word COM → soffice → None) produced PNGs; findings = the 7-item-checklist hits the skill saw on the rendered pages (empty when clean OR when skipped); fixed = whether the at-most-once fix-and-resave ran. skipped_reason present when rendered=false explains the skip (e.g. 'no renderer on this machine' — Cowork sandboxes may lack both renderers; the skipped path must be detectable, not invisible). WARN-ONLY FOREVER at the code layer — the gate is judgment, not schema. Written ONLY via visual_gate.log_visual_gate; mined by usage-report / insight-generator to prove the gate fires.",
+    "required": [["doc"], ["rendered"]],
+    "properties": {"doc": "string", "rendered": "boolean", "findings": "array", "fixed": "boolean", "skipped_reason": "string", "brief_kind": "string"}
+  },
+  "commitment_observed": {
+    "description": "A set-aside capture (v4.6.1 W4c observed tier): a commitment-shaped item the relevance gate kept on file WITHOUT opening — third-party↔third-party, or attribution the extraction could not confidently resolve (amber). Deliberately a SEPARATE type from commitment so every open-set reader excludes it by construction (no count, no triage row, no confirm row, no chase, no CRU candidacy — the W4a reminder-lane doctrine). Searchable; feeds prep context (capture_gate.prep_context_observed); promotable into the confirm flow via capture_gate.promote_observed, which appends a REAL commitment with pending_review:true + promoted_from pointing back here. data.id is deterministic obs_<sha256[:12]>(source_ref|title) so re-scans are idempotent. Written ONLY via capture_gate.build_observed_event / observed_from_commitment_event (the builder refuses due-date/money items — the asymmetric caution rail opens those instead).",
+    "required": [["title"], ["source_ref"]],
+    "properties": {"title": "string", "id": "string", "tier": "string", "observed_reason": "string", "kind": "string", "owner_id": "string", "owner_external": "string", "counterparty_id": "string", "counterparty_name": "string", "source_ref": "string", "evidence": "string", "channel": "string", "dedup_hash": "string", "session_id": "string", "no_due": "boolean", "attribution": "object", "floor_code": "string", "fusion_status": "string", "working_session": "boolean", "evidence_kind": "string", "self_counterparty_stripped": "boolean", "speech_act": "string"}
+  },
+  "commitment_superseded": {
+    "description": "Closes a DUPLICATE commitment in favor of a survivor (v4.6.0 C4 — the merge verb) OR closes a SPLIT original in favor of its parts (v4.6.0 S4 — the split verb; data.split_into lists the child commitment ids and superseded_by names the first child). WRITTEN ONLY via commitment_state.supersede_commitment() / commitment_state.split_commitment() (same guard set as close_commitment: id normalization, loud no-match, idempotency, pending_review floor — merging/splitting adjudicates the item, so user_confirmed is required for flagged items, lock-spanned scan->append). The projector honors it as a closer through the standard closer-id chain (data.commitment_id + the commitment_seq F3 seq alias reference the SUPERSEDED item) and, for MERGES ONLY (no split_into), folds data.merged_source_refs / the superseded id onto the SURVIVOR's in-memory copy (data.superseded_by) — provenance union, history never rewritten; split children instead carry their own data.source_event_seq / data.split_from provenance at write time. Suspects are flagged at capture by commitment_dedup (data.suspected_duplicate_of on the commitment event); the flag never closes anything by itself.",
+    "required": [["commitment_id", "commitment_seq"], ["superseded_by"]],
+    "properties": {"commitment_id": "string", "commitment_seq": "number", "superseded_by": "string", "survivor_seq": "number", "resolved_by": "string", "evidence": "string", "resolution": "string", "merged_source_refs": "array", "split_into": "array"}
+  },
+  "commitment_updated": {
+    "description": "Records a change to an OPEN commitment — the item stays open. Four writer families: the orchestrator `push to [date]` verb (data.new_due — the projector folds the latest into the effective due), the CRU schedule-shift path (data.change_summary + evidence, informational prose describing WHAT changed — never folded into wording), the S4 `fix wording` verb via commitment_state.edit_commitment_wording (data.new_title / data.new_summary — the projector folds the latest of each into the projected item's title/summary; the original stays in history, append-only), and the v4.6.1 W4b confirm-flow adjudications via commitment_state.confirm_commitment_owner (Mine: data.owner_confirmed true + data.new_owner_id — the projector folds ownership and clears pending_review) / commitment_state.clear_review_flags (Keep both: data.review_flags_cleared true — the projector clears pending_review + the C4 suspected_duplicate flags read-side); adjudication folds are append-order-aware against commitment_reassigned. WATCHGATE adds a fifth family: watch_gate.park_in_watch (data.watch_set true + the data.watch object — the projector stamps it onto the projection) / watch_gate.clear_watch (data.watch_cleared true — the projector removes it); WATCHING is additive data on an item that stays status open, never a new status value, so no reader loses a watched item. SPEC OVERDUE1 adds a sixth: commitment_state.mark_asked (data.asked_set true + the data.asked object {surface, asked_at, due_at_ask} — the projector stamps it onto the projection) / commitment_state.clear_asked (data.asked_cleared true — the projector removes it). It is the watch pair's twin, ADDITIVE the same way and status-free the same way, with one difference: any update carrying a substantive key (commitment_activity.SUBSTANTIVE_UPDATE_KEYS) ALSO clears the asked fold, because such an update is the user answering the question the mark records. Neither the asked pair nor the watch pair counts as MOVEMENT (commitment_activity._is_bookkeeping_update), so noticing that an item has gone quiet never resets the clock measuring how quiet it has been. Updates that carry none of new_due/new_title/new_summary/owner_confirmed/review_flags_cleared/watch_set/watch_cleared/asked_set/asked_cleared are informational and affect no fold.",
+    "required": [["commitment_id", "target_id"]],
+    "properties": {"new_owed_direction": "string", "new_owed_direction_owner": "string", "new_owed_direction_user": "string", "commitment_id": "string", "target_id": "string", "commitment_seq": "number", "new_due": "string", "due": "string", "due_date": "string", "new_title": "string", "new_summary": "string", "change_summary": "string", "evidence": "string", "reason": "string", "edited_by": "string", "new_owner_id": "string", "new_owner_name": "string", "owner_confirmed": "boolean", "review_flags_cleared": "boolean", "pending_review": "boolean", "confirmed_by": "string", "cleared_by": "string", "note": "string", "watch_set": "boolean", "watch_cleared": "boolean", "watch": "object", "asked_set": "boolean", "asked_cleared": "boolean", "asked": "object"}
+  },
+  "person_proposal_resolved": {
+    "description": "Adjudicates a person_proposal / person_update_proposal (v4.6.1 W4b — the proposal tombstone; the F-46 P2b stranding fix). WRITTEN ONLY via confirm_flow.build_person_proposal_resolved_event + event_gate.append_event, from the confirm section's Add person (resolution person_added, after people_writer.create_person), Same as [existing] (resolution same_as, after people_writer.add_person_alias), or Not relevant (resolution not_relevant, nothing else written — permanent, not a timed mute). data.proposal_seq references the proposal event's seq; confirm_flow.load_open_person_proposals stops re-surfacing any proposal a tombstone references. PID1 D8: a SEQ-LESS proposal (freelance-written seq:null) is referenced by data.proposal_fingerprint (confirm_flow.compute_proposal_fingerprint) instead — the alias group below absorbs that shape; int-seq stays preferred.",
+    "required": [["proposal_seq", "proposal_fingerprint"], ["resolution"]],
+    "properties": {"proposal_seq": "number", "proposal_fingerprint": "string", "resolution": "string", "person_id": "string", "alias": "string", "note": "string"}
+  },
+  "commitment_reassigned": {
+    "description": "Routes a commitment to a different owner or counterparty (v4.6.0 S4 — 'not mine' used to DISCARD; reassign ROUTES). WRITTEN ONLY via commitment_state.reassign_commitment() (id normalization, loud no-match, refuses closed items). At least one of new_owner_id / new_counterparty_id is required. data.confirmed marks an explicit user action (the W4b Theirs->[name] confirm verb, or the user naming the person in chat); the projector folds the latest reassignment into the projected item's owner_id/counterparty_id and — when confirmed is NOT true — stamps pending_review so the item sits in the unconfirmed bucket and never enters chase until confirmed (the W4b no-auto-email-on-a-guessed-owner guardrail). TTL1 fix round 1 (reviewer F-11) — the required group now admits `counterparty_restored`, which is the ONE id-less shape `event_gate` 4b has always admitted (POLICY1-B F-9: `commitment_state.restore_counterparty` putting a counterparty back to NONE, stamping `counterparty_cleared` + `counterparty_restored` with `new_counterparty_id: null`). The gate permitted it and this schema did not, so every such reversal printed a payload warning about a legal event — rare until TTL1 made the card default a DAILY act, then routine, and a warning that fires on correct behaviour is one nobody reads when it fires on a real defect. `actor_kind` is ATTRIB2's additive stamp.",
+    "required": [["commitment_id", "commitment_seq"], ["new_owner_id", "new_counterparty_id", "counterparty_restored"]],
+    "properties": {"new_owed_direction": "string", "new_owed_direction_owner": "string", "new_owed_direction_user": "string", "commitment_id": "string", "commitment_seq": "number", "new_owner_id": "string", "new_counterparty_id": "string", "new_owner_name": "string", "new_counterparty_name": "string", "prior_counterparty_id": "string", "prior_counterparty_name": "string", "counterparty_restored": "boolean", "counterparty_cleared": "boolean", "reason": "string", "reassigned_by": "string", "actor_kind": "string", "confirmed": "boolean"}
+  },
+  "chat_reconcile": {
+    "description": "ONE receipt per chat-closure fire (SPEC CHATSCAN1 §B — the `reconcile-chat` job inside the `maintenance` task, beside `reconcile-sent`). WRITTEN ONLY via chat_reconcile._log_receipt -> receipts.log_receipt; never hand-built. Deliberately NOT `sent_reconcile`: that type's validator reads `the latest one`, so sharing it would let the chat leg vouch for a mail leg that never fired. Written on every terminal state — skipped (no chat backend declared), blocked (a declared backend whose read could not happen; the cursor never advances over an unread window), degraded (a real run on the partial per-conversation path, carrying scan_mode + a plain-language coverage_note), complete — because a leg that stays silent when it does not run cannot be told apart from one that swept everything and found nothing. Counts are what was WRITTEN, never the plan: n_scanned is the denominator, n_candidates shows the relevance bound actually ran, and n_refused_no_pointer counts closes REFUSED for want of an auditable pointer (a non-zero value is the fence working).",
+    "required": [["task_id"], ["status"]],
+    "properties": {
+      "task_id": "string",
+      "kind": "string",
+      "status": "string",
+      "fired_via": "string",
+      "provider": "string",
+      "scan_mode": "string",
+      "degraded": "boolean",
+      "coverage_note": "string",
+      "scan_limits": "object",
+      "cursor_from": "string",
+      "cursor_to": "string",
+      "skip_reason": "string",
+      "blocked_reason": "string",
+      "n_scanned": "number",
+      "n_dropped_bad_ts": "number",
+      "n_deferred": "number",
+      "deferred_from_ts": "string",
+      "cursor_advanced_over_partial_sweep": "boolean",
+      "n_candidates": "number",
+      "n_candidates_over_cap": "number",
+      "n_closed": "number",
+      "n_proposed": "number",
+      "n_refused_no_pointer": "number"
+    }
+  },
+  "chat_dismissal_cleared": {
+    "description": "Unmutes a live chat_dismissal before its TTL expires (v4.6.0 S4 mute ledger — mutes stop being a one-way door). WRITTEN ONLY via mute_ledger.clear_dismissal() / clear_dismissals() (loud no-match on an unknown dismissal_seq, idempotent over already-inactive dismissals). References the dismissal by data.dismissal_seq (preferred — the chat_dismissal event's seq) or by data.target_id / data.fingerprint (clears every dismissal with that identity written BEFORE the clear). A clear carrying data.seq_only true (an undo's clear, written by clear_dismissal(as_undo=True), cr1#1364) lifts ONLY the dismissal at data.dismissal_seq: its target_id / fingerprint are kept for attribution and clear nothing else. Readers of chat_dismissal MUST honor it: a dismissal followed by a matching clear is INACTIVE regardless of remaining TTL (mute_ledger.live_mutes / active_dismissal_target_ids are the canonical readers).",
+    "required": [["dismissal_seq", "target_id", "fingerprint"]],
+    "properties": {"dismissal_seq": "number", "target_id": "string", "fingerprint": "string", "cleared_by": "string", "reason": "string", "via": "string", "seq_only": "boolean"}
+  },
+  "commitment_resolved": {
+    "description": "Closes a commitment. WRITTEN ONLY via commitment_state.close_commitment() (Phase 2 Stage B, F2 — the single closure path: id normalization, loud no-match, full-set idempotency, pending_review floor). References the commitment via one of the closer-id aliases (cru_match closer chain): commitment_id~thread_id~id~target_id, or a seq alias (commitment_seq~source_event_seq, F3 amnesty chain). The append gate REJECTS closures carrying none of these (Phase 1). close_commitment writes data.commitment_id (canonical) + resolved_by + evidence (≤200 chars) + resolution (done|dropped|superseded). EODFIX1: it additionally stamps data.title — a SNAPSHOT of the commitment's title at close time, optional and never required (every close already on disk predates it, and the End of Day wins block joins by id when it is absent).",
+    "required": [["commitment_id", "thread_id", "id", "target_id", "commitment_seq", "source_event_seq"]],
+    "properties": {"commitment_id": "string", "thread_id": "string", "id": "string", "target_id": "string", "commitment_seq": "number", "source_event_seq": "number", "resolved_by": "string", "evidence": "string", "resolution": "string", "title": "string"}
+  },
+  "commitment_reclassified": {
+    "description": "Kind override marker (Phase 2 Stage D, S6/S5) — additive; the projector applies data.new_kind to the referenced commitment read-side (history never rewritten). Written by the S6 migration script (promise→task partition) and promote_task_to_commitment (task→promise, one-tap promote when a counterparty appears). Never delete/recreate.",
+    "required": [["target_id", "commitment_id", "target_seq"]],
+    "properties": {"target_id": "string", "commitment_id": "string", "target_seq": "number", "new_kind": "string", "reason": "string"}
+  },
+  "commitment_reopened": {
+    "description": "Reopens a closed commitment (Phase 2 Stage D, S4 undo) — additive; the projector honors the LATEST of closure vs reopen in append order. Written by the triage undo path via commitment_state.reopen_commitment.",
+    "required": [["commitment_id", "target_id", "commitment_seq"]],
+    "properties": {"commitment_id": "string", "target_id": "string", "commitment_seq": "number", "reason": "string", "reopened_by": "string"}
+  },
+  "decision": {
+    "description": "A logged decision. The decision text lives under one of: decision~summary~title. data.id is the decision's own id, dec_<ULID>, minted by event_gate when a writer leaves it out (cr1#1011); a decision_resolved or decision_superseded names it in data.decision_id.",
+    "required": [["decision", "summary", "title"]],
+    "properties": {"id": "string", "decision": "string", "summary": "string", "title": "string", "rationale": "string", "context": "string"}
+  },
+  "meeting": {
+    "description": "A meeting record. Has a title or summary. meeting_type (optional) is the writer's classification of the meeting — sales | internal_1_1 | external | board | ... — stamped by past-meetings; the deal-signal detector's D9.1 genesis lane keys on meeting_type='sales' (defensive read: an untyped meeting contributes no genesis signal). PERSON BINDING (BUG-8244): the canonical shape carries top-level person_ids[] (resolved) AND data.attendees[] (invitee emails, verbatim from the source) — construct via meeting_capture.build_meeting_event(), never by hand. data.attendees_external[] holds display names with no entities.json match. data.attendee_person_ids and data.attendee_emails are LEGACY read-only variants: readers fold them via event_refs.meeting_person_ids(); no new writer may emit them.",
+    "required": [["title", "summary"]],
+    "properties": {"title": "string", "summary": "string", "source_ref": "string", "person_ids": "array", "attendees": "array", "attendees_external": "array", "attendee_person_ids": "array", "attendee_emails": "array", "primary_thread_id": "string", "meeting_type": "string", "duration_min": "number", "status": "string", "transcript_class": "string", "working_session": "boolean"}
+  },
+  "meeting_processed": {
+    "description": "A processed meeting. References the meeting and carries a summary/title.",
+    "required": [["meeting_id", "title", "summary", "source_ref"]],
+    "properties": {"meeting_id": "string", "title": "string", "summary": "string", "source_ref": "string", "person_ids": "array"}
+  },
+  "interaction": {
+    "description": "A passive-capture touchpoint. Carries a source_ref (dedup key) or a summary.",
+    "required": [["source_ref", "summary"]],
+    "properties": {"source_ref": "string", "summary": "string", "direction": "string", "dedup_hash": "string", "person_ids": "array", "primary_thread_id": "string"}
+  },
+  "email_drafted": {
+    "description": "A draft produced by email-writer (event fires from apply-choices on click). native_draft_id is the declared backend's native draft id (FB-plumbing item 5 — writers emit native_draft_id; the legacy gmail_draft_id spelling stays listed so pre-rename events on disk validate + read forever via native_draft_id_from_data). `to` is a read-side alias of `recipient` (RECIPIENTALIAS1, cr1#129): writers emit `recipient`; rows on disk that carried `to` validate and read through recipient_from_data.",
+    "required": [["recipient", "to"]],
+    "properties": {"recipient": "string", "to": "string", "topic": "string", "native_draft_id": "string", "gmail_draft_id": "string", "draft_event_seq": "number", "commitment_refs": "array", "decision_refs": "array", "voice_block_sha256": "string", "voice_applied": "boolean"}
+  },
+  "email_sent": {
+    "description": "A sent email; closure event linking back via draft_event_seq. gmail_thread_id (B6) when the send response provides it. `to` is a read-side alias of `recipient` (RECIPIENTALIAS1, cr1#129).",
+    "required": [["recipient", "to"]],
+    "properties": {"recipient": "string", "to": "string", "topic": "string", "gmail_message_id": "string", "gmail_thread_id": "string", "draft_event_seq": "number"}
+  },
+  "pack_run": {
+    "description": "Audit/telemetry trail of a scheduled-task / orchestrator fire. EODFIX1: the End of Day's receipt additionally carries data.receipt_id (`eod_<UTC to the second>-<8 hex>`, minted by end_of_day.mint_receipt_id) — optional and additive; it is what every one-tap gesture on that fire points at (`session:<receipt_id>:<gesture>`), so two acts of one evening cannot share a pointer. Receipts written before EODFIX1 carry none and their taps fall back to `session:end-of-day:<receipt ts>`.",
+    "required": [["task_id"]],
+    "properties": {"task_id": "string", "digest_path": "string", "sections_rendered": "array", "receipt_id": "string", "sections_check": "object", "timings": "object"}
+  },
+  "pattern_break_detected": {
+    "description": "A person whose contact cadence broke (Pulse). Carries the person and the diagnostic counts.",
+    "required": [["person_id"]],
+    "properties": {"person_id": "string", "eligible_event_count": "number", "most_recent_eligible_event_seq": "number"}
+  },
+  "deliverable_landed": {
+    "description": "DOCS1 D-2 (2026-09-24). One per document landed in the workspace folder from OUTSIDE the render chokepoint — today the only source is `claude_doc`: a Claude Doc the composer produced despite the document-routing rule, read back through the discovered docs seam and landed by `deliverables.export_claude_doc` under the owning kind's folder. Composed by that writer, appended by the caller through `append_jsonl`. `deliverables.export_claude_doc` reads it back to refresh the same file in place for the same doc (occurrence-keyed, no second row within the window).",
+    "required": [["source"], ["doc_id"], ["rel"], ["kind"]],
+    "properties": {"source": "string", "doc_id": "string", "doc_ref": "string", "rel": "string", "kind": "string", "title": "string", "format": "string", "refreshed": "boolean", "bytes": "integer", "sha256": "string", "machine": "string"}
+  },
+  "prep_brief": {
+    "description": "Per-brief prep receipt (v4.5.2 S1). One per Call_Prep brief written, carrying the meeting id — THE signal the morning brief's no-prep detection reads (F-29). Written only by receipts.log_prep_receipt; not a task-run receipt (five briefs in one fire are five prep_brief events and ONE pack_run). attendee_person_ids (cr1#1304, additive, optional) is the attendees' resolved person ids, so the Hub's month dashboard files a prep under its people; older receipts carry none.",
+    "required": [["meeting_id"], ["slug"], ["artifact"]],
+    "properties": {"meeting_id": "string", "slug": "string", "artifact": "string", "generated_by": "string", "fired_via": "string", "refreshed": "boolean", "meeting_start": "string", "attendee_person_ids": "array", "thread_id": "string", "thread_basis": "string", "machine": "string"}
+  },
+  "reminder": {
+    "description": "A user-created pin-until-cleared reminder (v4.6.0 W4a). NOT a commitment kind — never enters buckets, counts, chase, or triage. data.origin MUST be 'user_explicit' (gate-enforced; no skill, sweep, or scheduled task may mint one). id minted rem_<ulid> at build/gate time. repeat is 'weekly' | 'monthly' | {\"every_days\": N} — recurrence lives on reminders, not commitments (M decision 2026-07-09). personal defaults true when the reminder references no tracked business entity; personal reminders render ONLY in M-facing surfaces. ref (optional) points at a commitment/event id for context only — clearing the reminder never touches the referenced item.",
+    "required": [["summary"], ["remind_from"], ["origin"]],
+    "properties": {"id": "string", "summary": "string", "remind_from": "string", "due": "string", "personal": "boolean", "ref": "string", "origin": "string"}
+  },
+  "reminder_updated": {
+    "description": "Push / keep / edit / restore on an existing reminder. reminder_id REQUIRED (gate-rejected without it — an id-less update is a dead letter). action 'push' carries new remind_from (also re-arms a cleared one-shot); 'keep' is an acknowledged touch that resets the escalation clock; 'edit' revises summary/due; 'restore' takes back a reminder_deleted (the owner's undo, cr1#1221). origin MUST be 'user_explicit'.",
+    "required": [["reminder_id"], ["origin"]],
+    "properties": {"reminder_id": "string", "action": "string", "remind_from": "string", "due": "string", "summary": "string", "origin": "string"}
+  },
+  "deal_created": {
+    "description": "A deal thread opened for tracking (SPEC PIPE1). WRITTEN ONLY via deal_state.create_deal / adopt_deal (adopt = attaching a deal object to a pre-PIPE1 kind='deal' thread). data.value present only when the user stated it — never estimated.",
+    "required": [["thread_id"], ["org_id"], ["stage"]],
+    "properties": {"thread_id": "string", "org_id": "string", "stage": "string", "value": "number", "currency": "string", "name": "string", "adopted": "boolean"}
+  },
+  "deal_updated": {
+    "description": "A non-stage field changed on an open deal (value / expected_close / forecast_category / currency / source). WRITTEN ONLY via deal_state.update_deal; stage moves are deal_stage_changed, terminal outcomes are deal_won/deal_lost. Carries at least one changed field.",
+    "required": [["thread_id"], ["value", "expected_close", "forecast_category", "currency", "source"]],
+    "properties": {"thread_id": "string", "value": "number", "expected_close": "string", "forecast_category": "string", "currency": "string", "source": "string"}
+  },
+  "deal_stage_changed": {
+    "description": "A deal moved between active stages (SPEC PIPE1; backward moves allowed — deals regress; days-in-stage resets either way). WRITTEN ONLY via deal_state.set_stage.",
+    "required": [["thread_id"], ["from_stage"], ["to_stage"]],
+    "properties": {"thread_id": "string", "from_stage": "string", "to_stage": "string", "note": "string"}
+  },
+  "deal_won": {
+    "description": "Terminal win (SPEC PIPE1). WRITTEN ONLY via deal_state.close_deal(outcome='won') — idempotent; thread status flips to 'resolved'. data.converted_prospect true when the same call atomically ran the prospect->client conversion (D6 — the '[Name] signed' utterance).",
+    "required": [["thread_id"], ["org_id"]],
+    "properties": {"thread_id": "string", "org_id": "string", "value": "number", "converted_prospect": "boolean"}
+  },
+  "deal_lost": {
+    "description": "Terminal loss (SPEC PIPE1). WRITTEN ONLY via deal_state.close_deal(outcome='lost') — a valid loss_reason is REQUIRED (rejected without one); thread status flips to 'archived'. THE 'lost-deal events' board-pack-assembler section 4 reads.",
+    "required": [["thread_id"], ["org_id"], ["loss_reason"]],
+    "properties": {"thread_id": "string", "org_id": "string", "loss_reason": "string", "loss_note": "string", "value": "number"}
+  },
+  "deal_won_reversed": {
+    "description": "CUTB item 4 (2026-09-06). The REVERSAL MARKER for a deal_won an undo put back — WRITTEN ONLY by brain_undo._reverse_org_promotion, and only when the promotion it reverses carried deal_manufactured (the `mark [org] won`-with-no-deal path). Add-beside, the promotion_reversed precedent: the deal_won event and the deal object are never rewritten; the thread is archived; readers fold this marker (deal_state.list_closed_deals / won_reversals, pipeline_math.won_rate_90d, deal_signal_retire.settled_orgs). One per thread — a second undo is already_reversed.",
+    "required": [["thread_id"]],
+    "properties": {"thread_id": "string", "org_id": "string", "won_seq": "number", "reversed_by": "string", "reason": "string"}
+  },
+  "deal_update_proposed": {
+    "description": "PIPE1 Part 2 (registered up front per the wave pattern; no writer until the deal-signal detector ships): a propose-and-confirm deal update surfaced from observed meeting/email signal. Nothing mutates until the user confirms through apply-choices -> deal_state.",
+    "required": [["thread_id"]],
+    "properties": {"thread_id": "string", "proposal_kind": "string", "proposed_stage": "string", "proposed_value": "number", "evidence": "string", "fingerprint": "string"}
+  },
+  "deal_update_dismissed": {
+    "description": "PIPE1 Part 2 (registered up front; no writer until the detector ships): the user dismissed a proposed deal update — the cooldown record the detector reads before re-proposing.",
+    "required": [["thread_id"]],
+    "properties": {"thread_id": "string", "fingerprint": "string", "reason": "string"}
+  },
+  "objective_created": {
+    "description": "A standing objective opened (SPEC OBJ1 draft). WRITTEN ONLY via objective_state.create_objective — always a NEW kind='objective' thread; an objective about existing work links it via objective.anchor_thread_id instead of mutating the existing thread (cold-start proposals included). Carries the confirmed binding choice; binding detail lives on the thread's objective object — this event records what was chosen at creation.",
+    "required": [["thread_id"], ["statement"], ["binding_type"]],
+    "properties": {"thread_id": "string", "statement": "string", "binding_type": "string", "owner_id": "string", "horizon": "string", "anchor_thread_id": "string"}
+  },
+  "objective_updated": {
+    "description": "A non-terminal field changed on an open objective (binding / owner / horizon / statement / milestones). WRITTEN ONLY via objective_state.update_objective; terminal outcomes are objective_completed / objective_archived. Carries at least one changed field. A binding change carries binding_type (the rebind path — e.g. a renamed review meeting).",
+    "required": [["thread_id"]],
+    "properties": {"thread_id": "string", "statement": "string", "binding_type": "string", "owner_id": "string", "horizon": "string", "milestone": "string", "milestone_done": "boolean"}
+  },
+  "objective_review": {
+    "description": "Meeting-path harvest (SPEC OBJ1 draft): the objective was discussed in its bound review meeting; records the STATED status and a one-line context. WRITTEN ONLY via objective_state.record_review, called from the meeting-notes extraction step (reuses that pipeline — no parallel transcript scanner). status is directional and trusted BECAUSE it was spoken (on_track|at_risk|off_track|blocked). source_ref ties back to the processed meeting; a bound-series meeting with no qualifying discussion writes NOTHING — the absence is what drift math counts.",
+    "required": [["thread_id"], ["status"], ["source_ref"]],
+    "properties": {"thread_id": "string", "status": "string", "context": "string", "source_ref": "string", "meeting_title": "string"}
+  },
+  "objective_report": {
+    "description": "Self-path status (SPEC OBJ1 draft): the owner's own 20-second word, given inside the weekly objectives touch — never a per-objective ping. WRITTEN ONLY via objective_state.record_report. status is directional and trusted because it is the owner's own word (on_track|at_risk|off_track|blocked); it goes stale when reporting stops — drift math counts missed cadence cycles.",
+    "required": [["thread_id"], ["status"]],
+    "properties": {"thread_id": "string", "status": "string", "note": "string", "reported_by": "string"}
+  },
+  "objective_completed": {
+    "description": "Terminal completion (SPEC OBJ1 draft). WRITTEN ONLY via objective_state.complete_objective — idempotent (already-closed is a NO-OP, never a duplicate event); thread status flips to 'resolved' in the same call.",
+    "required": [["thread_id"]],
+    "properties": {"thread_id": "string", "statement": "string", "outcome_note": "string"}
+  },
+  "objective_archived": {
+    "description": "Terminal archive (SPEC OBJ1 draft) — 'no longer an objective', including the self-report graceful-death path (repeatedly ignored asks escalate to 'is this still an objective?' and land here on the CEO's yes-archive). WRITTEN ONLY via objective_state.archive_objective — idempotent; thread status flips to 'archived' in the same call.",
+    "required": [["thread_id"]],
+    "properties": {"thread_id": "string", "statement": "string", "outcome_note": "string"}
+  },
+  "brain_proposal": {
+    "description": "A unified Living Brain proposal (SPEC LB1): one uncertain observation a detector wants confirmed (tier confirm) or narrated (tier auto — legal only for AUTO_ALLOWED change classes with a registered reverser; propose() raises otherwise). WRITTEN ONLY via brain_proposals.propose(), which consults proposal_ledger.active_cooldowns (declined-within-60d fingerprints suppressed at source) and dedups on fingerprint against open proposals. action_tuples must map to registered verb_taxonomy action ids (no-consumer proposals rejected at source, D10). Deal-kind proposals additionally write the reserved PIPE1 deal_update_proposed alongside.",
+    "required": [["proposal_id"], ["kind"], ["fingerprint"], ["tier"], ["detector"]],
+    "properties": {"proposal_id": "string", "kind": "string", "fingerprint": "string", "tier": "string", "evidence": "string", "action_tuples": "array", "ttl_days": "number", "detector": "string", "thread_id": "string", "org_id": "string", "person_id": "string", "render_line": "string", "surface_hint": "string"}
+  },
+  "brain_proposal_resolved": {
+    "description": "Adjudicates a brain_proposal (SPEC LB1 — the tombstone). WRITTEN ONLY via brain_proposals.resolve_proposal() from apply-choices cr-brain dispatch: user_action in applied|edited|declined|skipped (same vocabulary as proposal_feedback.jsonl — resolve_proposal also appends the ledger row so cooldown math is shared). The projector stops surfacing any proposal_id a tombstone references. declined starts the 60-day fingerprint cooldown.",
+    "required": [["proposal_id"], ["user_action"]],
+    "properties": {"proposal_id": "string", "user_action": "string", "kind": "string", "fingerprint": "string", "detector": "string", "resolved_by": "string", "note": "string"}
+  },
+  "brain_proposal_expired": {
+    "description": "Silent TTL expiry of an unanswered brain_proposal (SPEC LB1). WRITTEN ONLY by cleanup's expiry sweep via brain_proposals.expire_stale() — logged, never nagged; the count is visible in cleanup's Monday-note card-health line. No cooldown: an expired fingerprint may be re-proposed if the signal persists.",
+    "required": [["proposal_id"]],
+    "properties": {"proposal_id": "string", "kind": "string", "fingerprint": "string", "detector": "string", "opened_ts": "string"}
+  },
+  "brain_change_undone": {
+    "description": "One reversed change from a Living Brain undo batch (SPEC LB1). WRITTEN ONLY via brain_undo.undo_batch() — the narration-trail marker; the reversal itself is the change class's ADDITIVE reversing event (commitment_reopened, chat_dismissal_cleared, a status->archived person_updated/org_updated), appended by the registered reverser immediately before this marker. change_ref points at the reversed change's audit anchor (event seq or id); reverser names the REVERSERS registry key that ran. Never edits or deletes prior events.",
+    "required": [["change_ref"], ["reverser"]],
+    "properties": {"change_ref": "string", "reverser": "string", "batch_ref": "string", "undone_by": "string", "note": "string"}
+  },
+  "morning_message_claimed": {"description": "This morning's message planned and claimed (cr1#1017 behaviour 1), BEFORE any send. WRITTEN ONLY by morning_message.plan_send under its lock: the workspace day and the digest of the exact plan (recipient, server, subject, body). mail_seams(self_send=...) and morning_message.record accept only the plan whose digest matches; a claimed day is never planned again.", "required": [["day"], ["digest"]], "properties": {"day": "string", "digest": "string"}},
+  "morning_message_sent": {"description": "The morning message went out (cr1#1017 behaviour 1). WRITTEN ONLY by morning_message.record after the morning run sent it through mail_seams(self_send=...): the owner's own business-primary address only. One per workspace day: plan_send and the seam refuse a second.", "required": [["day"], ["to"]], "properties": {"day": "string", "to": "string", "via": "string", "subject": "string", "n_need": "integer"}},
+  "morning_message_skipped": {"description": "A morning on which the morning message was not sent (cr1#1017 behaviour 1), and why: already_sent, no_hub, no_owner_address, unverified_binding, walled, read_only, no_send_tool, send_failed, unreadable. WRITTEN ONLY by morning_message.record. Names no address.", "required": [["day"], ["reason"]], "properties": {"day": "string", "reason": "string"}},
+  "hub_miss_reported": {
+    "description": "The owner told the Hub it missed something (cr1#1017). WRITTEN ONLY by cockpit_helpers.apply_hub_choices for a miss/tell press: what the owner said, why the Hub did not show it (listed, waiting, snoozed, closed, heard, mentioned, not_found; and for an item found only by the live search of mail and meetings, cr1#1202: filtered, closed_thread, never_fetched, inbox, meeting_unprocessed, meeting_no_promise, with found_where, filter, rule and searched), the one-line answer, what the book held (found_seq, found_id, found_source) and the to-do it filed (filed_id). The week's measure counts these.",
+    "required": [["hub_choice"], ["text"], ["why"]],
+    "properties": {"hub_choice": "string", "text": "string", "why": "string", "line": "string", "found_seq": "integer", "found_id": "string", "found_source": "string", "filed_id": "string", "terms": "array", "found_where": "string", "filter": "string", "rule": "string", "searched": "array"}
+  },
+  "hub_edit": {
+    "description": "A work stream, person or priority added or renamed from the Hub, a commitment's wording edited there (cr1#1383 slice 4), its due date set there through due_set.set_due (slice 4 PR 2: field title, due or title,due; old_due the date it replaced, empty when none, new_due, and due_seq the date row, which the undo takes back through due_set.undo_set_due first, then the words), a note added to a commitment there (action context on commitment_edit, cr1#1383 Add context: one note through commitment_state.add_commitment_note, new the note and note_seq its row, taken back by undo through brain_undo.REVERSERS commitment_note), a person's role, email or company set there (action set, cr1#1433: field, old_value and new_value as stored, set through people_writer.set_person_field, whose batch the undo takes back), a free note added to a thread (its notes, through thread_writer.update_thread; old_value and new_value the notes before and after) or to a person (one person_fact_observed through people_writer.record_person_fact) from the Hub (action context, cr1#1383 Add context; the note as new), or that change taken back (cr1#1383 part 2; a person's note through the registered entity_fact_retracted reverser). WRITTEN ONLY by hub_edit.apply_one, through cockpit_helpers.apply_hub_choices, after the record's own writer landed the change: the press (hub_choice), what it reached (kind: stream_edit, person_edit, priority_edit or commitment_edit; target_id, a commitment's id for commitment_edit), the action (add, rename, set, context or undo), the value it replaced and the one it wrote (old, new; field for a rename), the person rename's batch (batch_id), the line the page shows, and on an undo the press it takes back (undoes_choice) and the writer rows the undo made (wrote_seqs, which the thread cards' day-count skips: an undo is not a touch). Names its record as target_id, never as a thread key. cr1#1540 adds three actions: update (stream_edit only: a short dated note the owner posts on a thread; the row itself is the record, the note as new, the thread as target_id, no other writer called), order (priority_edit only: the owner's order for his priorities, order the whole order it leaves and old_order the one it replaced, target_id priority_order, no priority's own record touched) and star (priority_edit only: a thread made a priority through objective_state.create_objective, target_id the new priority and thread_id the thread it stands on).",
+    "required": [["hub_choice"], ["kind"], ["action"], ["target_id"]],
+    "properties": {"hub_choice": "string", "kind": "string", "action": "string", "target_id": "string", "field": "string", "old": "string", "new": "string", "old_value": "string", "new_value": "string", "batch_id": "string", "line": "string", "undoes_choice": "string", "wrote_seqs": "array", "order": "array", "old_order": "array", "thread_id": "string", "old_due": "string", "new_due": "string", "due_seq": "integer", "note_seq": "integer"}
+  },
+  "hub_meeting_saved": {
+    "description": "A meeting's live prep page saved from the Hub (cr1#1632 slice 1, the owner's Meeting done, save this) or that save taken back. WRITER: hub_meeting.apply_one ONLY, through cockpit_helpers.apply_hub_choices. A save names the decision rows it wrote (decisions: id, seq, text, through decision-log's shape), the person facts it wrote (fact_seqs, on fact_person), the answers kept on the meeting when nobody on it is on file, the questions asked, the points covered, and what it carries to the next brief with these people (carried). An undo names the save (undoes_choice): it retracts the facts and ends what was carried; the decisions stay. READERS: hub_meeting.saved_for (the page's saved state, on feed/today), hub_meeting.carried_points (the next brief).",
+    "required": [["hub_choice"], ["meeting_id"]],
+    "properties": {"hub_choice": "string", "meeting_id": "string", "title": "string", "start": "string", "person_ids": "array", "decisions": "array", "fact_seqs": "array", "fact_person": "string", "answers": "array", "asked": "array", "covered": "array", "carried": "array", "line": "string", "undoes_choice": "string"}
+  },
+  "hub_meeting_wrapped": {
+    "description": "A past meeting wrapped up from the Hub's wrap-up page (cr1#1632 slice 3, design E2), or that wrap-up put back. WRITER: hub_meeting.apply_one ONLY, through cockpit_helpers.apply_hub_choices. A wrap names each change it made through its own writer (wrote: due, a promise placed Today or This week through due_set.set_due, its row as seq; notmine, through commitment_state.disown_commitment; track, a promise of theirs confirmed through needs_review_queue.confirm_items), the decisions the owner said were not right (wrong: a correction; the decision row stands), the follow-up's state (follow: sent, drafts or none) and the points carried (carried). Put it back takes each change back through that writer's own undo (due_set.undo_set_due, commitment_state.undo_disown, commitment_state.restore_review_flags) and names the wrap (undoes_choice). READERS: hub_meeting.wrapped_for (feed/today's past rows, by the occurrence's start when both name one, cr1#1668).",
+    "required": [["hub_choice"], ["meeting_id"]],
+    "properties": {"hub_choice": "string", "meeting_id": "string", "title": "string", "start": "string", "person_ids": "array", "wrote": "array", "wrong": "array", "follow": "string", "carried": "array", "line": "string", "undoes_choice": "string"}
+  },
+  "meeting_changed": {
+    "description": "A meeting the owner moved, cancelled or took back from the Hub page (cr1#1539). The page made the change on the calendar on the owner's press; this is the book's record of it. WRITTEN ONLY by cockpit_helpers.record_calendar_changes, on the Apply run, one row per change: the page's choice (page_choice_id, load-bearing: a retried run answers from the first row), what happened (change: moved, cancelled or removed, removed being a Hub booking taken back), the event's id on the calendar (calendar_event_id), its title, and for a move the times it left and took (from_start, from_end, to_start, to_end) and whether it was put back at its original time (put_back). Names no thread and no person, so it is nobody's activity. A booking is a meeting_scheduled row, not this type.",
+    "required": [["page_choice_id"], ["change"], ["calendar_event_id"]],
+    "properties": {"page_choice_id": "string", "change": "string", "calendar_event_id": "string", "title": "string", "from_start": "string", "from_end": "string", "to_start": "string", "to_end": "string", "put_back": "boolean", "sent_from": "string"}
+  },
+  "reminder_cleared": {
+    "description": "Clears a reminder. reminder_id REQUIRED. For repeating reminders the reader re-arms to the next occurrence after data.occurrence (defaults to the occurrence active at clear time) — derive-next-on-read, no scheduler. Clearing a reminder with ref NEVER closes the referenced commitment. origin MUST be 'user_explicit'.",
+    "required": [["reminder_id"], ["origin"]],
+    "properties": {"reminder_id": "string", "occurrence": "string", "note": "string", "origin": "string"}
+  },
+  "reminder_deleted": {
+    "description": "Deletes a reminder for good (cr1#1221): the reader drops the id on every surface, and a repeating reminder never re-arms. reminder_id REQUIRED. WRITTEN ONLY via reminders.build_reminder_deleted_event, from the owner's own 'delete the reminder' or a Hub Delete press. Carries its undo handle (brain_batch_id with brain_change_class 'reminder_deleted'); the owner's undo appends a reminder_updated with action 'restore' through brain_undo, never an edit. Deleting a reminder with ref NEVER closes the referenced commitment. origin MUST be 'user_explicit'.",
+    "required": [["reminder_id"], ["origin"]],
+    "properties": {"reminder_id": "string", "origin": "string", "brain_batch_id": "string", "brain_change_class": "string", "hub_choice": "string"}
+  },
+  "person_role_changed": {
+    "description": "Lineage: a person's role/title changed (SPEC HIST1 D2). WRITTEN ONLY by people_writer.update_person at the before/after diff site — auto-emitted alongside person_updated when `role` changed with BOTH sides non-empty (a backfill filling an empty role emits nothing; migration sets pass suppress_lineage=True). The head field still updates; this event preserves the prior title as history. source_ref is REQUIRED and never null — when no connector ref is in hand the writer synthesizes 'update:<source_skill>:<seq of the person_updated event>' (D10 change-feed contract). summary is the human-readable change line the future change feed renders.",
+    "required": [["person_id"], ["to_role"], ["source_ref"]],
+    "properties": {"person_id": "string", "canonical_name": "string", "to_role": "string", "from_role": "string", "org_id": "string", "effective_date": "string", "source_ref": "string", "summary": "string"}
+  },
+  "person_org_changed": {
+    "description": "Lineage: a person moved companies — primary_org_id changed (SPEC HIST1 D2). WRITTEN ONLY by people_writer.update_person at the before/after diff site — auto-emitted alongside person_updated when `primary_org_id` changed with BOTH sides non-null (backfill attachment from null emits nothing; migration sets pass suppress_lineage=True). Top-level org_ids[] carries both endpoints so org-history renderers see the joined/left move. source_ref REQUIRED, synthesized from the triggering update when no connector ref is present (D10).",
+    "required": [["person_id"], ["to_org_id"], ["source_ref"]],
+    "properties": {"person_id": "string", "canonical_name": "string", "to_org_id": "string", "from_org_id": "string", "from_role": "string", "to_role": "string", "source_ref": "string", "summary": "string"}
+  },
+  "person_fact_observed": {
+    "description": "One atomic, sourced fact about a person (SPEC HIST1 D3) — additive; NEVER mutates the person record (facts are events, D1). WRITTEN ONLY by people_writer.record_person_fact: an explicit user statement ('remember Sam prefers Signal' — confidence high, no proposal), a confirmed brain_proposal, or (Part 2) the entity_fact_structured auto tier — batch-stamped (brain_batch_id + brain_change_class) for undo, category limited to preference|contact|personal (S2). category in preference|contact|personal|role|company_news|other. source_ref REQUIRED (facts are always sourced). Renderers suppress a fact whose seq a later entity_fact_retracted references.",
+    "required": [["person_id"], ["fact"], ["source_ref"]],
+    "properties": {"person_id": "string", "canonical_name": "string", "fact": "string", "category": "string", "confidence": "string", "source_ref": "string", "summary": "string"}
+  },
+  "org_fact_observed": {
+    "description": "One atomic, sourced fact about an org (SPEC HIST1 D3) — additive; never mutates the org record. WRITTEN ONLY by org_writer.record_org_fact (explicit user statement, confirmed proposal, or the Part 2 entity_fact_structured auto tier — batch-stamped, S2 category limits). Top-level org_ids[] carries the org so org-activity/history derivations see it. category in preference|contact|personal|role|company_news|other. source_ref REQUIRED. Renderers suppress a fact whose seq a later entity_fact_retracted references.",
+    "required": [["org_id"], ["fact"], ["source_ref"]],
+    "properties": {"org_id": "string", "canonical_name": "string", "fact": "string", "category": "string", "confidence": "string", "source_ref": "string", "summary": "string"}
+  },
+  "unidentified_attendee_observed": {
+    "description": "An UNNAMED meeting speaker/attendee (SPEC PID1 D5) — the annotation that replaces the malformed no-name person 'proposals'. WRITTEN ONLY via meeting_capture.build_unidentified_attendee_event (build_person_proposal_event raises on empty names by design — this is the sanctioned path, never a workaround). FULLY SILENT per the §0-4 ruling: never a queue row; the only render is ONE count line in the weekly staff meeting (identity_reconcile.count_open_annotations). attendee_hint is the source's own speaker label ('speaker 2'); attendee_email only when the source metadata literally carries it (F-08 extends to capture — never guessed). Resolved when a later identity_reconcile_run receipt lists this event's seq in data.annotations_resolved (identity_reconcile.load_open_annotations folds those).",
+    "required": [["meeting_source_ref"], ["attendee_hint"]],
+    "properties": {"meeting_source_ref": "string", "attendee_hint": "string", "attendee_email": "string", "evidence": "string"}
+  },
+  "identity_reconcile_run": {
+    "description": "ONE receipt per identity-reconcile pass (SPEC PID1 D7 — the Sunday maintenance job AND the M-fired one-time backfill, same code at two cap sets). WRITTEN ONLY via receipts.log_receipt from identity_reconcile.run_identity_reconcile(apply=True). Triple duty: the dispatcher's due-ness signal, the D6 CHANGED-narration source (change_feed reads n_auto_added / n_linked — counts of what was ACTUALLY written, never the plan), and the annotation-resolution fold (annotations_resolved lists unidentified_attendee_observed seqs now resolved). caps + spilled record the §0-3 cap posture — overflow is narrated, never silently dropped.",
+    "required": [["batch_id"]],
+    "properties": {"batch_id": "string", "n_auto_added": "number", "n_linked": "number", "n_merge_proposed": "number", "n_clustered": "number", "n_annotations": "number", "n_annotations_resolved": "number", "n_expired": "number", "n_kept_open": "number", "n_errors": "number", "caps": "object", "spilled": "object", "people_added": "array", "annotations_resolved": "array"}
+  },
+  "path_repair": {
+    "description": "SPEC PATHREPAIR1 v2 — a workspace-root registration repointed (or an undo of one). WRITTEN ONLY via path_repair.repair / path_repair.undo, and ONLY on success (or on undoing a success) — an unrepairable finding (ambiguous, zero candidates, or an ephemeral-only candidate) writes nothing, and neither does an UNKNOWN vantage (a session mount, another machine's registration, a disconnected drive) — ruling 1/2's NO-WRITE posture; task_alarm.classify_dark_surfaces recomputes that verdict live instead of reading an event. data.status is repaired|undone. trusted=true means the caller supplied its own already-verified live root (the dispatch-preamble / bridge-update call shape) rather than this module discovering one via marker+fingerprint search. pre_repair_config (present on status=repaired) is the workspace_root/workspace_basename/root_fingerprint triple as it read immediately before this repair wrote over it — the DURABLE undo record (ruling 5): path_repair.undo() reads this straight off the event, with no in-memory receipt required.",
+    "required": [["status"], ["new_root"]],
+    "properties": {"status": "string", "old_root": "string", "new_root": "string", "task_ids": "array", "trusted": "boolean", "pre_repair_config": "object"}
+  },
+  "schedule_retire_proposed": {
+    "description": "The suppression record for ONE offer to switch off a RETIRED scheduled task (SPEC LIFECYCLE1 §4 — the mirror of schedule_add_proposed, for the retirement direction). WRITTEN ONLY via schedule_proposals.log_retire_proposal after the offer was surfaced. Retirement is PROPOSE-NEVER-SILENT: this event records that the customer was asked, so schedule_proposals.propose_task_retirements suppresses the same offer for RETIRE_SUPPRESSION_WEEKS. It records an OFFER, never a disable — nothing in the system disables a registered task on its own.",
+    "required": [["taskId"]],
+    "properties": {"taskId": "string"}
+  },
+  "lifecycle_run": {
+    "description": "ONE receipt per project-lifecycle pass (SPEC LIFECYCLE1 — the `lifecycle` job inside the `maintenance` task, the fold that replaced Pulse's Phase 4 when the Pulse chat was eliminated). WRITTEN ONLY via receipts.log_receipt from lifecycle_pass.run_lifecycle_pass(apply=True) — a dry run writes nothing, so the job stays due. Triple duty: the dispatcher's due-ness signal, this job's own success validator (MAINT1: a job vouches for itself, never the dispatcher), and the audit trail for silent lifecycle transitions. revived / proposed / went_dormant / archive_proposed count what was ACTUALLY written, never the plan; archived is always 0 since cr1#845 (the pass only asks) and stays so old readers parse; spilled records the per-class cap overflow, which stays due and drains at the next weekly fire (narrated, never silently dropped).",
+    "required": [["considered"]],
+    "properties": {"considered": "number", "revived": "number", "proposed": "number", "went_dormant": "number", "archived": "number", "archive_proposed": "number", "spilled": "object", "errors": "array"}
+  },
+  "commitment_note_retracted": {
+    "description": "Takes back one note the owner added to a commitment (cr1#1463). WRITTEN ONLY by commitment_state.retract_commitment_note, reached from the brain_undo commitment_note reverser (Take back, bare undo). The note itself is a `note` row (data.via commitment_context, written by commitment_state.add_commitment_note) and stays in history; the projector and commitment_state.commitment_notes leave out the note whose seq retracts_seq names. note_commitment_id names the item under its own key, never commitment_id, so the take back is not itself a hand on the item for another undo. source_ref is synthesized (undo:<skill>:seq:<n>), never null.",
+    "required": [["retracts_seq"], ["note_commitment_id"], ["source_ref"]],
+    "properties": {"retracts_seq": "number", "note_commitment_id": "string", "undone_by": "string", "reason": "string", "source_ref": "string"}
+  },
+  "entity_fact_retracted": {
+    "description": "Retracts a previously observed fact (SPEC HIST1 D3/S1). WRITTEN ONLY by the brain_undo entity_fact_structured reverser (Part 2 — landed with the AUTO_ALLOWED entry in one commit). Facts are append-only with no status to flip, so undo APPENDS this event; render_person_history / render_org_history suppress the fact whose seq retracts_seq references. target_id is the person_id or org_id the fact was about. source_ref is synthesized (undo:<skill>:<change_ref>) — never null.",
+    "required": [["target_id"], ["retracts_seq"], ["source_ref"]],
+    "properties": {"target_id": "string", "retracts_seq": "number", "reason": "string", "source_ref": "string"}
+  },
+  "chart_render": {
+    "description": "One on-demand chart answer (SPEC OUT3B). WRITTEN ONLY by the chart-on-demand skill, once per ask. data.catalog_id = the closed-catalog series that answered (value_trend / pipeline_mix / pipeline_by_org); kind = the charts.py kind drawn. refused=true when the ask had no substrate answer (data.reason names why + which catalog entry was closest, per D4) — the refusal is text, not a page, so artifact is absent. On a rendered chart refused=false and artifact = the saved page path. org_id present only when the series was entity-scoped through the ENTITY_RESOLVE ladder. Mined to learn what the (empty at ship) chart-ask corpus actually wants charted.",
+    "required": [["catalog_id"], ["kind"], ["refused"]],
+    "properties": {"catalog_id": "string", "kind": "string", "refused": "boolean", "org_id": "string", "artifact": "string", "reason": "string"}
+  },
+  "substrate_reconciled": {
+    "description": "SPEC SYNC1 A3 — one receipt per successful quarantine reconcile / merge-forward. WRITTEN ONLY by reconcile_forward (inside the writer lock, after a healthy view is confirmed). data.replayed = quarantined events re-appended with fresh seqs (original ts kept); already_present = quarantined events that content-signature/commitment-id dedup skipped; archived = quarantine/marker files moved into the _recovery_<stamp>/ snapshot. Its presence proves the self-heal ran without manual recovery.",
+    "required": [["replayed"]],
+    "properties": {"replayed": "number", "already_present": "number", "archived": "number", "holder": "string"}
+  },
+  "day_intent": {
+    "description": "What ONE day is about (SPEC BK1, Daily Bookends) — a tiny typed record, append-only, LATEST-WINS per for_date (the OBJ2 supersession posture; the CEO changing their mind appends a new one and nothing is edited). WRITTEN ONLY via day_intent.write_day_intent / day_intent.reverse_day_intent. for_date is the workspace-LOCAL 'YYYY-MM-DD' day it governs, resolved through tz.py and never UTC (at 9pm Pacific the UTC calendar has already rolled over, which is precisely when the end-of-day chat fires). items is 1-3 entries of {text, rank, commitment_id?}; the ONLY legal empty items list is a retraction (data.retracted true — the additive reversal written when an undo has nothing to restore, read as None by load_day_intent). origin is wrap|manual|proposed: `manual` is the workspace-manager chat path, `wrap`/`proposed` are the end-of-day chat's legs (EOD1) — and a `proposed` row is a draft the system guessed, which day_intent.load_day_intent SKIPS by default so no surface can render it as fact. source_ref is the PROV1 pointer (a chat write's session/receipt id), or provenance_missing when there was nothing to point at. brain_batch_id + brain_change_class='day_intent' are the undo handle brain_undo.undo_batch resolves; they travel together. EVERY surface reads through day_intent.load_day_intent — nobody greps.",
+    "required": [["for_date"], ["items"], ["origin"]],
+    "properties": {"for_date": "string", "items": "array", "origin": "string", "source_ref": "string", "provenance_missing": "boolean", "brain_batch_id": "string", "brain_change_class": "string", "retracted": "boolean", "reverses_seq": "number", "restores_seq": "number", "reversed_by": "string"}
+  },
+  "router_miss": {
+    "description": "SPEC ROUTEMISS1 — one row per routing correction the CEO voiced in chat ('wrong skill', 'that should have been X', a 'no, I meant X' redirect). WRITTEN ONLY via router_miss.log_router_miss (which builds the row through router_miss.build_router_miss_event and appends via event_gate.append_event) from the workspace-manager verb handler, and ONLY when the remainder re-dispatched to a DIFFERENT skill than the one that just ran — never after a draft (a voice correction) or a disambiguation question. said = the CEO's full correction turn; meant = the remainder that was re-dispatched; resolved_to = the skill folder the remainder routed to; routed_to = the skill that took the PREVIOUS turn, known only when that turn was a scheduled fire (the newest event is a pack_run — its task_id), else null, NEVER inferred from the phrase (there is no session-local state); source is always 'user'; session_ref = the PROV1 pointer when one exists, else null. Consumers: render_router_misses (the owner-facing _hq/views/ROUTER_MISSES.md view) and cleanup's Monday-note line. The payload's said/meant are the CEO's own words and NEVER become a tests/triggers.yaml row without a human rewrite into placeholder vocabulary — the negative-row generator reads fences from skill descriptions, never events.",
+    "required": [["said"], ["meant"], ["resolved_to"]],
+    "properties": {"said": "string", "meant": "string", "resolved_to": "string", "routed_to": "string", "source": "string", "session_ref": "string"}
+  },
+  "substrate_alarm_cleared": {
+    "description": "SPEC SYNC1 A2 — best-effort audit event when a substrate-regression alert's condition re-checks false and the alert is annotated + archived to _hq/_resolved_alerts/ (D-3). WRITTEN ONLY by alarm_artifacts.sweep_alerts. data.alert = the archived alert filename; marker = the regression-marker path it referenced; sidecar_max_seq = the high-water the resolved predicate tested against.",
+    "required": [["alert"]],
+    "properties": {"alert": "string", "marker": "string", "sidecar_max_seq": "number", "resolved_at": "string"}
+  },
+  "style_changed": {
+    "description": "SPEC STYLE1 — one confirmed style change batch per layer. BUILT ONLY via chat_persona.build_style_changed_event (which enforces the layer/origin enums and refuses an empty changes list); appended via event_gate.append_event. layer = chat_persona | output_profile; origin = inferred_provisional (onboarding D7 carve-out, exactly once) | inferred_confirmed | asked | recalibrated; changes = [{knob, from, to}]. The show-my-style card reads per-knob provenance off this lane; no automated writer exists (D4: drift watch is OFF, hence no proposal_ref field — it would have no reader).",
+    "required": [["layer"], ["origin"], ["changes"]],
+    "properties": {"layer": "string", "origin": "string", "changes": "array", "evidence": "string"}
+  }
+}

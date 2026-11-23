@@ -1,0 +1,451 @@
+---
+name: one-pager-composer
+surfaces: both
+description: "Turn any topic, question, or pile of notes into a polished one-page executive brief in under 60 seconds. Fires on: 'one-pager on [topic]', 'make me a one-pager', 'one page summary of [topic]', 'I need a one-pager on [topic]', 'throw together a one-pager for [audience]', plus 'tune one-pager-composer'. Pulls evidence from the workspace when the topic names tracked entities, renders in the CEO's voice to the one-page discipline, output .docx routed to the matching project folder. Does NOT fire on 'memo on [topic]' (memo-writer — multi-page, directive), 'board pack' (retired, cr1#552 — workspace-manager says so), or 'research [topic]' (research — verified cited brief; the one-pager can consume its output)."
+
+voice_block_last_refreshed: 2026-04-21
+calibration_level: default
+template_version: 2.7.1
+---
+
+**Customer voice-block override (B1):** before drafting, read `_hq/voice/voice-block-one-pager-composer.md` if it exists — it supersedes this SKILL.md's `## Voice Block` section-by-section (override sections replace same-named defaults; absent sections fall through). The universal banned-phrase list still applies except where the override's Taboos explicitly carve out an item. Staleness reads the override's `Last refreshed:` first.
+
+## Deliverable Render Gate (GATE1 — MUST, v3.20.x)
+
+This skill produces a `.docx` deliverable. It MUST be produced through the canonical chokepoint — no exceptions:
+
+- **Render ONLY via `shared/scripts/brief_writer.py` `make_brief(brief_kind="one_pager", ...)`.** That single call runs the output-contract gate (B3), the voice-tell gate (B2), and the post-render leak scan, in that order, BEFORE the file is written.
+- **The file is BUILT in this session's scratch and LANDED in the workspace by the access layer (SPEC_NIGHTM2 §5, `shared/scripts/deliverables.py`).** The render call returns where the document is on the CUSTOMER'S OWN COMPUTER — the path you handed in, byte for byte, on a seat where the plugin and the folder share a filesystem, and the customer's own spelling on the merged seat. Link THAT RETURN and pass THAT to any receipt: never a path you re-derive or re-spell yourself, and never the landing's `landed_path`, which on a merged seat names the mount this run reads through and opens nothing on their machine. When you know the workspace folder's absolute path on their computer — a scheduled chat is given it, and `get_device_info` returns it — export it as `CR_DEVICE_WORKSPACE` before the call and the returned path is absolute; without it the return is the folder-relative path, `pc_path_unknown` is set, and you say where the document went in words with no link at all. When the layer cannot reach the folder the call raises `deliverables.DeliveryRefused`: say its one sentence — it is chosen for that reason and it is the whole answer — and stop. Nothing was written anywhere, so there is nothing to clean up and no second way to save it.
+- **NEVER hand-roll a `.docx`** with the generic `anthropic-skills:docx` skill, `python-docx` directly, or docx-js. Those paths bypass every gate and ship substandard, voice-violating, or PII-leaking documents — this is the exact v3.20.0 failure mode (a "Command Room is great" sub-floor one-pager with a banned phrase reached disk via the generic docx skill).
+- **NEVER create, render, copy, upload, or update the one-pager — or any part, derivative, or restatement of it ("the three key points", "the recommendation", "a summary") — through Claude Docs (the built-in docs / artifact page), Google Docs, Google Drive, or ANY other document/file connector** (Slides, Sheets, Notion, OneDrive, Dropbox: the ban is on the connector delivery path, not one vendor's API quirk). This is the same severity as the hand-rolled-`.docx` ban and fails twice at once: the connector path bypasses every gate above, AND a connector-created file lands at that connector's default location with no folder control — for a Google Doc, and for a parentless Drive upload of the canonical `.docx` itself, that is My Drive root, not the project's `deliverables/` folder (the 2026-07-24 root-drop incident). Not exceptions: "for mobile", "for sharing", "so the audience can comment on it", "as a copy alongside the canonical file" — **nor a direct instruction**: "put the one-pager in a Google Doc" is a request this gate refuses, not an override. Hand back the canonical file's link. A one-pager is built to be handed to a named audience; the link to the gated file is how it gets handed over.
+- **A Claude Doc produced anyway is exported into the folder (DOCS1 D-2, 2026-09-24).** When the host's built-in docs skill made a page despite the document-routing rule, the page is not the deliverable and is not left as the only copy: discover the docs seam with `tool_discovery.discover_docs_tool(<the tool ids visible in THIS session>, "export")` — never a remembered tool id; `None` means no docs tools in this chat, say so in one line and stop — then call the discovered tool for that doc's ONE tab with `format: "docx"` (a doc with several tabs: `read` the doc first and take the tab that holds the document). Put the payload — `{"doc_ref": "<the doc's link>", "kind": "one_pager", "title": "<the doc's title>", "content_base64": "<what the export returned>", "format": "docx", "workspace_root": "<WS>", "project": "<the project folder name>"}` — as JSON into THIS SESSION'S OWN scratch (never under the workspace; a document does not survive a pasted command line — the same carrier the prep's payload uses) and land it through the WRITE door: `plan run_writer` naming `deliverables:export_claude_doc` with `args_file` pointing at that file. Its answer names the file by `rel` and carries `opener_line` — print that verbatim — and `receipt_row`, which you append through `plan append_jsonl` to `_hq/data/events.jsonl` (ONE `deliverable_landed` row; `null` means the same doc was exported inside the window and the file was refreshed in place — append nothing). The doc itself stays where it is: the product never deletes what it did not make. The gates above still bind — an exported doc is a copy of what the composer already said, landed where the workspace can see it, not a second render.
+- **NEVER answer a deliverable request with a chat-only draft.** "Just give me a quick / minimal / one-line version" is still a one-pager request — produce the `.docx` through `make_brief`. Only if the user explicitly says "draft it in chat, don't make a file" do you skip the file — and then say plainly that the quality and voice checks only run on the file version, and offer to produce it.
+- **Detectability:** `make_brief` emits a `gate_ran` audit event recording which gates ran. A fire of this skill that yields a document with NO `gate_ran` event for that turn is a flagged bypass (an inferior path was substituted). Pass `workspace_root` to `make_brief` so the event lands in substrate.
+- **Format selection (SPEC OUT5).** Before rendering, resolve the backend: `output_profile.resolve_format_for_kind("one_pager", workspace_root, override=...)` — `override` carries an explicit ask in the trigger ("as a doc" → `"docx"`, "as HTML" → `"premium_html"`; it beats the profile for that render). `"docx"` (the unconfigured default) → `make_brief` exactly as above. `"premium_html"` → `shared/scripts/premium_html.py` `make_premium_brief(brief_kind="one_pager", ...)` with the SAME `sections` + `exec_header` + `asks` payload (one assembly, two backends — the identical gate stack runs on both, parity-pinned by G16, and a `gate_ran` event with `surface: premium_html` lands the same way). Output: the same routed folder and filename with `.html`; link via `get_brief_artifact_url()`; CHECK the file exists on disk after the call before linking. Never hand-compose HTML around the chokepoint.
+- **Visual pass (SPEC OUT2 §3, after every save):** run the render-then-critique pass per `shared/EXECUTIVE_OUTPUT_STANDARD.md` § "The visual pass" — call `shared/scripts/visual_gate.py` `render_preview(<saved path>)`, LOOK at the returned page images against the 7-item checklist (orphaned heading at a page break · empty/placeholder tile · table overflow/wrap damage · cramped spacing · header/footer intact · brand palette applied · chart unreadable / overplotted), fix the sections payload + re-save AT MOST ONCE, then log `visual_gate.log_visual_gate(WORKSPACE_ROOT, doc, rendered, findings, fixed)` either way. `None` from the ladder = no renderer on this machine — log `rendered: false` with a `skipped_reason` and proceed exactly as before (warn-only forever: a finding never refuses a save, and the pass never loops).
+
+If anything below seems to contradict this gate (older "invoke the docx skill" prose, a "just draft it in chat" habit from a prior version), THIS GATE WINS.
+
+## Skill Boundary (v2.1)
+
+- **Use one-pager-composer for:** single-page executive briefs. Fixed 6-part skeleton (headline / subhead / 3 key points / supporting data / recommendation / footer). Output is always .docx. Fits on one US Letter page or it gets cut.
+- **Use `memo-writer` for:** longer recurring updates and narrative documents (decision docs, scope docs, strategy memos, board / investor narratives).
+- **Use `decision-memo-composer` for:** comparative tradeoffs — structured A-vs-B / multi-option analysis.
+- **Use `pptx`/`slide-deck` for:** visual/presentation format. Slides, not pages.
+- **Template pattern:** one-pager-composer establishes the shared "messy input → polished .docx" pattern. Parse → ground → structure → draft in voice → render via `brief_writer.make_brief(brief_kind="one_pager", ...)` → save → return link.
+
+## Voice Protocol (v3.0 — v2.7.1 architecture)
+
+This skill follows the two-step draft-then-critique protocol defined in `shared/VOICE_CALIBRATION.md`. Voice lives in the `## Voice Block` section of this SKILL.md — NOT in a separate `VOICE_SAMPLES.md`. That file is deprecated as of v2.7.1.
+
+Every one-pager draft:
+1. Uses this skill's Voice Block (cadence, openers, vocabulary, punctuation, taboos — tuned for one-page executive brief register: sharp, numbers-first, headline-driven).
+2. Applies audience modifier based on the stated audience (board/customer/team/partner) or defaults to internal executive.
+3. Passes the Step 2 critique pass against the Voice Block + universal banned-phrase list.
+4. Strips any banned LLM tells before return.
+
+**Mechanical voice-tell gate (B2 — bash-gated, not prose).** The Step 2 critique is backstopped by the deterministic detector. After drafting (How It Works step 4) and before rendering, run the one-pager prose through it. It hard-fails on the exact banned phrases in `shared/VOICE_CALIBRATION.md`; structural tells warn:
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+printf '%s' "$DRAFT_BODY" | python3 "$PLUGIN_ROOT/shared/scripts/voice_tell_detector.py" - --context brief
+```
+
+On exit 1 (`FAIL`), rewrite the flagged lines and re-run until it exits 0. The same gate fires again at save: `brief_writer.make_brief(brief_kind="one_pager", ...)` raises `VoiceTellError` PRE-`Document()` (no file written) on a fail-severity tell, so a one-pager that still trips the detector never reaches disk via the gated path. (That guarantee is conditional on routing through `make_brief`; for a doc hand-rolled outside it, SPEC GATE2's deliverable sweep — `shared/scripts/deliverable_sweep.py` — **detects and flags** the same tells/leaks after the fact, before the one-pager leaves your hands.) A phrase the client's calibrated Voice Block demonstrably allows is exempt via `allow_phrases`; never improvise the override.
+
+Corrections on user-edited drafts append to `_hq/voice/corrections-one-pager-composer.jsonl`. The corrections corpus drives the next Voice Block refresh when the operator runs the calibration protocol.
+
+## Writer Contract (v3.7.1+ — substrate-aware)
+
+Before writing to any workspace file, read `shared/WORKSPACE_API.md`.
+
+**Primary writer for:**
+- `[project]/deliverables/[Topic]_OnePager_[YYYY-MM-DD].docx` (or `_hq/notes/` if no project scope — the one home for documents with no project, cr1#1581) — the polished one-page brief.
+
+**Appends to:**
+- `_hq/data/events.jsonl` — event type `one_pager_drafted` with `{topic, audience, primary_thread_id, artifact_path, source_decision_ids[], source_intel_ids[]}`. This lets `insight-generator` detect topical patterns ("you've written 4 one-pagers about pricing this month") and `operator-report` surface one-pagers in the work-produced section.
+
+**Reads from (v3.7.1+ substrate enrichment — was read-only over the data layer pre-v3.7.1):**
+- The CEO's input text + relevant `[project]/SESSION_NOTES*.md` + `PROJECT_CONTEXT.md` + `PROJECT_BRAIN.md` for project-specific facts.
+- `_hq/data/entities.json` for org / person / project context (e.g., if the one-pager is about Acme Co, pull their record).
+- `_hq/data/events.jsonl` for prior decisions on the topic — **read via the org-scoped reader, never a raw load** (PGUARD2 — the one-pager's audience is external): `from events_io import load_events_org_scoped; org_events, skipped = load_events_org_scoped(workspace_root)`, then filter `type == "decision"` with topic match. The reader applies the account-scope mask and drops personal-lane rows by design. Pulled into the brief's context so the one-pager doesn't contradict positions you've already taken. Source seqs go into `source_decision_ids[]` on the emitted event. **Subject-scoped when the project carries subjects (SPEC THREADANN1 §0 ruling 3):** once the topic resolves to a project (`primary_thread_id`), narrow the filtered decisions the same way call-prep does — `from thread_subjects import scope_events_to_subject; decisions = scope_events_to_subject(workspace_root, primary_thread_id, decisions, evidence={"attendee_org_ids": <the topic's org context, when known>})`. A project the weekly cleanup job never annotated passes `decisions` back UNCHANGED (the byte-identity fence the acceptance pins) — this only narrows a project that's ALREADY been split into evidence-scored subjects, never a project without them.
+- `_hq/intel/*.md` for captured intel on the topic — surfaced as "what we know" if the one-pager is research-heavy. Source ids go into `source_intel_ids[]` on the emitted event.
+- This skill's Voice Block + `shared/VOICE_CALIBRATION.md`.
+
+**Conflict boundary:** sole writer of `one_pager_drafted` events. No collision with any other skill.
+
+**Why the upgrade (v3.7.1 note):** pre-v3.7.1 this skill was read-only by design — a one-pager from 3 months ago was invisible to `insight-generator`, didn't show up in `operator-report` as work produced, and the topic-pattern detection ("you've made the same case 4 times") was impossible. The event write closes that loop while leaving the file-system deliverable shape unchanged.
+
+---
+
+# One-Pager Composer
+
+**For:** CEOs who need to produce a sharp, single-page brief fast — for a partner, customer, board member, or team — without spending 45 minutes wrestling with Word.
+
+## First-Run Personalization (SPEC FRP1)
+
+This skill adopts the First-Run Personalization Protocol (`shared/FIRST_RUN_PROTOCOL.md`). Both
+decisions are **show-then-tune (STT)** — the one-pager is produced first, then one-tap changes are
+offered. Read config through `get_config` — never the raw file.
+
+```python
+# Run the Access preamble first (CONTRACT Rule 22 v6, the block in shared/WORKSPACE_ACCESS.md): it resolves $PLUGIN_ROOT, exports CR_ENV, and cds there.
+import sys; sys.path.insert(0, "shared/scripts")  # valid because cwd == $PLUGIN_ROOT per the preamble above
+from skill_config_writer import get_config, save_skill_config, wipe_skill_config, is_configured
+
+DEFAULTS = {
+    "register": "external_formal",  # external_formal | internal_direct
+    "signature": "signed",          # signed (footer sign-off) | unsigned
+}
+cfg = get_config(workspace_root, "one-pager-composer", DEFAULTS)
+```
+
+`register` sets the default tone (the Voice Block still governs voice). `signature` controls
+whether the one-pager footer carries a sign-off.
+
+**Mode dispatch (4 modes):**
+
+| Mode | Trigger | Behavior |
+|---|---|---|
+| **Detect** (default) | "one-pager on…" | produce the one-pager with `cfg`. On the FIRST fire only (`not is_configured(...)`): `save_skill_config(workspace_root, "one-pager-composer", DEFAULTS)` BEFORE rendering, then append the first-run footer after the .docx link. |
+| **Show settings** | "show one-pager-composer settings" | render current config in plain English; no one-pager. |
+| **Tune** | "tune one-pager-composer" | pre-filled re-questionnaire OR freeform (table below) → `save_skill_config(..., is_reconfigure=True)` → re-produce. |
+| **Reset** | "reset one-pager-composer to defaults" | `plan run_writer` naming `skill_config_writer:reset_skill_config` with `{"skill_name": "one-pager-composer", "workspace_root": "<WS>"}` as its args (in-shell on a seat whose files are local: `reset_skill_config(workspace_root, "one-pager-composer")`); say its `line` → next fire is a first-fire again. |
+
+**The first-run block (footer — one-pager-composer ends in a chat link to the .docx, not a widget):**
+
+> *First time making a one-pager for you. I set 2 defaults: **formal tone (written for outside
+> readers)** · **signed footer**. Say "tune my one-pagers" to change either, or just tell me
+> ("internal/direct" / "unsigned").*
+
+The footer renders exactly once ever (`is_configured` gate).
+
+**Freeform tune (natural language → config):**
+
+| User says | Config change |
+|---|---|
+| "keep one-pagers internal/direct" / "less formal" | `register = internal_direct` |
+| "make one-pagers external/formal" | `register = external_formal` |
+| "leave one-pagers unsigned" / "no sign-off" | `signature = unsigned` |
+| "sign my one-pagers" | `signature = signed` |
+
+After applying: `save_skill_config(..., is_reconfigure=True)` + re-produce + confirm in one line.
+
+## What It Does
+
+Turn any topic or question into a polished one-page document in under 60 seconds. Input can be a prompt ("one-pager on our China supply chain exposure"), a link, a pasted article, or a loose pile of notes. Output is a formatted .docx saved into the current project's `deliverables/` folder, ready to email or print.
+
+This is the **template skill** for the "messy input → polished output" family. It's the quickest wow in a demo — single prompt in, beautiful artifact out — and sets the structural pattern that future output-layer skills inherit.
+
+## How to Use
+
+```
+"Write me a one-pager on [topic]"
+"Give me a one-pager about [our Q3 margin drop / this acquisition target / the new OSHA rule]"
+"One-pager: [headline]"
+"Turn these notes into a one-pager" (with pasted text or uploaded file)
+"Single-page brief on [topic] for [audience]"
+```
+
+If the user names an audience ("for the board", "for my sales team", "for a customer"), adjust tone and depth accordingly. If no audience, default to internal executive.
+
+## Output Structure
+
+**Deliverable link (CONTRACT Rule 3 — H2 heading link, LAST in the turn):** surface the .docx via `chat_output_renderer.doc_headline_link(label, brief_path.get_brief_artifact_url(absolute_path))` as the final line of the chat response — after the widget/summary and Sources, never interspliced mid-body, never a plain-text path, never a hand-built `computer://` URL.
+
+**File card first (CONTRACT Rule 3, owner ruling 2026-11-03).** Every file this turn made, this document included, comes back in the chat as a file card before the summary and before any link: call `SendUserFile` with the file and `display: "render"` (load it through the host's tool search when it is not in the tool list yet; a tool that has to be loaded is present, not absent). On a merged seat the card tool runs in this chat and cannot read the customer's computer, so stage the landed file into this session's own scratch first (the device staging tool, or the staged copy `plan_delivery` makes) and card that copy; never hand the card tool a path on the customer's computer, and never paste the file's bytes as text. Only where this chat has no file-card tool at all does the link or the saved-to line stand in for the card, and then `deliverables.card_absent_line()` is said once, in plain words, under it. A path in words is not delivery.
+
+Every one-pager uses this skeleton. No exceptions — consistency is the product.
+
+> **Executive Output Standard (EXEC1, v3.20.0+) — decision-forward.** Per `shared/EXECUTIVE_OUTPUT_STANDARD.md`: the **Headline is the exec-header VERDICT** (it already IS the conclusion — the one-pager is the standard's model for "headline = conclusion") and the **Recommendation leads** (it moves directly under the header, before the Key Points / Supporting Data audit trail). **FS-13: the one-pager renders the VERDICT lead ONLY — `brief_writer` no longer renders the CHANGED / DECIDE / NEEDED eyebrow for `one_pager` (it is a brief-family scaffold that misframed the page and cost it its single-page fit). Do not compose those lines; a why-now belongs in the Recommendation, not an eyebrow.** `one_pager` is decision-shaped, so `make_brief` ENFORCES the ordering — a Recommendation-headed section appearing only at section index > 2 raises. **The Recommendation gains a decide-by date and a cost-of-delay line ONLY when the arithmetic traces to substrate** (via `quantify.money_time_tag` / a logged figure); date alone otherwise — NEVER an estimated cost-of-delay.
+
+> **Exemplar anchor (SPEC OUT8).** Before composing, load the kind's structural exemplar — `exemplars.get_exemplar("one_pager", workspace_root)` (`shared/scripts/exemplars.py`) — and anchor STRUCTURE on it: section order, visual placement, proportions (the fixed skeleton below stays authoritative; the exemplar anchors layout within it). Workspace exemplar (`_hq/exemplars/one_pager/`) beats the shipped seed; `None` = compose on the skeleton below, unchanged. **Contract beats exemplar beats default** — an exemplar never licenses skipping the exec header, the ordering check, or the one-page cap, and it anchors structure, never facts: no name, number, or claim from the exemplar may appear in the page. After saving, run `exemplars.scan_docx_for_exemplar_tokens(docx_path, exemplar["text"])`; a finding means exemplar placeholder content leaked — fix the sections payload and re-save AT MOST ONCE (the visual-pass posture, warn-only). When the user gives structural feedback on a delivered one-pager ("make it like this", reorder/drop a section), capture it with `exemplars.append_structural_correction(workspace_root, kind="one_pager", direction=..., section=...)` — capture only; the exemplar itself is updated by the weekly `learning` job's exemplar leg, automatically at the shipped floors and narrated in the morning brief with a one-word undo (`shared/EXECUTIVE_OUTPUT_STANDARD.md` § "The exemplar anchor").
+
+1. **Headline → exec-header VERDICT** (1 line) — The single conclusion the reader should take away. Active voice, specific, no hedging. (Subhead's why-now folds into the header's CHANGED line.)
+2. **Recommendation**: What the reader should do. One paragraph, specific and time-bound. *(EXEC1: leads the body, directly under the header.)* Gains a decide-by date always, and a cost-of-delay line when it traces to substrate ("every week of delay is about an amount of exposure", only when `quantify` returns it).
+3. **Three Key Points** — Each one a tight paragraph, 2-4 sentences max. Lead with the claim, follow with the evidence. Bolded lead-in phrase. *(The audit trail for the recommendation above.)*
+4. **Supporting Data** — 3-5 bullets with numbers, dates, sources. If data is estimated or unavailable, say so plainly.
+5. **Footer** — Author, date, 1-line source note.
+
+Total length: fits on one US Letter page with 1-inch margins, 11pt Calibri. If content is overflowing, cut — don't shrink type.
+
+## How It Works
+
+1. Parse the prompt for: topic, audience, any attached data, any attached context files.
+2. If project context is available (user is in a client project folder), pull relevant session notes, PROJECT_CONTEXT.md, and recent deliverables for grounding.
+3. If web research is needed and the user hasn't said "use my notes only," use the web research connector to pull 2-3 authoritative sources.
+4. Draft using the skeleton above. Voice comes from the baked-in `## Voice Block` in this SKILL.md (Voice Protocol v3.0) — do not read external `VOICE_SAMPLES.md` files.
+5. **Render via the canonical brief_writer (v3.13.8+ — Bug #53):** call `shared/scripts/brief_writer.py` `make_brief(brief_kind="one_pager", ...)`. Do NOT invoke the `docx` skill or hand-roll docx-js. brief_writer enforces canonical Calibri typography, navy heading hierarchy (Heading 1/2/3 per Bug #7), eyebrow label "ONE-PAGER", and runs the universal post-render leak scanner (Bug #57/#59/#54) automatically. **Visual grammar (FS-12 — MUST):** data-bearing sections (supporting data, metrics, comparisons) render through the `table` / `matrix` / `tiles` primitives, never a bullet wall; before the visual pass run `visual_gate.flag_zero_table_data_heavy(sections, "one_pager")` and restructure any section it names. Fewer, structured facts also protect the single-page fit.
+6. Save to `[Current Project]/deliverables/` with filename `[Topic]_OnePager_[YYYY-MM-DD].docx`. If no current project context, save to `_hq/notes/` (matches the Writer Contract — this is the ONLY fallback location, the same home the export door uses for a document with no project).
+7. Return the file link + a 2-sentence summary of what's in it. Done.
+
+**Output guard:** no internal tokens, paths, event names, or version numbers in anything the CEO sees — vocabulary per `shared/VOICE_CALIBRATION.md` § Plain-language glossary.
+- Bad: "I made 2 calls: external-formal register · signed"
+- Good: "I set 2 defaults: formal tone (written for outside readers) · signed footer"
+
+**Output-contract gate (B3 — pre-save, before the voice gate).** `make_brief(brief_kind="one_pager", ...)` validates the structured `sections` against `shared/scripts/output_contract_validator.py` `RULES_BY_KIND["one_pager"]` BEFORE `Document()` is built (canonical order: contract → voice → render → leak scan): headline (the `title`) ≤25 words, Supporting Data 3-5 bullets, total 120-480 words, and the no-placeholder rule. The allowed form `[Figure needed — confirm before sending]` passes; every other placeholder (TBD, `[PLACEHOLDER]`, etc.) fails. On a blocking violation it raises `OutputContractError` (no file written). Read each violation's `section` + `fix_hint`, rewrite ONLY the failing sections — cut the headline, right-size the supporting-data bullets, or replace stray placeholder text with the allowed form or real data — and call `make_brief` again. Maximum 2 retries, then surface the failure plainly instead of shipping a substandard one-pager. **Sync rule: if you change the 6-part skeleton's counts or the headline cap here, change the matching entry in `output_contract_validator.py` `RULES_BY_KIND["one_pager"]` in the same commit.**
+
+## File Naming
+
+Format: `[Topic]_OnePager_[YYYY-MM-DD].docx`
+
+Examples:
+- `ChinaSupplyChain_OnePager_2026-04-20.docx`
+- `Q3MarginDrop_OnePager_2026-04-20.docx`
+- `AcquisitionTarget_Mercer_OnePager_2026-04-20.docx`
+
+## Formatting Standards (handled by brief_writer canonical path)
+
+The canonical `brief_writer.make_brief(brief_kind="one_pager", ...)` path already enforces:
+
+- US Letter, 1-inch margins
+- Body, headline, and section-label fonts + colors resolve through the brand theme (`shared/scripts/brand.py` — upgraded quiet-professional defaults; per-client override via the `brand` object in entities.json). Never hand-specify a color
+- Headline centered or left-aligned per template
+- Bullets use `LevelFormat.BULLET` — never manual unicode
+- Tables only when the data begs for it; never use tables as dividers
+- Footer in 9pt grey with author + date
+
+## Voice Block
+
+**Last refreshed:** 2026-04-21
+**Calibration level:** default
+**Sample count:** 0 (uncalibrated — generic sharp-executive defaults)
+
+### Sentence cadence
+- Typical length: 12-20 words
+- Maximum (headline): 25 words — hard cap
+- Maximum (key points / body): 30 words
+- Short-punch openers: frequent ("The number is 17%.", "One question matters.")
+
+### Openers (headline)
+- Preferred: active-voice, specific, conclusion-first. "Margin fell 17% because of three supplier concentration bets." "We should exit the China hardware line by Q3."
+- Avoided: "An analysis of…", "Considerations regarding…", "A review of our Q3 numbers"
+- Never use: "This document aims to…", "It is important to note that…", "The purpose of this one-pager is to…"
+
+### Vocabulary
+- Uses: specific verbs, concrete numbers, named entities. "17% drop", "3 suppliers", "Q3 exit", "Sam's team"
+- Avoids: "significant", "meaningful", "substantial", "leverage", "ecosystem", "holistic", "stakeholders" (name the group)
+- Domain-specific: whatever the topic calls for — but name it, don't abstract it
+
+### Punctuation
+- Em-dashes: occasional; never two in one sentence
+- Semicolons: rare
+- Parentheticals: rare in one-pagers — the page is too tight
+- Colons: acceptable before lists or definitions
+
+### Structure
+- Headline: single line, active voice, the conclusion. Never a question. Never a preamble.
+- Subhead: one sentence on why-now. Dates or quantitative trigger preferred.
+- Key points: bolded lead-in phrase + 2-4 sentence paragraph. Lead with claim, follow with evidence.
+- Supporting data: 3-5 bullets, each with a number, date, or source. Bullets are short fragments, not full sentences.
+- Recommendation: one paragraph, specific + time-bound. Names the action, the owner, the deadline.
+- Footer: author + date + 1-line source note.
+
+### Tone markers
+- Register: sharp, executive, commit-to-a-view
+- Self-reference: "I" or "we" — avoid passive voice
+- Hedging: minimal — if the data is weak, label the placeholder; don't cushion the language
+- Numbers over adjectives — always
+
+### Taboos (per-skill)
+- Never: "it is important to note that", "this document aims to", "in conclusion", "going forward", "synergies"
+- Never pad to fill the page. A strong half-page beats a bloated full page.
+- Never fabricate numbers to fill the supporting-data section. Mark `[Figure needed — confirm before sending]` and keep moving.
+- Never write a question as the headline. The headline is the answer.
+
+### Examples
+
+**Example 1: Headline and subhead (margin drop topic).**
+```
+# Q3 Margin Dropped 17%. Three Supplier Concentration Bets Are Why.
+
+The problem compounds through Q4 unless we diversify the top-3 supplier
+list by August 15.
+```
+
+**Example 2: Key point paragraph.**
+```
+**Supplier concentration is the headline risk.** 62% of Q3 hardware
+COGS came from three suppliers in Shenzhen. Two raised prices 9-14%
+in September. The third signaled a 2027 capacity cut. A single-supplier
+outage would stop the line for 4-6 weeks.
+```
+
+**Example 3: Recommendation close.**
+```
+## Recommendation
+
+Dual-source the top three SKUs by August 15. Sam's team owns the
+supplier shortlist by July 1. Finance models the 180-day inventory
+buffer by July 8. I'll chair a weekly Monday review until the second
+source is qualified.
+```
+
+### Anti-examples (bad → good)
+
+Apply the Universal writing standards in `shared/VOICE_CALIBRATION.md` (structure, specificity, floors — they do not override this skill's Voice Block). Each one-pager element has a failure mode; the contrast is the test.
+
+**Headline** — bad states a topic or asks a question; good states the conclusion.
+```
+BAD:  A review of our Q3 margin performance.
+GOOD: Q3 margin dropped 17%. Three supplier concentration bets are why.
+```
+
+**Key point** — bad leans on adjectives; good leads with the claim, then the number.
+```
+BAD:  Supplier concentration is a significant and meaningful risk that
+      could materially impact our margins going forward.
+GOOD: Supplier concentration is the headline risk. 62% of Q3 hardware
+      COGS came from three suppliers; two raised prices 9-14% in September.
+```
+
+**Supporting data** — bad is a vague assertion; good is a number with a date and source.
+```
+BAD:  Margins have been under pressure recently.
+GOOD: Gross margin fell from 41% to 34% between Q2 and Q3 (internal P&L, Oct 3).
+```
+
+**Recommendation** — bad is a direction with no owner or date; good names the action, the owner, the deadline.
+```
+BAD:  We should look into diversifying our supplier base soon.
+GOOD: Dual-source the top three SKUs by August 15; Sam's team owns the
+      shortlist by July 1.
+```
+
+## Triggers
+
+- "write me a one-pager"
+- "give me a one-pager"
+- "one-pager on"
+- "one-pager about"
+- "single-page brief"
+- "brief me on [topic] in one page"
+- "executive one-pager"
+- "turn these notes into a one-pager"
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## Gotchas
+
+- **If the topic is ambiguous, ask ONE question before drafting.** "One-pager on the lawsuit" → ask: "which lawsuit?" Don't guess.
+- **Don't pad to fill the page.** A strong half-page beats a bloated full page. If the topic genuinely doesn't need a full page, say so and deliver the shorter version.
+- **If the user asks for a one-pager on a topic with no available data, return a draft with clearly-labeled placeholders.** Do NOT fabricate numbers to fill the data section.
+- **Always render via `make_brief(brief_kind="one_pager", ...)`** (see the Deliverable Render Gate at the top). Do NOT hand-roll a `.docx` via the generic `docx` skill, and do NOT answer a one-pager request with a chat-only draft — those bypass the gates. Output markdown/inline text ONLY if the user explicitly says "just draft it in chat," and flag plainly that the quality and voice checks only run on the file version.
+- **Check the audience.** A one-pager for the board reads differently than one for the sales team. If audience isn't stated and isn't obvious from project context, ask.
+
+## What It Doesn't Do
+
+- Multi-page reports — use `memo-writer` (recurring updates / strategy memos) or a full report workflow
+- Decision frameworks / comparative tradeoffs — use `decision-memo-composer` (structured multi-option analysis); single-decision narrative capture is `memo-writer`'s decision doc
+- Slide decks — use `pptx` or the slide-deck skill
+
+## Template Pattern for Other Composers
+
+This skill establishes the shared pattern for all output-layer skills:
+
+- Parse → Ground (project/web) → Structure → Draft in voice → Render via the canonical `brief_writer.make_brief` chokepoint → Save → Return link
+- Output skeletons are fixed — the value is consistency, not creativity
+- Always render `.docx` deliverables through `brief_writer.make_brief` (GATE1) — never build files directly or via the generic `docx` skill
+- Always save into `deliverables/` with the naming convention
+- Always return a file link + 2-sentence summary, nothing more
+
+## Connected Tools
+
+- **`shared/scripts/brief_writer.py` `make_brief(brief_kind="one_pager", ...)`** — produces the Word file (the GATE1 chokepoint)
+- **Session Notes / PROJECT_CONTEXT** — project grounding
+- **Web research connector** — external data when needed
+- **Voice Block** (baked into this SKILL.md) — user voice calibration (v3.0)
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> Turn any topic, question, or pile of notes into a polished one-page executive brief in under 60 seconds. Produces a formatted .docx with headline, 3 key points, supporting data, and recommendation — saved to the project's deliverables/ folder, ready to send to a partner, customer, or board member. Use when the CEO says 'one-pager', 'one-pager on', 'write me a one-pager', 'make me a one-pager', 'I need a one-pager', 'need a one-pager', 'throw together a one-pager', 'single-page brief on', 'executive one-pager', 'turn these notes into a one-pager', 'one page summary', 'one page summary of', 'brief me on [topic] in one page'. Voice-calibrated via this skill's Voice Block per shared/VOICE_CALIBRATION.md. Also handles first-run personalization settings — use when the CEO says 'tune my one-pagers', 'tune one-pager-composer', 'show one-pager-composer settings', 'reset one-pager-composer to defaults'. DOES NOT fire on requests for multi-page reports / recurring updates / decision memos (use memo-writer) or slide decks (use pptx / slide-deck). This is the shortest-form output skill — pick it when the answer fits on one page.

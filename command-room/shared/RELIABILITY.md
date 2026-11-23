@@ -1,0 +1,243 @@
+# Reliability Contract — v2.1
+
+**Purpose:** Every skill in the Command Room plugin has to work reliably under flaky conditions — connectors time out, scheduled tasks fire when the CEO is offline, networks drop, rate limits hit. This contract defines the shared rules for graceful degradation, retry, state preservation, and failure reporting.
+
+**Applies to every skill that:**
+- Runs as a scheduled task (morning-briefing, cleanup, insight-generator, dormant-customer-scan).
+- Touches a connector (Gmail, Calendar, Slack, Granola, Drive).
+- Writes to workspace files (every skill, effectively).
+
+**Read with:** `WORKSPACE_API.md`, `PASSIVE_CAPTURE.md`, `SUBAGENT_VERIFICATION.md` (any orchestrator that fans out subagents re-verifies numeric claims through canonical helpers before rendering — R6).
+
+---
+
+## Core Principles
+
+> The primary user task always wins. Side effects and telemetry never block the primary output.
+
+> Fail loudly in the log. Fail quietly in the UX. The CEO sees what they asked for, always.
+
+> Idempotency is structural, not best-effort. Re-running any skill on the same inputs produces the same final state.
+
+---
+
+## Scheduled Task Reliability
+
+Skills that fire as scheduled tasks (morning-briefing at 7:30am, cleanup Sundays, insight-generator Sunday evening) follow these rules:
+
+### 1. Skip, don't fail, when context is missing
+
+If a scheduled task fires and the workspace isn't ready (no entities.json, no BUSINESS_CONTEXT.md, no recent session activity), the skill must:
+- Exit cleanly with no output.
+- NEVER create an empty briefing, empty audit, or generic fallback content.
+
+There is no skip log. A not-ready skip leaves no record unless the skill's own receipt step writes one.
+
+### 2. Holiday / vacation detection
+
+Before producing output, check `_hq/BUSINESS_CONTEXT.md` for an "Out of office" marker (date range). If the CEO is OOO:
+- morning-briefing still runs but output is titled "OOO BRIEFING — [date]" and contains only urgent-flagged items plus a "welcome back" summary on the return date.
+- insight-generator defers until 2 days after return date.
+- cleanup runs normally (maintenance is always valuable).
+
+### 3. Weekend handling
+
+- morning-briefing: skip on weekends UNLESS explicitly triggered manually. Its default schedule is weekdays only.
+- cleanup: fires Sundays (intentional — the CEO reviews Monday AM).
+- insight-generator: fires Sunday 19:00 (intentional — ready for Monday).
+- dormant-customer-scan: weekly Sunday (same reason).
+
+### 4. Missed-fire recovery + late-fire tiers (Phase 3 / R4)
+
+When the Claude app fires a missed slot late (machine was off/asleep), every CHAT orchestrator determines its run mode (`shared/RECEIPT_CONTRACT.md` § Run-mode detection) and computes its lateness at the top of the run via `shared/scripts/late_fire.py::check_lateness` — machine-local math (cron evaluates on the machine clock; workspace TZ is presentation-only) — and branches:
+
+- **Manual fire (typed trigger / Run Now / re-run)** — never late: no tier math, no banner, no event (v4.5.2 R2 — F-47 P1a wrote three false late_fires in one afternoon before this gate).
+- **< 3h late** — run normally, no mention.
+- **3–24h late** — run normally; the output opens with one plain line naming the scheduled time. Facts only — no cause is ever asserted (the "computer was likely asleep" narratives were fabrications, F-47/F-50).
+- **> 24h late** — degrade: the stale surface is NOT rendered, but every substrate write the task owes (events, view updates, the pack_run receipt) still lands silently, then one line tells the CEO the full surface was skipped and the next morning brief folds in what mattered.
+- **Silent task classes are EXEMPT** (membership = the `SILENT_TASKS` registry in `schedule_config.py`, never a name list): late is fine for the `maintenance` task (MAINT1 — it carries the reconcile / sweep / cleanup / insights / monthly jobs) — silent work always runs in full, and a job missed by a late or skipped fire stays due and self-heals at the next fire (`maintenance_dispatcher.due_jobs`).
+
+Lateness is scored ONLY against an UNSERVED slot (v4.5.2 R2): the task's newest substrate receipt is the served-slot marker — a slot with a receipt after it never produces a second late_fire, **and since SCHED1 (2026-08-17) never a second DELIVERY either — within the bound RUNNOW1 put on it (below)**: a scheduled-context fire for a served slot writes an honest `skipped` receipt and — only once that receipt has landed — gets back `directive: "skip_render"` plus a one-line ack, and renders nothing (a manual fire is unaffected — a human who asks for the surface gets it; a receipt that could NOT be written returns no directive, so the fire renders rather than leaving the day with neither a surface nor a record). **That skip is BOUNDED, and a `skipped` receipt is not a serve (RUNNOW1, 2026-08-23).** On `fired_via: "scheduled"` it holds only within `late_fire.SERVED_RECEIPT_MAX_AGE` (2h) of the receipt that served the slot — the duplicate it exists for, a catch-up and a cron fire delivering the same edition minutes apart. A **scheduled** fire arriving LATER for a served slot returns tier `rerun`, `directive: null`, `rerun_of`, and an ack the orchestrator posts ABOVE the surface it then renders in full: past that window the fire is a person pressing Run Now, and run mode is self-reported, so nothing can tell you otherwise. An explicit `fired_via: "catchup"` is exempt from the bound and keeps SCHED1's skip in full at any age — it is the one run mode that can prove it is not a person, since a Run Now always labels itself `scheduled`. Unbounded it refused people — a Saturday Run Now that labelled itself `scheduled` was answered "already ran … so I'm not sending it twice" 1,945 minutes off-slot, and asking again reproduced it — and, because the served-slot marker had no status filter, it re-armed from its own skip receipts, so two presses in a row could both be declined with the second citing the first. A re-run's OWN receipt (the one carrying `rerun_of`) is excluded from the served-slot marker for the same reason — it records a delivery a person asked for, not the scheduled delivery of a slot — so repeated presses each render, each naming the last time the surface actually ran. Both stay fully visible as `last_skip` / `last_rerun`; they simply stop standing in for a delivery, and the two-hour bound is still measured against the slot's serving receipt alone, so a genuine scheduled duplicate is stopped exactly as before. The skip receipt carries `window_incomplete_before`, seeded from the served instant before anything that can fail: a skip processes nothing, so without it `catchup.last_successful_point` would read the duplicate's own timestamp as how far processing reached and the next real fire would silently under-scan the whole span. Detecting the duplicate and rendering it anyway is what produced three full duplicate deliveries in one day. **Every path that pauses, disables or enables a task writes its `schedule_config_changed` record through `schedule_config.log_schedule_config_change` — the one writer** (SCHED1 §0-4: the registration fold-in wrote three `schedule_created` events and no record for the two chats it paused, leaving the F-51 suppression below reading a week-old marker). A slot older than the task's latest `schedule_config_changed` was minted by the change (F-51) and is never scored; scheduler `lastRunAt` stamps are never consulted (they land without execution — F-39). A `late_fire` event logs on the 3h+ tiers with `fired_via: catchup`; `late_fire.detect_chronic_lateness` (consumed by cleanup's Monday note) proposes a better default time after >24h-late fires in 3 of 4 weeks — the actual move always goes through change-schedule, and a schedule change never fires the task.
+
+### 4b. A late fire processes the whole missed span, not just its nominal window (CATCHUP1)
+
+Dispatch recovery above answers *"does the missed work still run?"*. This answers *"once it runs, what does it look at?"* — and they are different questions with different failure modes. A window measured as a fixed offset from `now` silently drops any closure longer than the offset: a three-day gap and a 24-hour window means two days of meetings are never processed, and the receipt that lands looks identical to a healthy one.
+
+- **Span windows** — every surface whose window is `[now − N, now]` computes it through `shared/scripts/catchup.py` `catchup_window(workspace_root, task_id, floor_hours=N, cap_days=30)` instead. The span runs from the last SUCCESSFUL run, never narrower than the nominal window (a fire an hour ago still covers its normal ground) and never wider than 30 days. No receipt ever means the nominal window — a fresh install does not back-process a month. Live at `past-meetings` (24h) and `friday-wrap` (168h).
+- **Partitioned periods** — where each period is its own labelled deliverable (the monthly operator report + value receipt, the opt-in monthly scorecard), one report per missed period via `catchup.missed_periods`, oldest first. "The previous full calendar month" is not a substitute for a month that was skipped; the dispatcher hands these jobs a `periods` list and the registered prompt iterates it.
+- **Batch caps must be honest — on EVERY surface the window widened.** A fire that cannot finish its widened window records `window_incomplete_before` on its receipt via `catchup.receipt_window_marker`, and the next window resumes from that value. Without it, widening the window just relocates the orphaning bug behind a green receipt. This is one rule with two shapes, and a fix on only one of them is the bug on the other: where the cap truncates a chronologically sorted list (`past-meetings`, 5 meetings a fire) the marker is the **oldest unprocessed item** and it advances as the backlog drains; where the cap drops the **lowest-ranked** items scattered across the span (`weekly-recap`'s six per-connector budgets, all sized for 7 days against a window that can be 30) no contiguous tail exists, the marker is the **window's own start**, and the next fire re-covers the span — free, because capture dedups on `source_ref_hash`. A fire that sampled its window says *sampled* in any headline that would otherwise claim coverage.
+- **A widened window crosses a clock boundary, and it crosses it once.** The span math here is machine-local naive because the scheduler is (R8). A connector query is not: it needs an unambiguous instant. So `catchup_window` returns both forms — naive `start` / `end` for receipt math and span comparisons, offset-carrying `start_aware` / `end_aware` for every connector call — and `catchup.to_connector_iso` is the single promotion point. Never hand a naive machine-local value to `tz.to_local`, which documents naive input as assumed-UTC and will move it by the machine's whole offset. This is LATETZ's failure class, and it is invisible wherever the workspace TZ and the machine TZ agree — agreement is not correctness, it is the bug not showing.
+- **Best-effort, always.** Every catch-up computation falls back to the nominal window on any failure. Catch-up widens a window; it is never the reason a fire produces nothing.
+- **Catch-up is silent.** The widened span is not narrated as a lateness event — `late_fire` already owns that surface. The only place a wider window may surface is where a headline would otherwise make a false claim about what was covered ("the last 12 days", never "this week"; a counter labelled "Last 24h" over a three-day sweep).
+- **Scheduled path only, where the distinction matters.** A human typing "weekly recap" means last week, not five weeks — those call sites pass `scheduled_only=True` with the fire's real `fired_via`, and anything that does not normalize into `{scheduled, catchup}` gets the plain nominal window (DOGFIX1's fail-safe direction).
+
+Legacy per-skill recovery notes (still true, now subordinate to the tiers above):
+- morning-briefing: a next-session catch-up briefing may cover up to 3 missed days; beyond that, surface as "you were offline N days — want a full catch-up?".
+- cleanup: runs at next opportunity; no catch-up needed — the audit is a point-in-time snapshot.
+- insight-generator: reruns once if the missed fire was <7 days ago; otherwise defers to next scheduled fire.
+
+### 5. Scheduled task output delivery
+
+Per each skill's delivery spec, output goes to:
+- Slack DM (if connected and preferred)
+- Gmail to the CEO's own address (if preferred)
+- `_hq/briefings/` / `_hq/insights/` / `_hq/audit-reports/` (fallback — the CEO sees it on next session launch)
+
+If the primary delivery channel fails (Slack down, Gmail rate-limited), fall back to file-save and continue — never drop the output.
+
+---
+
+## Connector Failure Handling
+
+Every connector read follows this error protocol:
+
+### 1. Timeout budget
+
+- Single connector read timeout: 15 seconds.
+- Full skill connector-scan timeout: 60 seconds (aggregate across all connectors).
+- If budget exceeded, abort remaining reads, return partial output with a `⚠️ [Connector] skipped — timeout` line.
+
+> **Honest mechanism (SPEC CON1):** these are **targets the skill self-polices**, not a hard ceiling — there is no shared timeout wrapper around connector/MCP calls, and the runtime does not interrupt a slow call at 15s. The numbers are a budget the model is asked to honor (stop scanning past ~60s and return partial output). There is no timeout event or timeout log, so a skill that gives up leaves no record unless its own receipt step writes one. Treat them as a service-level *intent*, not an enforced limit. A real shared wrapper is future work; until it exists, do not claim these are guaranteed.
+
+### 2. Graceful degradation
+
+For every connector read, if the connector:
+- Is not connected: silently skip. Never surface "Gmail is not connected" to the user — they know. Build the output from available sources.
+- Returns an auth error (expired OAuth): surface ONCE per session: "⚠️ [Connector] needs reconnection — [link]." No file holds that flag: nothing writes an auth-failure log, so not re-prompting later in the session is up to the chat.
+- Returns a rate-limit error: back off exponentially (wait 5s, 15s, 60s) up to 3 attempts. If still rate-limited, mark that connector unavailable for the rest of the session.
+- Returns a 5xx: retry once after 3s. If still failing, treat as unavailable.
+- Returns malformed data: skip the specific bad record, log to `_hq/CONFLICTS.md` with type `connector-malformed`, continue with the rest.
+
+### 3. Cache of last-known-good
+
+Skills that run daily (morning-briefing) may read a per-connector cache of the last successful fetch (stored at `_hq/caches/[connector]-last-good.json`, overwritten on every successful read). If a connector fails completely, the skill can fall back to the cache and flag: "⚠️ [Connector] unavailable — showing last-known-good from [timestamp]."
+
+Caches are:
+- Per-workspace, never shared (per PLUGIN_BOUNDARY rule 2).
+- Auto-pruned: only the most recent successful fetch per connector is kept.
+- Not considered memory — caches are regeneration-safe. Deleting `_hq/caches/` loses nothing the next run won't regenerate.
+
+### 4. Never fabricate when data is missing
+
+If a connector is unavailable and no cache exists, the skill must NOT fill the gap with guesses. Say "data unavailable," skip that section, continue.
+
+---
+
+## Write Reliability
+
+Per `WORKSPACE_API.md`, all writes are transactional at the append level. Additional reliability rules:
+
+### 1. Write ordering
+
+For skills that do both a JSON append and a markdown append (per `PASSIVE_CAPTURE.md`):
+1. Append to `events.jsonl` FIRST.
+2. Append to the SESSION_NOTES or other markdown source SECOND.
+3. If step 1 fails: skip step 2, log to `_hq/CONFLICTS.md`, surface "couldn't log this event — workspace may be stale. Try again or check `_hq/CONFLICTS.md`."
+4. If step 1 succeeds and step 2 fails: log to CONFLICTS, flag "event captured but narrative notes incomplete — `events.jsonl` has the record."
+
+### 2. Idempotency via dedup
+
+Every event append includes a dedup hash (see `PASSIVE_CAPTURE.md` rule on hashing). Before appending:
+- Compute the hash.
+- Check the last 200 events for a match.
+- If matched, skip (no error, no log — silent success).
+
+This makes re-running any skill safe. A user can "run morning-briefing" three times and still have one set of events captured.
+
+### 3. Concurrent-write protection — events.jsonl writer lock (shipped v3.19.x, SPEC A1)
+
+**Current state, plainly:** `atomic_append_jsonl` writes to `events.jsonl` inside a cross-process **writer lock**, so the whole read → seq-stamp → atomic-rename sequence is one critical section. Two concurrent callers can no longer lose an event or duplicate a seq. The atomic-write helper already guaranteed no reader sees a torn/partial file; the lock now also guarantees both racing writers land.
+
+**The race this closes (pre-A1 behavior):**
+
+1. Skill A reads `events.jsonl` tail (seq=42), computes its new event with seq=43.
+2. Skill B reads the same tail before A writes, also computes seq=43.
+3. A's `atomic_append_jsonl` reads the file, appends, renames.
+4. B's `atomic_append_jsonl` reads the file, appends with its stale seq=43, renames.
+
+Outcome was either a duplicate seq or B's rename silently overwriting A's event (no flag, no log). On Windows the racing `os.replace` could additionally raise `PermissionError [WinError 5]`. Measured pre-A1: 8 processes × 25 concurrent appends produced **25 of 200** events (175 lost). With the lock: 200/200, seq 1..200, zero duplicates.
+
+**How the lock works** (`shared/scripts/writer_lock.py`, `events_writer_lock`):
+
+- **Primary mechanism:** an OS byte-range lock (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows) on a dedicated, never-rewritten file `_hq/data/.writer.lock`. The kernel releases the lock automatically when the holder process dies, so **a crashed writer recovers with zero manual cleanup** (measured reacquire < 0.01s).
+- **Cloud-sync safe:** the lock file's content (a single byte) never changes and the file is never renamed/deleted — zero OneDrive/Drive sync churn. Holder diagnostics go to a sibling `.writer.lock.info` file that the locking logic never reads.
+- **Fallback:** if the OS lock syscall raises `OSError` (some network/virtual mounts refuse byte-range locks), it falls back to the sentinel lock (`.writer.lock.sentinel`, 30s stale timeout + pid-liveness reclaim). The write still lands.
+- **Timeout + jitter:** 30s default timeout, jittered retry to avoid lockstep contention. On timeout `atomic_append_jsonl` raises `TimeoutError` with an actionable message.
+- **Reentrant** per process+thread, so a skill that appends while already holding the lock never deadlocks itself.
+
+**Contention telemetry:** best-effort counters in `_hq/.system/lock_stats.json` (`waits`, `total_wait_ms`, `timeouts`, `fallback_sentinel_acquires`, `last_timeout`), written only when a wait exceeded 100ms (no write on the uncontended fast path). `cleanup` surfaces these in its Monday note and resets them. Telemetry failures are always swallowed — they can never break a write.
+
+**Scope note:** the lock is cooperative and covers `events.jsonl` only. `entities.json` / `aliases.json` keep their own sentinel lock (`atomic_write.acquire_write_lock`); a process holding both must acquire the events lock **second** to avoid an ordering deadlock. Writers that bypass `atomic_append_jsonl` entirely (forbidden per `WORKSPACE_API.md`) remain unprotected — the event-contract guard tests are the enforcement layer there.
+
+### 4. Corrupted file recovery
+
+Two different files, two different mechanisms — they are not interchangeable.
+
+**`entities.json` / `aliases.json` (rewritten in place):** `atomic_write.atomic_write_json_locked` re-reads the file after every write and confirms it parses. If it does not, it best-effort restores from the **newest existing backup in the sibling `_hq/data/_backups/` folder** and then raises, so the calling skill knows the write did not land. Log to `_hq/CONFLICTS.md` with type `corruption-recovery` and surface: "⚠️ Detected corruption in [file]. Restored from backup of [date]. Any changes since then may need to be re-captured."
+
+**`events.jsonl` (append-only history):** never restored over — a restore would delete real events. Corruption is healed by `cleanup` Phase 3b, which quarantines only the malformed lines to `_hq/.system/quarantine/` (saved, never deleted), atomically rewrites the file without them, and appends a `corruption_recovery` event.
+
+**What `_hq/data/_backups/` actually contains.** There is no daily snapshotter and no 14-day rotation. That folder is the single backup location (workspace-hygiene rule: the 3 newest of each backed-up file, one place) and it fills from one-off writers — `migrate_persons_v3_13_0.py` before a migration, the end-session MASTER_TRACKER rolling copy (Rule 11), and any deliberate pre-rewrite copy a skill makes. So the restore above is best-effort by construction: with nothing to restore from, the write fails loudly instead of silently half-landing. The primary protection is that atomic writes cannot produce a torn file in the first place — restore is the second line, not the first.
+
+---
+
+## Where failures are recorded
+
+There is no log folder and no per-type failure log, so there is nothing to rotate. Earlier versions of this contract named such files; no code ever wrote them. A failure lands in one of these records, or in none. The third column says which records code writes and which exist only when the chat follows a skill's or orchestrator's instruction:
+
+| What happened | Where it is recorded | Written by | What reads it |
+|---|---|---|---|
+| A scheduled fire found its slot already served | A `pack_run` receipt with status `skipped` | Code: `late_fire`, through `receipts.log_receipt` | `receipts.last_receipt_times`, which the watchdog (`task_watchdog.health_verdict`) uses |
+| A scheduled fire skipped because the workspace was not ready | No record, unless the skill's own receipt step writes one (weekly-insights and dormant-customer-scan require a receipt on every run) | The chat, on the skill's instruction | The receipt readers, when a receipt exists |
+| A connector timed out, refused auth, or hit a rate limit | No record of its own. The End of Day receipt carries `connector_gaps` when the chat passes them to the pack writer | The chat supplies the reasons; code (`end_of_day`) copies them onto the receipt | Nothing in code reads them back from the receipt |
+| A dedup hit | Nothing. A matched hash is a silent success (Write Reliability, rule 2) | Nobody | Nothing |
+| A scheduled fire could not go on (hard failure) | A `scheduled_task_failure` event carrying the diagnostic | The chat, on orchestrator instruction (the morning-brief and historical-backfill orchestrators); no code writes it | `task_watchdog.check_task_failures`, inside the watchdog's verdict, for 7 days |
+| A surface could not render | A `surface_failed` receipt | Code: `surface_drivers.log_surface_failed`, the only writer | `receipts.last_receipt_times` and `receipts.count_runs` |
+| An `events.jsonl` append could not get the writer lock | `atomic_append_jsonl` raises `TimeoutError`, and the timeout is counted in `_hq/.system/lock_stats.json` | Code: `writer_lock` | `cleanup`, which reports the counters weekly and resets them |
+| Malformed lines in `events.jsonl` | They move to `_hq/.system/quarantine/` and a `corruption_recovery` event is appended | Code: `recover_corruption.py` | `cleanup`, which runs it every fire and reports what it healed |
+
+---
+
+## User-Facing Messaging
+
+When a reliability event has to surface to the user:
+
+### Keep it single-line and actionable.
+
+- ✅ "⚠️ Gmail skipped — timeout. Re-run or check connection."
+- ❌ "We were unable to fetch data from Gmail due to a network timeout. Please verify your internet connection and OAuth token validity, then re-run the command..."
+
+### Never block the primary output.
+
+The briefing / audit / brief comes first. Warnings go at the top or bottom as a brief note, not as a paragraph.
+
+### Don't apologize.
+
+- ✅ "Couldn't reach Slack. Showing the rest."
+- ❌ "I'm sorry, but I wasn't able to..."
+
+### Never invent explanations.
+
+If you don't know why something failed, say "[Connector] unavailable" and move on. Don't speculate ("probably a network issue").
+
+---
+
+## What This Contract Does Not Do
+
+- Does not handle catastrophic failures (workspace folder missing, disk full, OS-level errors). Those are surfaced as the system-level error with no graceful fallback — the user needs to fix infrastructure.
+- Does not replace the user manually clicking "retry" — the CEO can always re-run a skill to get fresh data.
+- Does not guarantee real-time freshness — Command Room is a near-real-time system, not a live one. A briefing might be 15 minutes stale; that's fine.
+
+---
+
+## Validation
+
+No check reads a failure log, because none exists. These are the reliability checks that run today:
+
+1. `cleanup` (weekly, in its scheduled-task watchdog step) and the on-demand health check (`system-health`) read one verdict, `task_watchdog.health_verdict`: each scheduled task's newest receipt against its schedule, and any `scheduled_task_failure` event from the last 7 days that is newer than the task's last good receipt.
+2. `cleanup` reads the writer-lock counters in `_hq/.system/lock_stats.json`, reports them in plain words, and resets them.
+3. `cleanup` runs `recover_corruption.py` on every fire, which heals malformed `events.jsonl` lines and records a `corruption_recovery` event.
+
+---
+
+**End of reliability contract.**

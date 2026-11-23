@@ -1,0 +1,385 @@
+---
+name: reconcile-sent
+surfaces: both
+description: "Silent job in the Maintenance task (3x weekdays) with four write jobs: close commitments the CEO completed by emailing outside the product's draft path; open a commitment when a sent reply carries an untracked promise; watch earlier sends for outcomes (replied / no reply / bounced); persist mid-confidence matches for one-click confirm on the plate. Runs as a close leg inside the maintenance background task, after its capture legs (MAINT1); no widget, no chat surface. Manual fire: 'reconcile my sent mail'. Honors pending-review flags (never auto-resolves); reconciliation only, whatever task carries it. Does NOT fire on 'follow up' phrasings (follow-up-ritual / email-writer) or 'scan for commitments' (scan-for-commitments, historic bulk extraction)."
+---
+
+# Reconcile Sent — silent commitment reconciliation
+
+This task is all write-side work — four silent write jobs (commitment closures,
+the sent-promise capture, the email-outcome watch, the voice reconcile) and no
+visible deliverable to hide behind. Reconciliation is write-side maintenance (cursor semantics + idempotent
+closures); the morning brief is a read-mostly render. They were co-located and
+the invisible write lost every time (Bug #98-v3). Here the writes ARE the job,
+so there is nothing to deprioritize them against — the same reason the silent
+Sunday `cleanup` task runs reliably.
+
+**Personal sources, before the first connector read (cr1#1179).** Render `cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_helper --json '{"name": "connector_reads:chat_wall", "args": {"workspace_root": "<WS>"}}'`, paste what it prints and run that, once, before any connector is read here, and follow `shared/CHAT_WALL.md`: call no tool on a server in `connectors`, show no message from a mailbox in `mailboxes` unless its sender is in that entry's `except_senders`, write nothing from either, and say nothing about what was left out.
+
+## Skill Boundary (v2.1)
+
+- **Use reconcile-sent for:** the silent background pass over the declared mail backend's Sent folder — closing already-handled commitments, OPENING commitments from sent promises nothing tracks yet (v4.6.2), watching tracked sends for outcomes, logging voice corrections. It renders nothing.
+- **Use `inbox-triage` for:** inbound mail — triage, classification, reply drafts. Its commitment extractor covers both directions but only ever sees unread-inbox threads (the unread + in-inbox intents) — a thread the CEO read and replied to the same day never reaches it. THIS task's sent-promise capture is the rescue path for exactly those outbound promises (the BUG-3719 class: a promise made in the CEO's own reply, in a thread triage never scanned, aging silently until the counterparty chases).
+- **Use `morning-briefing` for:** the reader-facing brief; it reads the closures this task wrote.
+- **Use `commitment-triage` for:** viewing open commitments on demand (`show-my-list` is retired, cr1#552).
+
+## Writer Contract
+
+Every write goes through a locked helper — never a hand-rolled append:
+
+- `commitment_resolved` events + the `sent_reconcile` audit event + the `workspace.sent_reconcile_cursor` advance — via `reconcile_sent_commitments.reconcile_and_receipt` (one call, Step 3).
+- NEW `commitment` opens (and `commitment_observed` set-asides) from the CEO's own sent promises — the SAME `reconcile_and_receipt` call (its `sent_commitment_items=` argument, Step 2c → Step 3), which routes them through `sent_capture.capture_sent_items` → the shared capture block (`capture_gate.gate_commitment_data`), the W4c relevance gate, restatement dedup vs the open set, and one locked `event_gate.append_event` batch.
+- NEW contact records for people the CEO actually corresponds with (CONTACT1) — the SAME `reconcile_and_receipt` call (its `contact_capture_items=` argument, Step 2d → Step 3), which routes them through `contact_capture.capture_contacts` → the two-way + hard-clarity gate → the shipped `people_writer.auto_add_person` (FS-11) on the existing `person_org_creation_structured_fact` auto class, with its own `workspace.contact_capture_cursor` and one `contact_captured` marker per create (the undo anchor and the idempotency ledger).
+- Terminal `email_outcome` events (`replied` / `no_reply_7d` / `bounced`) — via `email_outcomes.watch_and_receipt` (Step 2b).
+- Voice-correction appends under `_hq/voice/` — via `voice_corrections.reconcile_sent_against_snapshots` (Step 4b).
+
+No other files touched; no view renders. Reads: the declared mail backend's Sent folder (resolved in ONE call via `tool_discovery.discover_mail_search_tool(tools, declared=connector_config.declared_backend("email"))` — the seam resolves the declared backend first and refuses to substitute another product's tool; the in-sent / from-me intents compile to provider operators in `connector_adapters/mail.py`, never named here), `entities.json`, `events.jsonl`, `_hq/voice/draft-snapshots.jsonl`.
+
+**Account-scope (connector-agnostic-v1, R10 §7a).** Sent-mail scanning attributes commitments to the owner, so it runs ONLY against **classified in-scope** accounts. An `unclassified` account is excluded from the Sent pass entirely (fail-closed — never file personal sent mail as business commitments before classification). Superhuman's ~1-min post-send sync lag (capability manifest) is tolerated — a just-sent message may not appear yet; the over-wide window stays safe because of the BUG-3719 self-closure guard, which now keys on the **canonical dedup key** (`connector_adapters.provenance.canonical_dedup_key`) so it holds across legacy `gmail:<id>` and new structured provenance (R16).
+
+## When this runs
+| Mode | Trigger |
+|------|---------|
+| **Scheduled (primary)** | the first CLOSE leg in the `maintenance` task's weekday fires (MAINT1; since cr1#663 the two capture legs, `meeting-capture` and `session-sweep`, run ahead of it, so a fire over a gap opens before it closes): due at every 6:45 AM / 12:45 PM / 5:45 PM weekday slot per `maintenance_dispatcher.due_jobs`; the 6:45 pass runs BEFORE the 7:00 morning brief, so the brief reads an already-reconciled substrate |
+| **Scheduled (chat leg)** | `reconcile-chat` — the SECOND job, same cadence, same fire (Step 6). Closing from chat is wired into the maintenance cadence exactly like closing from mail: a registered leg, never an on-demand extra. A maintenance run missing it is reported as incomplete (`maintenance_dispatcher.roster_gap`), not quietly partial |
+| **Manual (normal)** | "reconcile my sent mail", "reconcile sent" |
+| **Manual (wide catch-up)** | "catch up my sent mail", "reconcile the last N days", "reconcile my backlog" — fetches a 30-day (or N-day) window regardless of the cursor, to clear backlog stranded behind a stale cursor (Bug #101) |
+
+## Enforcement is on the EVENT, not a sentence (Bug #98-v3)
+
+The v3.18.9 fix gated on a printed "reconciled…" line. That was gameable — the
+model fed the matcher a curated message list and printed a truthful-looking line
+without a real fetch. So the success criterion here is a **substrate artifact a
+validator reads back**, never a narration:
+
+- A real `sent_reconcile` audit event must land in `events.jsonl` carrying
+  `cursor_from`, `cursor_to`, and `sent_scanned_count`.
+- `validate_reconcile_ran` reads it back and confirms it's THIS run's audit.
+- If you cannot show that event, **the task FAILED** — say so plainly; do not
+  narrate a success.
+
+## The job (do exactly this)
+
+**Before any python snippet below (Rule 22):** resolve the plugin root and run every snippet from it — the cwd never persists and `shared/scripts` only resolves from the plugin root:
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+```
+
+1. **Determine the fetch window — and look BACK far enough to clear stranded backlog (Bug #101).** Read `workspace.sent_reconcile_cursor` from `entities.json` and hold it as `cursor_before` (you'll validate against it). **The cursor is NOT automatically trustworthy as a fetch floor:** a pre-v3.18.12 version could leave the cursor sitting ahead of mail it never actually reconciled (it claimed "reconciled up to here" while doing nothing), which strands every earlier sent message — a fetch floored at the cursor would never see it. So choose the fetch floor by mode:
+   - **First real run on this workspace** — detect via `validate_reconcile_ran(workspace_root)["ran"] is False` (no prior `sent_reconcile` audit event exists) → fetch the **last 30 days** regardless of the cursor. This clears any backlog a stale cursor skipped past.
+   - **Manual catch-up** ("catch up my sent mail" / "reconcile the last N days") → fetch the requested window (default **30 days**) regardless of the cursor.
+   - **Normal scheduled run** (a prior audit event exists) → fetch with the `{"in_sent": true, "after": <cursor-date>}` intent (compiled per provider by `connector_adapters/mail.py`) with a ~1-day overlap behind the cursor (cheap, idempotent, catches near-cursor stragglers). A cursor older than 30 days reads as a first run, the 30-day window (cr1#663, the one maintenance window bound): `reconcile_sent_commitments.plan_sent_window` answers all three branches as `after`, with the window it applied under `maintenance_window`.
+
+   `reconcile_and_receipt` advances the cursor to the newest message in whatever window you fetched (never backwards), and matching is idempotent — a wide re-scan closes nothing twice, so an over-wide window is always safe.
+
+   **This step has a twin, and it is not optional to keep them equal (SPEC MAILFLOOR1).** The End of Day fire calls the same `reconcile_and_receipt` on the same cursor, so it states these same three branches in its own text: `skills/enable-command-room-schedules/references/orchestrator-past-meetings.md`, Phase A. Change a window here and change it there in the same edit — a test pins the pair equal and goes red on a one-sided change.
+
+   **Also record the fire start NOW, before anything is fetched or written** (RECONFENCE layer 2): `fire_start = datetime.datetime.now(datetime.timezone.utc).isoformat()`. Hold it as `fire_start` — Step 3 passes it. It marks the instant this run began, so a commitment captured at or after it cannot be treated as independent evidence for closing itself. It must be taken here, at the TOP, not next to the Step-3 call: taken later it would sit after any capture phase and fence nothing.
+
+2. **Do a REAL Sent fetch over the Step-1 window.** The declared mail backend's seam-resolved search tool, with the `{"in_sent": true, "after": <the floor date you chose in Step 1>}` intent compiled per provider by `connector_adapters/mail.py` (30-day floor on a first run / catch-up; the cursor date on a normal run). When the connector says more pages remain, read the next pages too, until the window is covered; a read that stops before the end passes `read_complete=False` in Step 3, and an errored read passes `fetch_blocked` with an empty batch (cr1#742, cr1#827). This is the whole point of the task — do NOT reuse a message list pulled for some other purpose; that's the exact shortcut that gamed the old gate. For each outbound message resolve `recipient_person_ids` against `entities.json` people (by email), AND capture `recipient_names` — the recipients' display names and email local-parts (e.g. `["Sam", "sam"]` where `sam` is the local-part of the address; `["Bowie Stone", "bstone"]`). Also carry the message's **`thread_id`** (the connector's conversation id) and **`has_attachment`** (the connector's attachment flag — `True` only when the message really carries one; never infer it from the body saying "attached") and **`attachment_names`** (the file names the connector reports for the message; `[]` when it reports none). Build `sent_messages = [{message_id, ts, thread_id, has_attachment, attachment_names, recipient_person_ids, recipient_names, recipient_emails, subject, body, labels, folder, folders, label}, ...]`. **`labels`, `folder`, `folders` and `label` hold the message's labels or folders, under the connector's own spelling: they are what the mail connector's include and exclude lists match on, and a message with none of them passes both lists.** **`recipient_emails` is the To/CC addresses verbatim (SELFMAIL1)** — the same addresses you already read to resolve `recipient_person_ids`, carried through rather than thrown away. It is what lets Step 3 tell a message you sent to somebody from a note you sent to yourself, and it is the strongest of the three channels it can ask: addresses, then resolved ids, then display names. Omitting it is safe (the id channel answers next), never wrong. **`has_attachment` and `thread_id` are load-bearing for closure (SENTMATCH):** the matcher scores an email against a commitment title, and the email that IS the deliverable ("here you go", file attached) barely overlaps the title — it scored 0.20 and never closed anything, which is why 73 measured runs over 1,372 sent messages auto-closed only 21. Those two fields are the non-title evidence that a deliverable was delivered; omit them and reconciliation keeps missing the exact class it exists for. Omitting is safe, never wrong — an absent field simply leaves that basis inert. **`attachment_names` decides whether a file proves a close (cr1#980):** a file counts only when its name and the message's own words show it IS the item, so with no names a title match that rests on the file alone stays a proposal for the owner. **`ts` is the one field where that is NOT true (EVORDER).** It must be the connector's own ISO-8601 send time (`2026-07-28T14:39:40Z` or an offset form), because layer 3 refuses to close a commitment captured AFTER the message was sent — the F-11 class, four measured false closes. Absent `ts` leaves layer 3 inert, which is safe. But a *present and malformed* `ts` — a display string like `"Jul 28, 2026"`, or date-only `"2026-07-28"` — fails SAFE and LOUD: the run closes **nothing at all** and prints a `RECONFENCE: send_ts=…` line on stderr. Pass the raw connector timestamp through unformatted; never a human-readable date. **`recipient_names` is load-bearing for recall (Bug #103):** commitment extraction frequently fails to link the counterparty into a commitment's `person_ids` (some "Send [Name] …" items are stored with only the user), or the counterparty has no email on file, so resolving by id alone misses real completions — the matcher falls back to finding the recipient's name in the commitment title. **If the Sent read cannot happen at all — no mail connector resolves, the connector budget is exhausted, or every account is still unclassified — do NOT call Step 3 with an empty list and let it write a clean zero.** A run that read nothing and a run that read everything and found nothing produce the identical `sent_scanned_count: 0` audit, and the first one is a dead rail wearing the second one's receipt. Call Step 3 with `sent_messages=[]` AND `fetch_blocked="<what was missing, named in plain language>"`: the audit lands stamped blocked with that reason, the cursor does NOT advance over a window nobody read, and `validate_reconcile_ran` correctly refuses it. Stay silent to the CEO per `shared/RELIABILITY.md` §1 and log the one-line skip — loud in the SUBSTRATE, quiet in the chat.
+
+2a. **A note you mailed to yourself is not evidence, and a send only closes what it was addressed to (SELFMAIL1).** Two rules, both enforced in code — you do not have to filter anything yourself; carry the fields honestly and the rails apply them.
+
+   - **A message whose recipients are all your own accounts never counts.** Not as delivery, not as a title match, not as a thread prior, and not as your own recap of a meeting. The contact pass has refused these since CONTACT1 ("a message to yourself is not correspondence with anyone") and the sent rail now asks the same module the same question. On 2026-09-07 an empty-subject note the CEO mailed to himself closed two real promises and queued four proposals off a title echo; that is the regression this closes. The message is still READ — the cursor advances over it — it simply proves nothing.
+   - **A close or a proposal requires the send to have gone to the counterparty.** Strong: to the counterparty carrying what the item said would show it done. Moderate: to the counterparty, matched by title. Anything not addressed to the person the item is owed to is neither closed nor proposed — it is left alone. An item with nobody on it can no longer be closed by mail at all; that is deliberate, and it is what your own word and the age-out are for.
+
+   Both refusals are counted in the audit event (`n_self_addressed_skipped`, `n_not_addressed_skipped`) so a run that fenced something says so instead of looking like a run that found nothing.
+
+2b. **Outcome watch (v1) — silent (B6).** A second silent write on the same fire: detect whether earlier CR-sent emails got a reply. Co-locating two silent *writes* is fine — the Bug #98 anti-pattern was a silent write next to a *visible deliverable*, not two background writes. This runs BEFORE Step 3 so the single `sent_reconcile` audit event can carry the reply counts.
+
+```python
+import sys; sys.path.insert(0, "shared/scripts")
+from email_outcomes import load_pending_tracked_sends, watch_and_receipt
+
+pending = load_pending_tracked_sends("<abs workspace root>")   # email_sent in last 21d, no terminal outcome yet
+to_check = pending[-25:]   # cap 25 per run, OLDEST first; backlog drains across mornings (idempotent)
+```
+
+   For each send in `to_check`, fetch its thread state via the seam-resolved thread-fetch tool — by the stored thread id if present (the loader returns it from the legacy field or the structured `provenance` block transparently), else the seam-resolved search tool with the `{"message_id_lookup": <the send's stored message id>}` intent (compiled per provider by `connector_adapters/mail.py`) to resolve the thread. Build `thread_states = {sent_event_seq: {"messages": [{"from", "ts", "message_id"}, ...]}}` — **metadata only, never reply bodies or subjects** (privacy). Then:
+
+```python
+summary = watch_and_receipt("<abs workspace root>", thread_states, source_skill="reconcile-sent")
+```
+
+   **Read-receipts as an extra reply-watch signal (A6, feature-detected — external/sales contacts ONLY per N5):** when the declared backend's manifest has `read_receipts` (`connector_adapters.capabilities.supports(provider, "read_receipts")` — Superhuman's `get_read_status_feed` class), the outcome watch MAY consult the read-status feed for sends still pending. The N5 constraint is CATEGORICAL, not per-message judgment — but be honest about the enforcement tier: it is PROSE-LEVEL (no code consults the read-status feed or checks org type; this instruction is the boundary). Consult read status only for recipients whose resolved person record ties to an EXTERNAL org (client / prospect / vendor — an org that is not the user's own `is_primary_focus` org and not a teammate `reports_to` chain member). Internal recipients are never read-status-watched — that's surveillance, not sales follow-through. Read status never creates a terminal outcome by itself (a read is not a reply); it may only annotate the pending send (`data.seen: true`) so relationship surfaces can render a seen-but-not-replied state. Capability absent → silent skip; the reply watch is unchanged.
+
+   **MAILTRUST1 — `no_reply_7d` is a NEGATIVE claim and needs two reads.** A terminal no-reply outcome asserts absence, and any single read (thread-fetch included — it came back one message short on 2026-07-29) can only prove presence. Before writing `no_reply_7d` for a send: corroborate the thread-fetch with a broad recency sweep of a different shape (an N-day recency window scoped across ALL mail, never a sender-scoped search) through `shared/scripts/mail_absence.py::corroborate_absence`; on `corroborated: False`, leave the send PENDING (it ages within the 21-day window and re-resolves on a later fire) rather than writing the terminal outcome. `replied` / `bounced` are presence claims — one read suffices.
+
+   `watch_and_receipt` appends one terminal `email_outcome` event per resolved send (`replied` / `no_reply_7d` / `bounced`) and is idempotent (a re-run re-loads pending and the now-terminal sends are already excluded). Hold `summary` — Step 3 passes it into `reconcile_and_receipt(..., outcome_watch_summary=summary)` so the audit event records the reply counts. **Stay silent — produce no chat output for this phase;** the reply/latency patterns surface later through `insight-generator`'s Outcome-patterns pass, never here. Budget: ≤25 thread fetches + ≤25 message-id-lookup fallback searches per fire; on connector-budget exhaustion, stop and leave the rest pending (idempotence makes that safe). A send with neither a stored thread id nor a resolvable message-id lookup is skipped and ages out of the 21-day window — never guess a thread by recipient+subject.
+
+2c. **Sent-promise extraction (v4.6.2, the BUG-3719 fix) — reuses the Step-2 fetch; no second connector pass.** Read each Step-2 sent message and extract NEW commissives — promises the CEO made in their own outbound words ("I'll send corrected invoices next week", "we'll reconcile the billing internally and reissue"). The Stage-D capture floor (`shared/COMMITMENT_SCHEMA.md` § "Extraction triggers") applies with full force: clear owner (the CEO — this pass reads only their own sent words), clear deliverable, real consequence. Rules:
+   - **Promises only, not completions.** "Just sent the deck" / "here's the file" is evidence of DOING — that's Step 3's matcher's job (it closes). Extract only forward-looking commissives. Polite filler ("I'll take a look", "will do") is below the floor — when in doubt, skip (same rule as the Slack leg).
+   - **This pass never extracts what's owed TO the CEO.** Inbound asks are `inbox-triage`'s lane; direction here is fixed by the surface — Sent mail, the CEO's own words, the CEO's own promises.
+   - Per commissive, build an item dict: `{"message_id", "thread_id"` (SENTMATCH — the conversation the promise was made in; it lands as `data.thread_ref` so a LATER send in the same thread can be recognized as the delivery)`, "ts" (the message's send time), "title", "kind"` (counterparty determinable → `"promise"`; the recipient almost always is)`, "due"` resolved from the language against the MESSAGE's send date (or `"no_due": true` — silence is rejected by the gate)`, "counterparty_id"` (recipient resolved via `entities.json`, else `"counterparty_name"`)`, "evidence"` (the promise sentence)`, "org_id"/"org_name"` (the recipient's resolved org, for the per-org capture override AND — BIND1 — for the write-time thread binding: it is the evidence that puts a sent promise under its client's thread instead of "Everything else", so fill it whenever the recipient resolves. `reconcile_and_receipt` binds each item through `reconcile_sent_commitments.bind_sent_items` -> `capture_gate.bind_capture_thread` before `sent_capture` builds the event; an org with several live threads leaves the row unbound and puts ONE `thread_binding` question on the on-demand "review project bindings" page — never the daily "Needs your eyes" card, which it cannot take a slot on — and an unresolvable row ships exactly as it does today — no question, no change to this receipt)`, "person_ids", "classification_confidence"}`. Hold the list as `sent_items` — Step 3 writes them; do NOT append them yourself.
+   - Skip extraction for messages already covered (`sent_capture.already_captured(root, message_id, title, provider=<the seam-resolved provider>)`) — cheap, and re-runs stay idempotent either way (Step 3 re-checks). The provider is the declared email backend's provider tag / `DiscoveryResult.platform` from the Step-2 seam resolution — pass it so new refs are honestly attributed (`superhuman:<id>` on a Superhuman backend, never `gmail:<superhuman-id>`).
+
+2d. **Contact candidates (SPEC CONTACT1) — reuses the Step-2 fetch; no second connector pass, no semantic judgment.** People the CEO demonstrably corresponds with were sitting as name-only identity rows for weeks because nothing created a record from correspondence itself. This is that feeder. Unlike 2c it involves NO extraction: you are transcribing structured header fields, not reading meaning. Build one item per **(sent message x direct To/CC recipient)**:
+
+   `{"message_id", "ts"` (the message's send time)`, "thread_id"` (optional)`, "email"` (the recipient's address, verbatim)`, "display_name"` (the display name on that address in the To/CC header)`, "name_source", "direction": "sent", "recipient_field": "to" | "cc"}`
+
+   Hold the list as `contact_items` — Step 3 writes them; do NOT create people yourself and never call a people writer from here.
+
+   - **`name_source` is the honesty field, and it is the whole gate.** Use `"mail_header"` when the display name came from the counterparty's own address in the To/CC header, and `"calendar_attendee"` when a **calendared** attendee record for that same address supplies it. There is no third value: if the only name you have came from a meeting **transcript**, from a speaker label, from something the CEO typed in the body, or from the address itself (`jsmith` → "J Smith"), **omit the item entirely**. Transcripts are NOT a source for this pass — uncalendared speaker attribution is unreliable, which is exactly why the rule is categorical rather than a judgment call. Never invent a `name_source` to get an item through: the gate reads it as a claim about where the name came from.
+   - **Direct recipients only.** To and CC. Not BCC, not a Reply-To, not an address that merely appeared in the body or a quoted thread, and never anyone from **inbound** mail — one-way correspondence never creates a record. A meeting attendee the CEO has never directly emailed does not qualify either; the calendar may only corroborate a name for an address that IS on a send.
+   - **Pass what you honestly have and let the gate refuse the rest.** Role/shared inboxes, single-token names, and names carrying annotation markers are all refused in code and counted in the receipt — do not pre-filter them by hand, and do not "clean up" a name to help it pass. Signature blocks are out of scope: never read a role, title, or company out of message text.
+   - **Omission is always safe.** A workspace whose connector cannot supply header display names simply produces no items, and this pass does nothing — no error, no nag.
+   - **Your own accounts are not counterparties.** A message addressed or copied to one of the CEO's own mail accounts is not correspondence with anyone; those are dropped in code against the declared account list, so you need not filter them by hand.
+   - Nothing about the fetch window changes for this pass: it rides its own `workspace.contact_capture_cursor` and reads only messages newer than it, so the wide first-run / catch-up windows from Step 1 create nothing retroactively.
+
+3. **Run the orchestrator — ONE call. It does the matching, the `commitment_resolved` writes, the sent-promise capture (opens + restatement merges + set-asides), the cursor advance, AND emits the `sent_reconcile` audit event.**
+
+```python
+import sys; sys.path.insert(0, "shared/scripts")
+from reconcile_sent_commitments import reconcile_and_receipt, validate_reconcile_ran
+from primary_user import resolve_primary_user
+
+user_id = resolve_primary_user("<abs workspace root>")   # deterministic — do NOT guess (Bug #102)
+receipt = reconcile_and_receipt("<abs workspace root>", sent_messages,
+                                user_person_id=user_id,
+                                source_skill="reconcile-sent",
+                                outcome_watch_summary=summary,   # from Step 2b
+                                sent_commitment_items=sent_items,  # from Step 2c — [] when nothing extracted, never None
+                                # fired_via: omit on a scheduled fire or a catch-up (the seat decides); pass "manual" on a chat-phrase / Run Now fire (v4.5.2 receipt contract)
+                                exclude_captured_since=fire_start,  # from Step 1 — RECONFENCE layer 2
+                                read_complete=True,   # False when more pages remained than Step 2 read: the cursor holds (cr1#742)
+                                fetch_blocked=None,   # why the fetch errored, in plain words; None when it answered (cr1#827)
+                                contact_capture_items=contact_items,  # from Step 2d — [] when nothing transcribed, never None
+                                provider="<the seam-resolved provider>")  # declared backend's provider tag / DiscoveryResult.platform from Step 2 — honest source_ref attribution on non-Gmail backends
+```
+
+   **The circularity fence (RECONFENCE).** `exclude_captured_since=fire_start` is layer 2: a commitment captured at or after this run began is something this fire wrote, so it is one source with the evidence, not two, and it is dropped before scoring. Layer 1 needs no argument here — `reconcile_sent` derives each message's own ref internally and drops any commitment attributed to the very message being scored, including a merge survivor that absorbed that message's capture (which the older BUG-3719 single-key guard could not see). Anything captured BEFORE `fire_start` stays fully matchable, so a send that genuinely fulfills an earlier promise still closes it.
+
+   **The contact pass (CONTACT1) runs inside this same call, after the promise capture and before the cursor write.** It creates a record ONLY for someone the CEO has sent a direct To/CC message AND whose full name came from a structured source — every bar fails safe, and an unverifiable bar refuses. Creates go through the shipped `people_writer.auto_add_person` writer, so the same-name gate and the observed-provenance email rule are unchanged; a same-name collision mints today's identity confirm row **pre-filled with the address you observed** rather than forking a duplicate. Each create retires any open name-only identity row it answers, so the question stops being asked. Applied-then-narrated: creates land in the change feed with `undo`, never as a "track them?" row. A per-fire cap bounds creates and the overflow is CARRIED — `receipt["contacts"]["n_carried"]` is non-zero and the contact cursor deliberately does not advance past them, so they land next pass; that is the cap working, not a loss. `receipt["contacts"]["refused"]` names WHICH bar refused each candidate — read it when a person you expected never appears, rather than loosening anything in Step 2d.
+
+   The capture pass dedups each item against the open set as it stood BEFORE this run's closes (`capture_gate.matches_open_commitment`: same owner, same counterparty, the wording effectively the same), so a sent restatement of a meeting-sourced or triage-sourced commitment MERGES into the item that already tracks it instead of double-tracking. Items route through the W4c relevance gate (the CEO is a party to their own promise → opens under party-only; an org-level observed-only override still sets aside; dated/money items always open). Per-item extraction failures land loudly in `receipt["capture"]["errors"]`, non-empty means the extraction must be fixed and the run repeated (idempotency makes that safe); never ignore it silently.
+   **Resolve the user via `resolve_primary_user`, never by guessing** — on real workspaces the `is_primary_user` flag is often unset, so a hand-resolved user can come back wrong/None and the matcher's owner gate (`owner_id == user`) then matches nothing (Bug #102, the other half of why reconciliation closed 0). **An unresolved user now ABORTS the run** — `reconcile_and_receipt` raises `PrimaryUserUnresolvedError`, writes no audit event, and leaves the cursor where it was. Do NOT catch it and continue: report the failure plainly ("reconciliation could not run — the workspace user is unresolved"), and check that the path you passed is the WORKSPACE ROOT, not `_hq` (the resolver answers `person_001` at the root and `None` one level down). Before this abort the same state wrote a clean `n_closed: 0` audit that `validate_reconcile_ran` accepted — a dead rail reporting success.
+
+   **How closures happen now (SENTMATCH).** Three bases, in the user's terms: (1) the email quotes the commitment strongly enough — the long-standing behavior, unchanged; (2) **the email delivered it** — an attachment went out, the recipient is the person the item is owed to, and the words say it's done ("here you go", "as promised"); (3) **the email continues the thread the promise was made in** — a weaker text match is enough on that one conversation. Basis 2 closes outright; basis 3 becomes a confirm unless it's the only thing that message matched. A message that delivers on two different open items closes neither — it asks. Every closure stays reversible via `undo`.
+
+4. **Self-validate against the event (mandatory).** Read the audit back and confirm it's this run's:
+
+```python
+v = validate_reconcile_ran("<abs workspace root>", since_cursor=<cursor_before>)
+# v["ok"] must be True. v carries cursor_from/cursor_to/sent_scanned_count/n_closed.
+```
+
+   - `v["ok"] is True` → reconciliation genuinely ran. Done.
+   - `v["ok"] is False` → you did NOT actually reconcile (no audit event, or it's a stale one). Do not report success. Re-run steps 2–3 with a real fetch, or report the failure plainly.
+
+   **Also check `receipt["signal_fields"]` (SENTMATCH).** It counts how many messages the fetch handed over (`n_fetched`), how many of those actually reached the matcher (`n_scored` — the rest were set aside by a fence, before any delivery field was read), how many of the SCORED messages carried `has_attachment` / `thread_id`, and how many closures each new basis produced. **`n_scored` is the denominator for every judgment you make about the fetch — never `n_fetched`** (a receipt written before SELFMAIL1 has no `n_scored`; fall back to `n_fetched` there). If `n_scored` is non-zero but `n_attachment_field_present` and `n_thread_field_present` are both **0**, the Step-2 fetch dropped those fields on every message the checks could see and the delivery checks did not run at all — a zero closure count then means nothing. `reconcile_and_receipt` appends a plain-language heads-up to `receipt["summary"]` in exactly that state and in no other, because the caveat hangs off `n_scored` too; surface it rather than reporting a clean zero, and fix Step 2.
+
+   **A FENCE IS NOT A FETCH FAILURE (SELFMAIL1).** `n_fetched` non-zero with `n_scored` **0** is a different state and it means the opposite: every message was set aside before scoring — on the ordinary shape, mail the user addressed only to themselves (`n_self_addressed_skipped` says how many). Nothing read their delivery fields, so both presence counters read **0** for that reason and NOT because the connector dropped anything. There is no fetch to fix: report what the summary already says — the mail went only to the user, so there was nothing to check it against, and a note to yourself cannot show a promise kept — and leave Step 2 alone. Reading `n_fetched` here in place of `n_scored` is precisely how a night whose only message was a note the user wrote to himself came out as "your mail stopped carrying attachment and conversation details": an alarm about a connector that was working perfectly.
+
+   **Graded is not closed.** `n_graded_on_delivery` / `n_graded_on_thread` are what the matcher PROPOSED; `n_closed_on_delivery` / `n_closed_on_thread` are what was actually WRITTEN, and they can never exceed `n_closed`. When they differ, `n_graded_close_refused` says how many the closure path refused and `close_refusals` names why, keyed by the refusal — `PendingReviewError` (the item is flagged uncertain and may only close on an explicit confirm), `CommitmentIdError` (the id resolved to nothing, so no orphan tombstone was written), `OpenSubitemsError`, `SourceRefError`. **Every one of those is the system working**, so report the refusal as a held item, never as a lost close. Reading only the graded half is how a receipt came to say `n_closed_on_delivery: 1` beside `n_closed: 0`.
+
+   **`n_stale_evidence_skipped` (EVORDER)** counts candidates layer 3 refused because the message predates the commitment it would have closed. Read it against `n_closed`: a non-zero value is the fence **working**, not an error, and needs no report. But if `n_fetched` is non-zero and `n_closed` is 0 while a `RECONFENCE: send_ts=…` line appeared on stderr, the fetch supplied a malformed `ts` and the run closed nothing for that reason alone — say so plainly and fix Step 2's timestamp, rather than reporting that nothing matched.
+
+4b. **Voice reconcile (B1) — silent.** After validation, diff the FINAL sent bodies against the draft snapshots:
+
+```python
+import sys; sys.path.insert(0, "shared/scripts")
+from voice_corrections import reconcile_sent_against_snapshots
+reconcile_sent_against_snapshots("<abs workspace root>", sent_messages)   # reuses the Step-2 fetch; no second connector pass
+```
+
+   It matches each sent message to a `_hq/voice/draft-snapshots.jsonl` row (by the send's stored message id, else recipient + normalized subject + a 7-day window), classifies the drafted-vs-sent diff, and appends voice corrections. Silent and non-blocking — it never affects the commitment reconciliation receipt; on any error, continue.
+
+   **Structural-correction rider (SPEC OUT8) — additive, same silent contract.** When a Step-4b match corresponds to a delivered Command Room document (the snapshot references a rendered brief) AND the drafted-vs-sent diff is STRUCTURAL — the user reordered, dropped, or reshaped sections before sending, not just rewording — also append one structural correction: `from exemplars import append_structural_correction; append_structural_correction("<abs workspace root>", kind="<the doc's brief kind>", direction=..., section=..., doc="<filename>", source="reconcile_sent")` (`shared/scripts/exemplars.py`; direction from `exemplars.KNOWN_DIRECTIONS`). Wording-only diffs stay voice-rail-only — the two rails are disjoint (voice owns words, exemplars own layout; `shared/VOICE_CALIBRATION.md` § "The rail boundary"). Capture only — this NEVER writes an exemplar; the weekly `learning` job's exemplar leg batches the log and promotes automatically at the shipped floors, with a past-tense receipt on the morning brief and a one-word undo. Silent and non-blocking; on any error, continue.
+
+4c. **Per-person receipts on group items (HYG1 — the MC1 4.7 wire-up) — silent, automatic, inside the Step-3 call.** When a sent message matches ONE recipient of a multi-recipient commitment at auto-resolve-grade score ("send the deck to the board" → a send to one board member), `reconcile_and_receipt` now records that person's delivery receipt automatically instead of skipping the match. Nothing to do here — the orchestrator handles it — but know the contract:
+   - **Non-destructive by construction.** A receipt NEVER closes the item; when the last recipient's receipt lands, the item stamps its everyone-received signal, which PROPOSES closure (`receipt["partial_propose_closure"]`) — the user closes, never the task.
+   - **Only resolved recipients.** A name-only match (no person record) is skipped and reported in `receipt["partial_skipped_names"]` — an id is never guessed from a name token at write time.
+   - **Idempotent.** A recipient already recorded never gets a second receipt; re-runs and wide catch-up windows are safe.
+   - The self-closure guard applies unchanged: a receipt is never recorded from the message that opened the commitment.
+
+4d. **Roster-complete closes (AUTOAPPLY §4b) — run AFTER Step 4c, silent.** A receipt is informational, so `mark_partial_received` never closes — that posture is correct and unchanged. But when the WHOLE roster has delivered and every contributing receipt names its counterparty by resolved id AND carries connector evidence, the close is corroborated by N independent receipts and reversible, so it acts instead of asking:
+
+```python
+import sys; sys.path.insert(0, "shared/scripts")
+from reconcile_sent_commitments import apply_roster_complete_closes
+closes = apply_roster_complete_closes("<abs workspace root>",
+                                      source_skill="reconcile-sent",
+                                      closed_by=user_id)   # from Step 3
+```
+
+   - **ONE evidence-free receipt in the set and nothing closes** — a bare manual claim is a person's assertion, not connector evidence, and the item renders its confirm row exactly as it does today (`closes["skipped"]` says which and why).
+   - Open sub-items (SUB1 D3) and any `pending_review` flag block the close, unchanged.
+   - **A mail connector set to ask before closing (`close_mode: propose`, cr1#756) closes nothing here.** Each item that would have closed is in `closes["skipped"]` with that reason and `closes["close_mode"]` reads `propose`; the owner is asked once per item: by the proposal Step 3 wrote for the completed roster, or, for an item never asked about (its roster completed before the setting, or its last receipt came from another rail), by one proposal this step writes (`closes["n_proposed"]`). Zero closes, so the narration below says nothing.
+   - **Narration is required, in the user's language:** "closed *[title]* — everyone delivered — say `undo` to reverse any." Never the event-type name (Rule 4). Zero closes → say nothing.
+   - **If this pass reverses one of its OWN closes** — it read a close back, judged the evidence wrong and reopened the row — that reversal is the MACHINE'S act, not the CEO's (CONTRACT Rule 32, ATTRIB2). Pass `actor=event_types.MACHINE` to `commitment_state.reopen_commitment` / `brain_undo.undo_batch`, and never a person id. Say it in the CEO's language as something the product did (*"I reopened two I had closed on a note you sent yourself"*), never as something he did. On 2026-09-07 this pass reopened two rows on its own judgment, stamped them with the CEO's own id, and the morning brief told him he had reversed them.
+   - Reversible via the registered `commitment_close` reverser; the `brain_batch_id` stamped on each closure is what `undo` resolves.
+
+5. **Surface only if something closed or opened (otherwise stay silent — this is a background task).**
+   - `receipt["resolved"]` non-empty → one line, delivered the same way other scheduled tasks deliver (Slack DM / email / saved note per the workspace's delivery preference): *"Closed N follow-ups you'd already sent — [titles]. Say `undo` to reopen any."*
+   - `receipt["opened"]` non-empty → *"Started tracking N promise[s] from your sent mail — [titles]. Say `not mine [n]` to drop any."* (Plain language only — never "captured a commissive" or any event name.)
+   - `receipt["n_contacts_added"]` non-zero → *"Added N [contact/contacts] you've been emailing back and forth with — [names]. Say `undo` to reverse."* (Plain language only. Never mention the cap, the cursor, or a carry — a carried candidate simply arrives on a later pass and there is nothing for the CEO to do about it. Say nothing at all when the count is zero, including when candidates were refused: a refusal is the gate working, and it belongs in the substrate, not in the CEO's morning.)
+   - `receipt["n_contacts_gave_up"]` non-zero **or** `receipt["contacts"]["cursor_reset"]` set → surface the sentence `reconcile_and_receipt` already appended to `receipt["summary"]` verbatim, **even on a fire that added nobody**. These two are the only contact states that speak on a zero: one says the pass stopped retrying an address it could not write, the other says it started fresh because its own record of where it had reached was unusable. A stall that only appears in an audit event is a stall nobody finds.
+   - `receipt["pending"]` non-empty → *"Did you already handle these? [title] — `mark done [n]`."*
+   - `receipt["partial_propose_closure"]` non-empty → *"Everyone on [title] has received theirs — close it when ready."* (Partial receipts themselves stay silent; only a COMPLETED roster earns a line.)
+   - Nothing closed, nothing opened → no output. Silence is correct; the audit event is the proof it ran. (Restatement merges, set-asides, and per-person receipts are silent by design — they surface through 'show waiting' and Commitments in the Hub's Work tab, not here.)
+
+6. **The chat leg (SPEC CHATSCAN1 §B) — a SEPARATE registered job in this same fire, not an optional extra.** Mail is one channel a promise gets discharged through; the declared chat backend is another, and a commitment delivered there stays open forever without this. The dispatcher lists `reconcile-chat` immediately after `reconcile-sent` on the identical cadence, so both run in the same maintenance fire and both land before the 7:00 brief. **This leg adds no scheduled task of its own** — it is a job inside the already-authorized `maintenance` task, which is why it needs no registration on any client machine.
+
+   **Write `the declared chat backend`, never a product name.** There is exactly one chat vocabulary here, and every difference between backends lives in the capability manifest and `shared/scripts/connector_adapters/chat.py`. If you ever find yourself about to write "if it's [product] then…", stop: that branch belongs in the manifest, not in this text and not in your reasoning.
+
+   a. **Resolve the backend and PLAN the scan before fetching anything.**
+
+```python
+import sys; sys.path.insert(0, "shared/scripts")
+from connector_adapters import chat as chat_seam
+from tool_discovery import discover_chat_tool
+
+provider = chat_seam.resolve_chat_provider("<abs workspace root>")
+plan = chat_seam.plan_scan(provider, date_filtered=True)   # mode / degraded / coverage_note / limits
+```
+
+   - `provider is None` → **the workspace has no chat backend. Skip the leg silently** — say nothing to the CEO, raise nothing — and still call Step 6c, which writes the skip receipt. The receipt is the point: without it, "no chat backend" and "swept everything and found nothing" are the same clean zero.
+   - `plan["mode"] == "per_chat_scan"` → this backend cannot filter chat by date and the connector degrades to a partial per-conversation sweep on its own, without warning. That is a real run, not a failure — but it is PARTIAL, and `plan["coverage_note"]` is the plain-language sentence that says so. It rides the receipt automatically; never claim a full reconcile over it.
+   - Resolve the read tool with `discover_chat_tool(tools, operation, declared=<the declared chat row>)` — the provider-agnostic resolver. `discover_slack_tool` is the CAPTURE leg's older, single-product resolver; using it here would make every non-Slack workspace look like a workspace with no chat at all.
+
+   b. **Fetch the window through that tool** — since `chat_reconcile.backfill_floor(workspace_root)`, which returns the stored cursor or, on a first-ever run, a short fixed backfill window (never full history — passive whole-history ingestion is the named anti-goal). When the connector says more pages remain, read the next pages too (a `per_chat_scan` plan's own limits are its cover, not a partial read). Build `chat_messages` as raw connector dicts; the leg normalizes both id shapes itself. Per message carry: the conversation/channel id, the message id, an ISO timestamp, the text, the author id, `counterparty_person_ids` / `counterparty_names` resolved against `entities.json`, and `thread_id` / `permalink` when the backend has them. **If the read cannot happen at all**, do NOT hand in an empty list — pass `fetch_blocked="<what was missing, in plain language>"` so the audit records a blocked run and the cursor does not advance over a window nobody read.
+
+   c. **Run the leg. It does the rest — matching, closing, proposing, the receipt, the cursor.**
+
+```python
+from chat_reconcile import reconcile_chat_and_receipt, validate_chat_reconcile_ran
+chat = reconcile_chat_and_receipt(
+    "<abs workspace root>", chat_messages,
+    user_person_id=user_id,          # the SAME resolved user as Step 3
+    provider=provider, scan_plan=plan,
+    user_chat_ids=[...], user_names=[...],   # the CEO's own ids on that backend
+    # fired_via: the SAME as Step 3 - omitted there, omitted here
+    exclude_captured_since=fire_start,       # the Step-1 instant, same fence as mail
+    read_complete=True,    # False when more pages remained than the read took: the cursor holds (cr1#742)
+    fetch_blocked=None,    # why the read errored, in plain words; None when it answered (cr1#827)
+)
+v = validate_chat_reconcile_ran("<abs workspace root>")   # v["ok"] must be True
+```
+
+   There is no separate matching engine here: the CEO's own outbound messages score through the same sent matcher Step 3 uses, and a counterparty's message scores through the same reply matcher the inbound rail uses. **Thresholds are untouched.** Chat is terse, so expect more of the traffic to land in the propose-band than mail does — that is the thresholds working correctly, and it is not a reason to move them.
+
+   d. **Every chat-evidenced close carries a pointer back to the message, or it does not happen.** The leg refuses any close it cannot point at, counts the refusal in `chat["n_refused_no_pointer"]`, and leaves the item open. An unauditable close is a row the CEO cannot check, and that hole must not reach a third channel. Nothing to do here — but if that count is non-zero, the fetch in Step 6b dropped ids and needs fixing. **A message whose timestamp is not a real ISO-8601 instant is quarantined** (dropped, counted in `chat["n_dropped_bad_ts"]`) rather than carried: an unparseable time cannot order evidence against a promise, and it used to reach the cursor and wedge the leg permanently. If that count is non-zero, Step 6b is passing a display string where the connector's raw timestamp belongs.
+
+   d-bis. **The cursor never passes a message this fire did not adjudicate.** When more candidates survive than the per-fire cap, the leg drains the OLDEST first and holds the cursor at the newest one it actually scored — so the deferred remainder sits inside the next fire's window and the "picked up on the next one" line is true. Nothing to do here; just do not "help" by advancing the cursor yourself. On a backend whose sweep is partial by construction the cursor still advances (otherwise the leg never progresses) and the receipt records `cursor_advanced_over_partial_sweep` — that gap is not recoverable by re-running the same window, so never describe it as something that comes back later.
+
+   e. **Where the results go: the surfaces that already exist.** Closes are ordinary closures — the brief and the daily chats read them like any other. Anything needing a human call is written as the SAME close-proposal the mail leg writes, so it reaches the needs-your-call queue and the staff-meeting fold through the shared adapters, the shared card builder and the shared fences. **There is no chat-specific queue, pile, or review surface, and you must not invent one** — a second place to look is a place that goes unlooked.
+
+   f. **Surface only what the CEO can act on** (same posture as Step 5): closes → the existing "closed N you'd already handled" line; proposals → the existing confirm line. `chat["n_scanned"]`, the scan mode, the caps and the coverage note belong on the RECEIPT, not in the CEO's morning. The one exception is `chat["coverage_note"]`: when a report would otherwise imply a full chat sweep, append it verbatim — an honest gap beats a confident overclaim.
+
+## Self-heal
+The FIRST fire on a workspace fetches a **30-day window regardless of the cursor**
+(Step 1, Bug #101) — so it clears the entire accumulated backlog of already-sent
+follow-ups, including mail sent BEFORE a stale cursor that an earlier broken
+version left sitting ahead of un-reconciled messages. Zero prompt, zero user
+action. After that first wide pass, normal runs go forward from the cursor. If a
+workspace already had its first run under the cursor-only behavior (so the backlog
+is still stranded), a one-time "catch up my sent mail" clears it.
+
+## What it does NOT do
+- It does not render a morning brief or a commitments view — the brief reads the closures and opens this task wrote.
+- It does not fetch inbound mail, triage, or draft replies — that's `inbox-triage`. The sent-promise capture opens items ONLY from the CEO's own outbound words — it never opens owed-to-you items from what correspondents wrote.
+- It does not double-track a promise that already exists — a sent restatement of a tracked commitment merges via the restatement match; the same message re-scanned is skipped by `(source_ref, title)`.
+- It never advances the cursor without a real fetch behind it — the audit event + validator make that checkable.
+- It does not create a contact from inbound mail, from a meeting attendee the CEO has never emailed directly, or from a name a transcript attributed to a speaker — every one of those is refused in code, and none of them is a judgment call you get to make in Step 2d.
+- It does not backfill contacts. The contact cursor starts at the moment of the first pass and only goes forward; a wide "catch up my sent mail" window closes commitments across it and creates no one. A bounded backfill is a separate decision, not something this task does on its own.
+- It does not surface reply/outcome patterns — Step 2b only WRITES the `email_outcome` events silently; `insight-generator`'s Outcome-patterns pass is the reader-facing surface.
+
+## Reliability
+Runs as a scheduled task and follows `shared/RELIABILITY.md`: skip-not-fail when the workspace isn't ready, 15s/60s connector budgets, no fabricated data when a connector is down (emit nothing and exit clean — the brief's `reconcile_stale` soften covers the gap).
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> Silent maintenance task with four silent write jobs: (1) close commitments the CEO completed by sending a follow-up DIRECTLY from their mail client (outside the product's draft->send path), (2) open a new commitment when a sent reply carries a promise nothing tracks yet (v4.6.2, the rescue path for outbound promises in threads that were read and replied before inbox triage ever saw them), (3) watch earlier tracked sends for reply/no-reply/bounce outcomes, (4) reconcile final sent bodies against draft snapshots for voice corrections. Fires as a close leg inside the maintenance background task on weekday slots, after its capture legs (6:45 AM pass lands before the morning brief; MAINT1) and can be run manually with 'reconcile my sent mail' / 'reconcile sent'. A wide one-time catch-up runs via 'catch up my sent mail' / 'reconcile the last N days' / 'reconcile my backlog'; it fetches a 30-day window regardless of the cursor to clear a stranded backlog. The core pass: fetch the declared mail backend's Sent folder (since the cursor, or a 30-day window on a first run / catch-up), match against open commitments, write the closures + advance the cursor, and self-validate that the work actually landed; the sent-promise capture, outcome watch, and voice reconcile all ride the same fetch. It does NOT produce a reader-facing brief; the morning brief reads what this task wrote. This split exists because reconciliation is an invisible substrate write that loses to visible deliverables when co-located with them (Bug #98-v3: three folds into the brief/inbox were all skipped; the brief diagnosed the structural cause itself and recommended moving it out).

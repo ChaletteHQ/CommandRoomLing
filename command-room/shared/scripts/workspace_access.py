@@ -1,0 +1,4398 @@
+#!/usr/bin/env python3
+"""The workspace access layer — one module, two faces (SPEC_NIGHTM1 §2, ACCESS1).
+
+WHY THIS EXISTS
+---------------
+In the merged Claude app the helpers and the data are on different machines.
+`shared/scripts/*.py` is synced into a cloud container; the customer's workspace
+is FUSE-mounted only inside a sandbox VM on their own PC, reached one shell call
+at a time through the device bridge. Nothing bridges the two: the container
+cannot open a workspace file, and the VM has no plugin files. Every line of the
+old contract ("cd $PLUGIN_ROOT && python3 -c …", with the workspace found under
+the same $SESSION_DIR/mnt) assumed one filesystem, and there is no longer one.
+
+THE SHAPE (gap analysis §4, strategy 2, ruled §0.8). A version-stamped,
+content-hashed copy of the runtime is installed INTO the workspace at
+`_hq/.cache/cr-runtime/<version>/`, and every substrate verb runs in the VM, in
+place, against the live files — so the append path keeps the real writer lock,
+the real seq allocation and the real read-back, byte for byte. This module is
+the only thing SKILL.md prose is allowed to invoke, and it has two faces:
+
+  * HOST face — runs where the data is (the VM under the installed runtime, or
+    an ordinary local machine, or a legacy Cowork sandbox). `read`,
+    `run_helper`, `write`, `append_jsonl`. One call = one verb = one JSON
+    envelope line on stdout.
+  * CONTAINER face — runs in the cloud container from the plugin checkout and
+    NEVER opens a workspace file. `discover` (the standalone block the model
+    pastes into the device shell), `expect`, `install --out`, `verify`,
+    `plan <verb>` (the exact command string to paste). In `container` mode
+    every data verb REFUSES and says where to run it (§0.25) — a silent
+    stage-and-compute fallback is the improvised-path class Rule 22 ended.
+
+MODE VOCABULARY (coordinator decision D-1). `env_detect.MODES` names WHERE THIS
+PROCESS RUNS; `host_mode` here names WHERE THE DATA IS relative to this process.
+Neither module renames the other's enum; the mapping lives in `MODE_FROM_ENV`
+and `detect_host_mode` below and is pinned by `tests/run_access1_test.py`.
+
+WHAT THIS MODULE MUST NEVER DO. Stage customer data into the container; guess a
+workspace when it cannot resolve one; write plugin code anywhere but the
+content-hashed runtime cache; set `CR_DATA_ROOT`; or unlink anything on a hot
+path (`os.unlink` is EPERM on the mount — `build/P1_RESULT_2026-09-19.md`).
+
+3.10-safe by contract: the sandbox VM is Python 3.10.12 and this file is the
+first thing that runs there. Stdlib only.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path, PurePosixPath
+
+# cr1#1240: while a battery runs, an upward walk never binds a real book.
+try:
+    from battery_isolation import walk_may_bind as _walk_may_bind
+except Exception:  # pragma: no cover - loaded outside shared/scripts
+    try:
+        from .battery_isolation import walk_may_bind as _walk_may_bind  # type: ignore
+    except Exception:
+        def _walk_may_bind(root, env=None):  # fail closed only inside a battery
+            import os as _o
+            return not str(_o.environ.get("CR1_BATTERY_ISOLATED", "") or "").strip()
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Constants — the vocabulary every other lane builds against
+# ---------------------------------------------------------------------------
+
+VM = "vm"
+LOCAL = "local"
+COWORK_LEGACY = "cowork_legacy"
+CONTAINER = "container"
+HOST_MODES = (VM, LOCAL, COWORK_LEGACY, CONTAINER)
+
+# D-1: env_detect's vocabulary -> this module's. `merged_cloud` is the one that
+# needs a fact rather than a lookup (is THIS file running from the installed
+# runtime inside a workspace?), so it is resolved in `detect_host_mode`.
+MODE_FROM_ENV = {
+    "legacy_cowork": COWORK_LEGACY,
+    "claude_code_local": LOCAL,
+    "unknown": CONTAINER,
+}
+
+# The runtime cache — plugin-owned code inside the customer's workspace, the one
+# write a plugin update makes under the root (PLUGIN_BOUNDARY invariant 4, as
+# amended by this lane). Never data; never readable through the data verbs.
+RUNTIME_CACHE_REL = "_hq/.cache/cr-runtime"
+CURRENT_POINTER = "current.json"   # a pointer FILE, never a symlink (FUSE/Drive)
+MANIFEST_NAME = "manifest.json"
+
+# The substrate anchor, spelled exactly as `workspace_root.py` spells it.
+ANCHOR_REL = "_hq/data/entities.json"
+PRUNE_DIRS = ("_archive", "_demo-framework")
+MAX_SEARCH_DEPTH = 5
+
+# The writer lock's content must never change (writer_lock.py:32-39).
+LOCK_REL = "_hq/data/.writer.lock"
+# cr1#1602: the door's step log (`task_timings.STEPS_REL`), refused to every
+# verb as the runtime cache is: only `_timed_door` writes it.
+STEPS_LOG_REL = "_hq/.cache/task-steps.jsonl"
+
+# Registered JSONL files — the append-only set `atomic_write.py:776-777` names.
+# `events.jsonl` and its year shards route through the event gate; the rest are
+# ordinary registered appends. Anything else is refused by name.
+REGISTERED_JSONL = frozenset({
+    "events.jsonl",
+    "staging_emissions.jsonl",
+    "classifier_feedback.jsonl",
+    ".backfill_cursor",
+})
+_EVENTS_SHARD_RE = re.compile(r"^events-\d{4}\.jsonl$")
+
+# The two files whose canonical writer takes the sentinel lock and stamps `.rev`
+# (`atomic_write.atomic_write_json_locked`).
+REV_FILES = ("entities.json", "aliases.json")
+
+# The layer reports its own timeout at 150 s so a 180 s device_bash cap never
+# truncates an envelope silently.
+DEFAULT_TIMEOUT_S = 150
+
+# The helpers `run_helper` may call, spelled `module:function`.
+#
+# The manifest alone is NOT an allow-list: `atomic_write` is in the manifest by
+# construction, so a module-level gate let `run_helper` write any file anywhere
+# — outside the root, into this cache, and over the ledger — going round the
+# three fences `write` and `append_jsonl` enforce (review finding B-2; the
+# coordinator ruled it a BUILD bug and tightened the spec, SPEC §2 item 2, to
+# require this registry). So the gate is a named FUNCTION list: read/compute
+# helpers, plus the gated writers that stamp, dedup and sidecar on the way in.
+#
+# The rule for adding one: it READS or COMPUTES and writes nothing. No writer
+# belongs here at all, gated or not (review finding B-1): `event_gate:
+# append_event` was allowed as "the sanctioned writer", and because the helper
+# door applies only the path fences, a fire could append a JSON line onto
+# `entities.json` or `aliases.json` — leaving the substrate's anchor file
+# invalid JSON — and create unregistered `.jsonl` files, all of which the
+# layer's own `append_jsonl` door refuses by the `REGISTERED_JSONL` rule.
+# `write` and `append_jsonl` ARE the doors; `run_helper` never writes. A raw
+# writer (`atomic_write:*`) and a process/filesystem verb (`os`, `shutil`,
+# `pathlib`, `subprocess`) never belonged here either.
+RUN_HELPER_ALLOWLIST = frozenset({
+    # reads and computes
+    "data_root:resolve",
+    # cr1#667: a declared connector's effective kind, dials, lists and scope
+    # (absent fields read as the kind's defaults); the setter is on the
+    # write list beside it
+    "connector_config:connector_settings",
+    # cr1#1179: what a chat must never read (personal connectors and the
+    # mailboxes whose surface dial is off); reads, writes nothing
+    "connector_reads:chat_wall",
+    # cr1#1577: what an import may write about a person (the off-limits list
+    # and the personal lane, fail closed); hands back the kept items and a
+    # count, writes nothing
+    "import_wall:screen_import",
+    # cr1#1014 (train 4): keyword search over the log; reads, writes nothing
+    "log_search:search_log",
+    # cr1#1017 (train 8): the per-seat word list and the advisor's sheet; reads, writes nothing
+    "words:load_words",
+    "words:plan_words",
+    "advisor_sheet:questions",
+    "advisor_sheet:load_sheet",
+    "onboarding_confirm:plan_confirm",  # cr1#1163 part 2: the step-5 cards' current values and evidence (writes nothing)
+    "whats_new_setup:plan_whats_new",  # cr1#1235: on an existing seat, the connectors and accounts with no role and the unset step-5 cards (writes nothing)
+    "project_folder:plan_folder",  # cr1#1582: what making a project's folder would do, or why the name cannot be a folder name (writes nothing)
+    # FILECARD1 (cr1#611): has this seat been shown the paste-in block (walks the ledger, writes nothing)
+    "claude_instructions:shown_status",
+    # DORMSCOPE1 (cr1#170): whose accounts the dormancy scan may rank
+    "dormancy:outreach_scope",
+    # DORMDOOR1 (cr1#316): the scan's required live-contact check. Discovery
+    # picks the mail and calendar tools from the run's tool list and the
+    # declared backends; the check merges the saved last touch with the live
+    # signals the model fetched. Both read or compute and write nothing.
+    "live_contact_check:discover_live_check_tools",
+    "live_contact_check:live_contact_check",
+    "entity_resolve:resolve",
+    "entity_resolve:resolve_all",
+    "events_io:count_rows",
+    "events_io:load_all",
+    # cr1#1018 (train 9): the two number answers. Each reads its ledger, or
+    # counts from the log when the ledger is stale, and writes nothing; the
+    # rebuild that writes the ledgers is the maintenance job's, never here.
+    "ledgers:pipeline_by_stage",
+    "ledgers:sessions_by_client",
+    # cr1#1015 (train 6): the decision list and "what did we decide about
+    # X". Each reads the stored list, or counts from the log when it is
+    # stale, and writes nothing; the rebuild that writes the list is never here.
+    "decision_list:decision_list",
+    "decision_list:what_did_we_decide",
+    # cr1#1016 (train 7): the one loader every skill calls through the
+    # Access preamble's rule 2. It folds the rules fresh from their sources
+    # and writes nothing. The rules are read through it only, so the rules
+    # store's own readers are deliberately not on this list.
+    "context_loader:load_context",
+    # cr1#1016 slice 2: whether each record an answer names is on file
+    # (cr1#785 item 4); reads the log, the register and the rules, writes nothing
+    "context_loader:check_named",
+    # cr1#1556: one read call for a plain question about the record. It finds
+    # who and what the question names, pulls the entries, the open promises
+    # and the decisions through the readers above, and says whether that is
+    # enough. Reads the log through the org-scoped reader and writes nothing.
+    "recall_reader:answer_pack",
+    # cr1#1016 slice 3: the always-loaded diet's measure and plan; both read
+    # the brief and the log and write nothing (the cut is the writer below)
+    "claude_md_diet:measure",
+    "claude_md_diet:plan",
+    "events_io:shard_invariants",
+    "events_io:shard_paths",
+    # the inbox chain (ORCH1). Every one reads or computes; the rows they
+    # compose are appended by the CALLER through `plan append_jsonl`, which is
+    # what keeps this door a read door.
+    "inbox_helpers:apply_priority_rules",
+    "inbox_helpers:billing_door",
+    "inbox_helpers:check_draft_dates",
+    "inbox_helpers:filter_by_preferences",
+    "inbox_helpers:gate_reply",
+    "inbox_helpers:header_date",
+    "inbox_helpers:lateness",
+    "inbox_helpers:mail_seams",
+    "inbox_helpers:pack_run_telemetry",
+    "inbox_helpers:plan_fire_receipt",
+    "inbox_helpers:plan_inbound_capture",
+    "inbox_helpers:plan_inbound_reconcile",
+    "inbox_helpers:priority_rules",
+    "inbox_helpers:render_inbox_page",
+    "inbox_helpers:renderer_preflight",
+    "inbox_helpers:setup",
+    "inbox_helpers:surface_preferences",
+    "inbox_helpers:triage_config",
+    # HEAL1 (Night M2) — the maintenance catch-up's read half. A merged seat
+    # asks these three questions through this door and executes the answer's
+    # job legs the same way; the one receipt goes through `append_jsonl`,
+    # never through here.
+    #
+    # `catch_up_plan` is the surface's form of the due-jobs question and is
+    # the one that is listed, NOT `due_jobs` itself. The spec's sentence
+    # names `due_jobs`; the difference is B-1, and it is deliberate. Both
+    # reach `dispatch_plan`, whose root-validation leg REPAIRS — an
+    # idempotent fingerprint backfill on a healthy root, a repoint plus a
+    # receipt on a dead one — and whose `scheduled` path stamps a fire-start
+    # marker. `catch_up_plan` takes neither branch by construction (it plans
+    # read-only and always as a manual fire), while `due_jobs` takes both
+    # whenever the caller asks for them, and on this list the caller is
+    # whatever the model pasted. A helper here reads or computes; a gated
+    # writer is exactly what made this verb a write door once already.
+    "maintenance_dispatcher:catch_up_plan",
+    "maintenance_dispatcher:typed_maintenance_branch",  # cr1#929 - a typed run maintenance on a merged seat fetches the registered task's merged branch, adapted for a manual fire (text only)
+    "maintenance_dispatcher:maintenance_staleness",
+    "surface_drivers:maintenance_truth_line",
+    # TZ1 (Night M2) — the schedule registry, read where the folder is.
+    "schedule_backend:read_trigger_map",
+    # FIX3 (F3-2) — the two questions a scheduled fire asks before it does
+    # anything. They used to be three `python3 -c` bodies pasted into the
+    # bootloader's own prose, which is the class guard G69 exists to stop.
+    # Both read and compute: `root_guard` is PATHREPAIR1's verdict with the
+    # apply leg removed (a fire never repairs — R-HEAL1-4), and `retirement`
+    # asks the registry two questions and renders one sentence.
+    # FIX3 (F3-10) — the connector-read row, COMPOSED here and appended
+    # by the caller through `append_jsonl`. The writer half
+    # (`chat_context:log_connector_read`) is not on this list and must
+    # never be: a read door writes nothing.
+    "chat_context:connector_read_row",
+    "fire_guards:retirement",
+    "fire_guards:root_guard",
+    # IDENT1 I-12 - the text surface for a run with no widget tool, the
+    # delivery plan it follows, and the typed `draft N` reader. All three
+    # read or compose; the landing is `write`, the rows are `append_jsonl`.
+    "inbox_helpers:render_inbox_text",
+    "inbox_helpers:plan_delivery",
+    "inbox_helpers:typed_reply_action",
+    # IDENT1 I-14 - the connector discovery step, rendered from the
+    # declaration (a read of the workspace's own connector labels).
+    "inbox_helpers:connector_discovery_step",
+    # IDENT1 I-15 - is this chain migrated? Reads the PLUGIN's own census,
+    # never the workspace; a stop is one sentence and zero writes.
+    "migration_gate:gate",
+    # IDENT1 I-2 (R-RW2-3, first half). The prep's ONE path question. It was
+    # refused here on 2026-09-22, so the chat imported the writers into a
+    # shell to get the answer and wrote the receipt with a session token.
+    # A read: it names the file a brief for this occurrence lives in.
+    "prep_pipeline:resolve_prep_brief_path",
+    # RETIRE1 (Night M3, SAFETY0) — the third fire question: is this fire the
+    # workspace's declared scheduled writer? It reads the declaration and the
+    # process environment and writes nothing; `foreign: true` makes its
+    # `line` the whole turn.
+    "fire_guards:scheduled_writer",
+    # SCHEDDISCOVER1 (night M3, review M-2) — the scheduler discovery step's
+    # ONE rendered call: the opening line a scheduling skill says (where the
+    # chats run, or why there is no scheduler). Computes one sentence from its
+    # arguments; reads nothing and writes nothing.
+    "schedule_backend:opening_lines",
+    # cr1#1278 - the scheduler listing call by the backend the loaded tool
+    # names select (the name the health check reads the scheduler by). Reads
+    # nothing and writes nothing.
+    "schedule_backend:plan_list",
+    # ORCH2C (Night M3 lane 6) — the Waiting On chain
+    # (`orchestrator-commitments.md`). Every one reads or computes: the CRU
+    # passes are PLANNED here (the closes they would make come back as
+    # `writes` for `run_writer commitments_helpers:apply_cru_writes`, the
+    # review proposals as rows for `append_jsonl`), the receipt is COMPOSED,
+    # and a hand-shaped page is rendered and handed back for `write`. The
+    # chain's two writers are on the writer list, never here.
+    # `chase_candidates` (fix pass 1, REVIEW_ORCH2C HIGH-2) is Phases 3,
+    # 3.6, 3.8, 4.5 and 5 - the chase set built where the ledger is.
+    "commitments_helpers:chase_candidates",
+    "commitments_helpers:cru_window",
+    "commitments_helpers:filter_chase_rows",
+    "commitments_helpers:fold_gate",
+    "commitments_helpers:lateness",
+    "commitments_helpers:meeting_today_rows",
+    "commitments_helpers:plan_calendar_cru",
+    "commitments_helpers:plan_commitments_receipt",
+    "commitments_helpers:plan_sent_cru",
+    "commitments_helpers:render_waiting_on_page",
+    "commitments_helpers:render_waiting_on_text",
+    "commitments_helpers:renderer_preflight",
+    "commitments_helpers:resolve_people",
+    "commitments_helpers:setup",
+    "commitments_helpers:validate_inbound_ran",
+    # SWEEPDOOR1 (cr1#938) - `clean up my commitments` on a merged seat. Every
+    # one reads or computes: Steps 1-2 in one call, the self-check, the bulk
+    # verbs' plans (which write nothing) and the queue offer. Their writers
+    # are on the write list.
+    "commitment_backlog_sweep:door_setup",
+    "commitment_backlog_sweep:last_scan",
+    "commitment_backlog_sweep:validate_sweep_ran",
+    "commitment_backlog_sweep:amnesty_plan",
+    "commitment_backlog_sweep:review_offer",
+    "commitment_backlog_sweep:review_expiry_plan",
+    "commitment_backlog_sweep:ingest_kill_plan",
+    "skill_config_writer:load_skill_config",  # cr1#938 - a saved setting, read (its two writers are on the write list)
+    # ORCH2 (Night M3) — the morning brief. Every one reads or computes; a
+    # row its delegated writer would append (the clock record, a served-slot
+    # skip, the chat touches, `brief_state`, the combined `pack_run`) comes
+    # back in `pending_rows`/`rows` for the caller's `plan append_jsonl`.
+    # Writers (the first-fire settings save) go through `run_writer`.
+    "morning_brief_helpers:brief_config",
+    "morning_brief_helpers:brief_state",
+    "morning_brief_helpers:chat_context",
+    "morning_brief_helpers:lateness",
+    "morning_brief_helpers:open_commitments",
+    "morning_brief_helpers:plan_combined_receipt",
+    "morning_brief_helpers:plan_maintenance_receipt",
+    "morning_brief_helpers:prep_config",
+    "morning_brief_helpers:prep_leg_plan",
+    "morning_brief_helpers:prep_leg_result",
+    "morning_brief_helpers:prep_meeting_lines",
+    "morning_brief_helpers:render_for_fire",
+    "morning_brief_helpers:settings_for_fire",
+    "morning_brief_helpers:thread_payloads",
+    # ORCH2 — what's on my plate (the mute ledger, show-my-reminders' since
+    # cr1#552, and the My Plate chat's lateness check). Same rule: reads and
+    # computes; the page comes back for `plan write`, rows for
+    # `plan append_jsonl`. The retired discuss list's read (cr1#552) stays
+    # a verb so the bridge can plan the retirement beside the data; the
+    # `discuss_list_retired_v1` writer is what moves the items.
+    "plate_helpers:discuss_list",
+    # ORCH2 fix pass 1 — the My Plate chat's Step 0 fold gate and its
+    # degrade-tier receipt compose, both beside the data.
+    "plate_helpers:fold_gate",
+    "plate_helpers:lateness",
+    "plate_helpers:live_mutes",
+    "plate_helpers:plan_list_marker",
+    "plate_helpers:plan_plate_receipt",
+    "plate_helpers:render_list_page",
+    # ORCH2 — the staff meeting and the health check (system-health).
+    # The substrate alarm lines are NOT here: they sweep resolved alerts
+    # as they run, so they go through `run_writer`.
+    "staff_meeting_helpers:health_report",
+    "everything_ok:answer",  # cr1#1585 - the one "is everything OK?" answer (tasks, workspace, what needs a yes), read only
+    "staff_meeting_helpers:health_substrate",
+    "bug_log:open_bug_count",  # cr1#852: how many logged bugs are still open, for the health check
+    "staff_meeting_helpers:lateness",
+    "staff_meeting_helpers:plan_staff_receipt",
+    "staff_meeting_helpers:self_report",
+    "staff_meeting_helpers:staff_window",
+    # ORCH2 fix pass 1 — the staff meeting's unnamed-speaker count line
+    "staff_meeting_helpers:unnamed_speakers",
+    # ORCH2 — End of Day (orchestrator-past-meetings.md, end-of-day). The
+    # module's two WRITERS (`apply_cru_pass`, `run_shadow_lane`) are on the
+    # write list and never here (G74).
+    "eod_helpers:brief_path",
+    "eod_helpers:capture_fence",
+    "eod_helpers:catchup_window",
+    "eod_helpers:cru_walk",
+    "eod_helpers:decision_rows",
+    "eod_helpers:dedup_meetings",
+    "eod_helpers:lateness",
+    "eod_helpers:meeting_write_counts",
+    "eod_helpers:plan_eod_receipt",
+    "eod_helpers:prep_feedback",
+    "eod_helpers:render_eod_page",
+    "eod_helpers:render_for_fire",
+    "eod_helpers:render_set",
+    "eod_helpers:renderer_preflight",
+    "eod_helpers:unprocessed_backlog",
+    "reconcile_sent_commitments:plan_sent_window",  # MAINTJOBS1
+    "chat_reconcile:plan_chat_scan",  # MAINTJOBS1
+    "inbound_mail_leg:plan_inbound_mail",  # cr1#664 - the inbound-mail job, planned beside the data
+    "session_sweep:plan_sweep",  # MAINTJOBS1
+    "tasks_leg:plan_tasks_capture",  # cr1#668
+    "tasks_leg:plan_tasks_close",  # cr1#668
+    "connector_proposals:plan_connector_proposals",  # cr1#668
+    "maintenance_dispatcher:plan_schedule_realign",  # MAINTJOBS1
+    "schedule_backend:bridge_plan",  # v5.33.0 merge-fix MF-3 (D-8): the bridge refreshes mapped chats only; a read that plans
+    "schedule_backend:bridge_schedules_line",  # v5.33.0 merge-fix MF-3/MF-4 (D-5): the bridge's schedules sentence through the one producer
+    "cockpit_helpers:load_config",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:hub_pointer",  # cr1#782 - the Morning Brief's last line: the Hub's address when one is set up
+    "cockpit_helpers:setup_check",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:render_page_file",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:admin_check",  # cr1#723 - what the client's admin must switch on for the page's Send and calendar answers, read only
+    "cockpit_helpers:version_answer",  # cr1#118 - which version am I on: the shipped plugin.json and the forwarded runtime version, one line
+    "cockpit_helpers:status_doc",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:settle_statuses",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:plan_prune_choices",  # cr1#683 - the applied choices past the window the refresh leg deletes from the page, planned not written here
+    "cockpit_helpers:feed_today",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:feed_inbox",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:feed_projects",  # cr1#660 - the cockpit page's Projects tab, read only
+    "cockpit_helpers:feed_review",  # cr1#779 - the Review tab's rows
+    "cockpit_helpers:feed_week",  # cr1#780 - the Done tab's rows
+    "cockpit_helpers:feed_settings",  # cr1#781 - the Settings tab: what was learned and every setting, read only
+    "usage_guide:guide",  # cr1#187 - the habits and phrases: the Settings section and the typed "how do I use this", read only
+    "cockpit_helpers:feed_mine",  # cr1#662 - the Today page's priorities and reminders, read only
+    "cockpit_helpers:feed_mail_rules",  # cr1#1020 - the Inbox tab's mail rules and dropped threads, read only
+    "cockpit_helpers:feed_brief",  # cr1#1310 - the Brief tab: today's saved morning brief, as written, read only
+    "morning_message:hub_address",  # cr1#1017 - the Hub page the morning message reads its Inbox feed from, read only
+    "cockpit_helpers:miss_search_plan",  # cr1#1202 - what the apply run searches for each "Missed something?" press, computed not written
+    "cockpit_helpers:miss_chat_plan",  # cr1#1315 - what report-bug does with the "Something wrong?" chat's message: the route and the one search, computed not written
+    "cockpit_helpers:miss_chat_answer",  # cr1#1315 - where that chat's missing item was found and why the Hub missed it, before anything is filed; read only
+    "cockpit_helpers:feed_people",  # cr1#1020 - the People tab and the starred people on Home, read only
+    "cockpit_helpers:refresh_part",  # cr1#1530 - one part of what the one-call refresh built, read from its scratch folder outside the workspace
+    "cockpit_helpers:feed_board",  # cr1#1017 - the Week view's board on Today: due cards and priority lanes, read only
+    "cockpit_helpers:plan_claim",  # cr1#675, cr1#691 - the claim an Apply run writes before it acts, planned and not written here
+    "hub_meeting:carried_points",  # cr1#1632 slice 1 - what the owner's last meeting page with these people left, for the next brief; read only
+    "cockpit_helpers:plan_page_records",  # cr1#817 - the page's own sends and drafts with no book record yet, claimed for one run, planned not written here
+    "cockpit_helpers:apply_repin",  # cr1#1608 - an Apply batch the page refused, pinned again to the versions read, never by hand
+    "cockpit_helpers:plan_apply",  # COCKPIT1 (cr1#608) - the cockpit page's engine, read or compute
+    "cockpit_helpers:newer_message_arrived",  # COCKPIT1 (cr1#608) - the send gate: did the thread move after the draft
+    "cockpit_helpers:reply_reaches_everyone",  # cr1#1251 - the reply-all gate: a group reply a mail service cannot carry is refused, computed not written
+    "cockpit_helpers:sent_tokens_update",  # cr1#684 - the used-token record a run writes before a send, composed not typed
+    "cockpit_helpers:plan_task_registration",  # COCKPIT1 (cr1#608) - the cockpit task's registration, planned and not called
+    "cockpit_helpers:plan_cockpit_registration",  # cr1#619 - all four cockpit tasks, planned and not called
+    "cockpit_helpers:maintenance_status",  # cr1#666 - the Hub's status/maintenance document, read only
+    # DOORHELP2 (cr1#1005): helpers meeting-notes, people-crm, decision-log and
+    # needs-your-call name on a merged seat. Each reads or computes and
+    # writes nothing.
+    "meeting_capture:rerun_status",  # meeting-notes' re-run check, run BEFORE processing (reads receipts)
+    "narration_names:person_header",  # people-crm's record header, the person's name and never the id
+    "cru_match:load_open_commitments",  # the open-commitment fold (reads events.jsonl)
+    "decision_match:load_open_decisions",  # decision-log's open-decision fold (reads events.jsonl)
+    "surface_composers:refused_line",  # the one sentence when post refuses twice (pure)
+    "needs_review_queue:queue_text",  # needs-your-call's queue page as text, the view command's own page
+    # DOORHELP3 (cr1#1005, part 2). Each computes and writes nothing; the
+    # meeting builders hand back the row the skill lands with append_jsonl.
+    "meeting_capture:build_meeting_event",  # meeting-notes Step 9a1's row, built not written
+    "meeting_capture:build_meeting_processed_event",  # Step 9a2's receipt row, built not written
+    "meeting_capture:already_processed",  # the re-run predicate (reads receipts)
+    "meeting_capture:pasted_source_ref",  # a pasted note's stable source_ref (pure)
+    "cru_match:split_pending_review",  # people-crm Gate 2's split (pure)
+    "narration_names:humanize",  # ids to names in a sentence (pure)
+    "narration_names:name_index",  # the id-to-name index (reads entities.json)
+    "offer_gate:compose",  # an offer line gated before it is said (pure)
+    "offer_gate:fact_close_lines",  # people-crm Gate 2b's close lines (pure)
+    "offer_gate:duplicate_decisions",  # decision-log's doubled-entry count (pure)
+    "offer_gate:decision_log_duplicates_line",  # its sentence (pure)
+    "surface_composers:decision_log_answer",  # decision-log's composed answer (reads)
+    "chat_output_renderer:validate_chat_output",  # the leak scan on a reply (reads)
+    "chat_output_renderer:output_check",  # cr1#1357: the same scan, answering its receipt (reads)
+    "surface_composers:undo_receipt_text",  # cr1#1414: the gated receipt for an undo that already ran (reads)
+    # DOORHELP7 (cr1#1005, part 4): the reads a merged seat was still refused.
+    # Each reads and writes nothing (pinned on a local and a merged seat).
+    "meeting_capture:count_meeting_writes",  # meeting-notes Step 9a3, the claim audit (reads the book)
+    "meeting_capture:meeting_binding_audit",  # Step 9a3's binding check (reads the book)
+    "task_watchdog:health_verdict",  # the Maintenance health step's verdict (reads receipts)
+    "integrity_check:run_checks",  # the Maintenance integrity step, detect only (reads)
+    # cr1#1297 part 2 (batch 1): read-only helpers skills already import
+    # in-shell, on the read door so a merged seat runs them instead of
+    # refusing them. Each reads a file or computes on its arguments and
+    # writes nothing (ORCH1's seven-frame scan and its byte census cover
+    # every name here). Not here yet: the pure helpers that take a whole
+    # ledger or register as an argument, which the door's argument walk
+    # cannot carry at real size; they stay in the census baseline.
+    "brief_path:get_brief_path",  # a brief's path, computed (pure)
+    "brief_path:get_brief_artifact_url",  # a saved file's link, computed (pure)
+    "brief_path:get_brief_opener_url",  # the link a chat opens, computed (pure)
+    "brief_path:saved_to_meetings_footer",  # the "saved to" line under a brief (pure)
+    "chase_policy:load_chase_policy",  # the chase-window settings (reads its file)
+    "chase_policy:get_chase_window",  # one relationship's window (pure)
+    "change_feed:changes_since",  # what changed since a time (reads the log)
+    "change_feed:plumbing_lines",  # the feed's plumbing lines (pure)
+    "closure_index:pointer_coverage_line",  # its sentence (pure)
+    "deal_health:zombie_threshold_days",  # the zombie threshold from closed deals (pure)
+    "deal_state:list_open_deals",  # the open deals (reads entities.json)
+    "objective_state:list_open_objectives",  # the open objectives (reads entities.json)
+    "objective_math:forum_objectives",  # the objectives a meeting touches (pure)
+    "pipeline_math:rank_deals",  # deals in health order (pure)
+    "pipeline_math:value_by_org",  # open value per org (pure)
+    "receipts:normalize_task_id",  # a task id in its one spelling (pure)
+    "schedule_config:cron_to_english",  # a cron line in words (pure)
+    "schedule_config:task_display_name",  # a task's display name (pure)
+    "release_remediation_selector:version_lt",  # version order (pure)
+    "surface_preferences:load_surface_preferences",  # the surface dismissals (reads its file)
+    "surface_preferences:is_suppressed",  # is an item dismissed (pure)
+    "surface_preferences:dismissal_fingerprint",  # a dismissal's key (pure)
+    "skill_config_writer:get_config",  # a skill's settings over its defaults (reads)
+    "skill_config_writer:is_configured",  # has a skill been set up (reads)
+    "extraction_hints:load_extraction_hints",  # the extraction hints (reads its file)
+    "session_sweep:last_sweep",  # the last sweep receipt (reads the log)
+    "session_sweep:last_backfill",  # the last backfill receipt (reads the log)
+    # cr1#1297 part 2 (batch 2): 25 more read-only in-shell helpers, by
+    # batch 1's method. Each computes on small arguments of its own, or
+    # reads a file under the workspace, and writes nothing at any depth. Not
+    # here: names whose reads reach the stale-read or read-alarm sidecar,
+    # names that take a whole ledger, register or day pack, names whose
+    # answer depends on in-process state the door's child would not share
+    # (the composers' gate-passed register, the prep leg's sequence),
+    # names whose argument is always a `computer:` link (the door refuses
+    # that by design, cr1#1058), names that hand back a dataclass whose
+    # callers read a property the door's plain copy drops, any raw
+    # `people_writer` name (D-W2-5: only its `door_` wrappers go on a
+    # list), the missing-entries sentence composer (LEDGERFENCE1 keeps
+    # its name inside seq_health alone), and every writer.
+    "extraction_hints:is_resolution_miss",  # does a reply say it was done (pure)
+    "reminders:wants_delete",  # do the words ask to delete a reminder (pure)
+    "render_router_misses:chat_route",  # is this the router-miss question (pure)
+    "scaffold_automation:slugify",  # a title as a slug (pure)
+    "schedule_config:parse_cron",  # a cron line's five fields (pure)
+    "schedule_config:readiness_retirement_summary",  # its one line (pure)
+    "schedule_config:unavailable_schedule_lines",  # the not-running lines (pure)
+    "offer_gate:deliverable_findings_line",  # the deliverable check's line (pure)
+    "offer_gate:schedule_card_line",  # the scheduling card's line (pure)
+    "onboarding_profile:parse_setup_sentence",  # the setup card's answers (pure)
+    "prep_grading:section_weight",  # a prep section's learned weight (pure)
+    "prep_pipeline:build_prep_tiles",  # the prep stat tiles (pure)
+    "prep_pipeline:build_relationship_timeline",  # the timeline strip (pure)
+    "prep_pipeline:assemble_prep_sections",  # the prep's section list (pure)
+    "prep_pipeline:build_owed_table",  # the owed table (pure)
+    "seq_health:gap_standing_line",  # the standing missing-entries line (pure)
+    "draft_constraints:apply_draft_constraints",  # a draft's learned limits (pure)
+    "voice_corrections:diff_and_classify",  # what an edit changed (pure)
+    "person_candidates:ack_line",  # the add-a-person reply line (pure)
+    "deliverable_sweep:scan_chat_text",  # a draft's leak and voice scan (pure)
+    "deliverable_sweep:summarize_for_user",  # the sweep's summary line (pure)
+    "cleanup_actions:check_aliases_staleness",  # is ALIASES.md behind (reads)
+    "cleanup_actions:check_analytical_view_staleness",  # stale views (reads)
+    "skill_config_writer:lint_skill_configs",  # the settings lint (reads)
+    "brain_undo:undo_listing_lines",  # the bare-undo listing (pure)
+    # cr1#1580: where a project's session notes are read and appended,
+    # `SESSION_NOTES_<folder name>.md` or the older spelling a folder already
+    # holds. Lists one folder and writes nothing; the skill writes the file.
+    "session_notes_file:notes_file",
+    # KEEP THIS NAME LAST, directly above the closing brace.
+    # `run_access1_test`'s B-1 removal proof anchors on the exact two-line
+    # string `"workspace_root:find_workspace_root",` + `})` and puts the
+    # gated writer back in that slot. An addition appended after this line
+    # breaks that anchor and the proof reports "anchor not found" instead of
+    # going red for a real reason. New entries go ABOVE.
+    "morning_brief_helpers:confirm_lines",  # BRIEFDOOR1 - Step 3g's confirm pointer
+    "morning_brief_helpers:money_lines",  # BRIEFDOOR1 - Step 3h's money carve-out
+    "morning_brief_helpers:reminders",  # BRIEFDOOR1 - Step 3f's own pins
+    "morning_brief_helpers:post_text",  # BRIEFDOOR1 - the chat copy's document links
+    "bridge_versions:install_versions",  # HYGIENE3 - the bridge's version triple, workspace half (D-3)
+    "schedule_backend:plan_registration",  # BRIDGE2 - registration planned beside the data: the seat digest vs the declaration (R-WALK-3)
+    "schedule_backend:plan_default_cron_moves",  # cr1#967 - a kept chat still at an old shipped default time moves, time only; the owner's own time never
+    "schedule_config:scheduled_writer",  # BRIDGE2 - the declaration read where the folder is, so a refusal can name the computer
+    "workspace_config_io:install_state",  # schedule setup Step 0.C - first install, re-run, or a record that cannot be read (never a first install)
+    "migration_adjudication:adjudication_status",  # BRIDGE2 - the bridge's Phase 1 adjudication gate, read beside the data (R-WALK-5)
+    "maintenance_dispatcher:chats_state",  # CHATSON1 (#98) - M1b asks with the scheduler's rows for EVERY chat on the roster; switch-on only for the ones that read off
+    "maintenance_dispatcher:own_chat_state",  # FIRE3B - M1b asks with the scheduler's rows; switch-on only when this chat reads off (F-T2-13)
+    "eod_helpers:resolve_choice",  # MIGRATE3-EOD - the evening answer resolver, read beside the data (F-T2-15)
+    "friday_wrap_helpers:lateness",  # MIGRATE3-FW - the wrap's Phase 2.9 verdict, its rows held
+    "friday_wrap_helpers:plan_wrap_receipt",  # MIGRATE3-FW - the wrap's one pack_run, composed not written
+    "friday_wrap_helpers:wrap_post",  # MIGRATE3-FW - the post fences beside the data, a refusal answered
+    "friday_wrap_helpers:recap_config",  # MIGRATE3-FW - weekly-recap's first-run settings read
+    "friday_wrap_helpers:catchup_window",  # MIGRATE3-FW - the wrap's since-last-run window
+    "friday_wrap_helpers:group_section",  # MIGRATE3-FW - section 8's heading from the reader's settings
+    "friday_wrap_helpers:week_sections",  # MIGRATE3-FW - sections 8b, 8b-bis and 8c read beside the data
+    "friday_wrap_helpers:window_events",  # MIGRATE3-FW - the window's org-scoped rows (PGUARD1)
+    "friday_wrap_helpers:brief_path",  # MIGRATE3-FW - the recap document's path
+    "friday_wrap_helpers:closing_lines",  # MIGRATE3-FW - 5.C's footer and heading link, composed not printed
+    "friday_wrap_helpers:plan_commitment_captures",  # MIGRATE3-FW - Phase 3's commitments, gated and composed (no scan skill)
+    "friday_wrap_helpers:week_facts",  # MIGRATE3-FW - the primary user and the commitment counts, read beside the data
+    "friday_wrap_helpers:plan_visual_gate",  # MIGRATE3-FW - 5.B's visual-pass audit row, composed not written
+    "morning_brief_helpers:call_prep_config",  # MIGRATE3-MB - call-prep's first-run knobs, read beside the data
+    "morning_brief_helpers:prep_constraints",  # MIGRATE3-MB - call-prep's learned constraints (and the draft through them)
+    "morning_brief_helpers:coaching_handoff",  # MIGRATE3-MB - call-prep's coaching handoff question
+    "morning_brief_helpers:prep_opener",  # MIGRATE3-MB - the landed prep's cloud-aware opener
+    "exit_doors:plan_fact_closes",  # MIGRATE3-MB - D-T2B-1: which Owed rows the record shows finished; a read, never a close
+    "maintenance_dispatcher:score_door_job",  # FIRE3 - the merged fire scores each script/door job beside the data (MAINTJOBS1 S-4)
+    # PEOPLEWRITE2
+    "people_writer:door_find_person",  # PEOPLEWRITE2 - people-crm's dedup read before a person write; an ambiguous name answered, never raised (D-W2-5)
+    # DOORHELP1 (cr1#518): three READS the drafting and triage skills name,
+    # refused on every merged seat until now. Each reads and writes nothing:
+    # the owner's person id off entities.json, the learned voice constraints
+    # off the corrections store and the voice block, and the thread payload
+    # (already reached through `morning_brief_helpers:thread_payloads`).
+    "primary_user:resolve_primary_user",  # DOORHELP1 - inbox triage's owner id
+    "draft_constraints:load_draft_constraints",  # DOORHELP1 - the drafting skills' learned constraints
+    "load_thread_knowledge:load_thread_knowledge",  # DOORHELP1 - the drafting skills' thread payload
+    # OBJDOOR1 (cr1#317): the objectives readout, the in-shell block's own
+    # composition in one read (inputs, health, due check-ins, skipped lines).
+    "objective_math:readout",
+    # MNSTEPS1 (cr1#550): two READS meeting-notes names, refused on every
+    # merged seat until now. Step 5h's scoped deal-signal detection (its
+    # proposals are written by `deal_signal_detector:propose_candidates`,
+    # on the write door) and the card's expiry sentence, composed from the
+    # workspace's own question lifetime. Both read and write nothing.
+    "deal_signal_detector:detect_deal_signals",  # MNSTEPS1 - Step 5h, detection only
+    "attribution_doors:card_expiry_sentence",  # MNSTEPS1 - Step 9c-bis, the expiry line
+    # cr1#928: the three skill-class maintenance jobs, planned beside the
+    # data on a merged seat. Each reads and writes nothing; its writer is on
+    # the write list.
+    "skill_jobs_door:plan_cleanup",  # cr1#928 - the cleanup passes the writer runs and the ones it does not
+    "skill_jobs_door:plan_weekly_insights",  # cr1#928 - the five projections the session composes from
+    "skill_jobs_door:plan_monthly_report",  # cr1#928 - the owed months and each month's digest
+    # cr1#970: the update bridge's one line about scheduled chats. A pure
+    # read of the activity log; it never reads the scheduler. Its writer,
+    # the marker the two owner skills write, is on the write list.
+    "schedule_handoff:pending_line",  # cr1#970 - the update's one schedules line, read only
+    # cr1#1014 (train 4, the deep tier): the document shelf's two readers.
+    # Each reads the folder and the stored shelf and writes nothing; the
+    # rebuild is on the write list.
+    "doc_shelf:find_documents",
+    "doc_shelf:quote_section",
+    # cr1#1014 (train 4): what was said in meetings, and the feedback given
+    # in them. Both read the log and write nothing; the writer is on the
+    # write list.
+    "meeting_substance:meeting_summaries",
+    "meeting_substance:feedback_entries",
+    # cr1#1632 (slice 2): what the owner attached to a meeting on the Hub, as
+    # the brief's Attached section; screened by the imports' wall (fail
+    # closed), reads the log, writes nothing
+    "meeting_attach:for_brief",
+    # cr1#397 (SPEC CRAFT1 step 2): craft recall. The craft files a task
+    # reads, the Sources lines for the rules an output used (read back from
+    # the file through each rule's id), and people-crm's two verbs. All four
+    # read and write nothing.
+    "craft_recall:craft_for_task",
+    "craft_recall:cite_rules",
+    "craft_recall:craft_inventory",
+    "craft_recall:match_craft_verb",
+    # cr1#398 (SPEC CRAFT1 step 3): craft capture's read half. Which ask it
+    # is, the sources listed before anything is read, and the preview the
+    # owner confirms, edits or dismisses. All three write nothing; the file,
+    # its event and the view are `craft_capture:write_craft`, on the write
+    # list.
+    "craft_capture:match_capture_ask",
+    "craft_capture:gather_sources",
+    "craft_capture:build_preview",
+    "workspace_root:find_workspace_root",
+})
+
+# The writers `run_writer` may call, spelled `module:function` (IDENT1 I-0,
+# ruling R-M3-2 / coordinator decision D-2).
+#
+# `run_helper` is a READ door and stays one: its seven-frame write-scan is
+# the pin that keeps it honest. But a document, a receipt, a close and a
+# re-pin are WRITES, and until this door existed the layer had no way to run
+# one beside the data - so the 2026-09-22 prep chat imported `brief_writer`
+# and `receipts` straight into a shell, and the receipt it wrote carried a
+# session token instead of the customer's writer id. This is the door those
+# calls go through instead: its own list (no name is on both - guard G74),
+# refused where there is no workspace (`container`), path-fenced like
+# `write`, arguments bound by NAME, and an identity PRECONDITION
+# (`receipts.require_writer_identity`) asked before anything runs. Every
+# name here has a reason in `shared/WORKSPACE_ACCESS.md`'s writer table.
+#: cr1#603: the record a scheduled fire leaves when it STOPS before its
+#: surface. The one writer the door lets a foreign fire run (the identity
+#: gate below skips the foreign leg for this name and this name only).
+FIRE_STOP_WRITER = "receipts:log_fire_stopped"
+
+RUN_WRITER_ALLOWLIST = frozenset({
+    # the prep (I-2): the document, its receipt, and the fact closes the
+    # prep runs before its Owed table (which include the calendar leg)
+    "brief_writer:make_brief_from_json",
+    "receipts:log_prep_receipt",
+    # cr1#603: the bootloader's stop record, before any STOP line it posts
+    FIRE_STOP_WRITER,
+    "exit_doors:apply_fact_closes",
+    "calendar_close:run_calendar_close_job",
+    # the connector declaration and the update bridge's re-pin (I-7)
+    "connector_config:set_declared_backend",
+    # cr1#667: a declared connector's kind, dials, lists and scope, set from
+    # the owner's words at set-up or by one sentence in chat
+    "connector_config:set_connector_settings",
+    "release_actions.connector_display_name_repin_v1:connector_display_name_repin_v1",
+    # the fire-delivery setting (I-12 (8)): `publish my scheduled pages`
+    "fire_delivery:set_artifact_publish",
+    "fire_delivery:record_artifact_url",
+    # SAFETY0 (RETIRE1's R0; spec §7 seam S-10): declaring THIS workspace's
+    # one scheduled writer is a whole-file entities.json write plus one
+    # `scheduled_writer_declared` row, made on the registering seat.
+    "schedule_config:declare_scheduled_writer",
+    # cr1#1138: the deliberate hand-over of the schedules to THIS seat - the
+    # same write as the declaration, with the refusals lifted and the new
+    # holder taking effect at the next slot.
+    "schedule_config:hand_over_schedules",
+    # cr1#1139 (ruling A5): the owner names THIS account as acting for them -
+    # one entities.json key plus one `acting_account_named` row.
+    "schedule_config:name_acting_account",
+    # ORCH2C (Night M3 lane 6) - the Waiting On chain
+    # (`orchestrator-commitments.md`). The closes its CRU passes plan, the
+    # inbound pass end to end, the stamped auto-merges, the first-fire
+    # config save, and the one-command driver (its view mints the plate's
+    # display numbers, and its render and receipt are one call, FB-7).
+    "commitments_helpers:apply_cru_writes",
+    "commitments_helpers:run_waiting_on_surface",
+    "reconcile_inbound_commitments:reconcile_inbound_and_receipt",
+    "commitment_dedup:apply_auto_merges",
+    "skill_config_writer:save_skill_config",
+    # ORCH2 (Night M3) — the daily surfaces' and the maintenance fire's
+    # writers. Each is a write that cannot be expressed as ledger rows: a
+    # job that writes through its own writers, an alert sweep. (ORCH2's
+    # settings-file writer is `skill_config_writer:save_skill_config`, listed
+    # ONCE above under ORCH2C - MF-23; G74 [6] polices duplicates.)
+    "maintenance_dispatcher:run_job",
+    "substrate_health:substrate_alarm_lines",
+    # ORCH2 — End of Day's writes that are not ledger rows
+    "brief_path:ensure_brief_directory",
+    "eod_helpers:apply_cru_pass",
+    "eod_helpers:run_shadow_lane",
+    "exit_doors:apply_own_word_closes",
+    "meeting_capture:route_meeting_captures",
+    # ORCH2 — My Plate's one-command driver: its view mints the plate's
+    # display numbers under the writer lock and lands the receipt (FB-7).
+    "plate_helpers:run_my_plate_surface",
+    # ORCH2 fix pass 1 — the Staff Meeting's one-command driver, the same
+    # shape: it runs the watch-expiry pass, freezes the page-set, lands the
+    # page and writes the fire's one receipt (FB-7).
+    "staff_meeting_helpers:run_staff_meeting_surface",
+    "schedule_backend:record_trigger_row",  # SCHEDREG1 - registration's trigger row, landed where the folder is
+    "schedule_backend:record_registration",  # SCHEDFAST1 (#101) - the trigger row AND the schedule_created receipt, one door call per created chat
+    "schedule_backend:record_removals",  # SHELVE1 (cr1#618) - after the bridge's reinstall deletes: the trigger rows dropped and one config record
+    "schedule_backend:record_workspace_registration",  # cr1#1504 - schedule setup's own config record, merged, never written over an unreadable file
+    "schedule_config:write_schedule_skipped",  # SCHEDREG1 - the one refusal row a seat that cannot register writes
+    "inbox_helpers:run_inbox_surface",  # INBOXDRIVE1
+    "inbox_helpers:stamp_last_triage",  # LASTTRIAGE1 (cr1#454) - the typed triage's LAST_TRIAGE.txt, stamped from the clock; it takes no time
+    "maintenance_dispatcher:mark_fire_start",  # MAINTJOBS1
+    "reconcile_sent_commitments:reconcile_and_receipt",  # MAINTJOBS1
+    "chat_reconcile:reconcile_chat_and_receipt",  # MAINTJOBS1
+    "eod_incremental:log_capture_pass_receipt",  # MAINTJOBS1
+    "session_sweep:sweep_and_receipt",  # MAINTJOBS1
+    "tasks_leg:capture_tasks_and_receipt",  # cr1#668
+    "tasks_leg:close_tasks_and_receipt",  # cr1#668
+    "connector_proposals:propose_from_connectors_and_receipt",  # cr1#668
+    "cleanup_actions:sweep_lock_litter",  # MAINTJOBS1
+    "cleanup_actions:tidy_folder",  # cr1#1019 (T10) - the folder tidy, archive first with a manifest; see the writer table row
+    "cleanup_actions:undo_folder_tidy",  # cr1#1019 (T10) - every move of one tidy put back from its manifest; see the writer table row
+    "schedule_refresh:log_schedule_refreshed",  # MAINTJOBS1
+    "schedule_backend:record_trigger_map",  # MAINTJOBS1
+    "release_actions.claude_md_docs_rule_v1:claude_md_docs_rule_v1",  # DOCS lane (DOCS1 D-1): the rule into CLAUDE.md, one applied row
+    "release_actions.claude_md_filecard_rule_v1:claude_md_filecard_rule_v1",  # FILECARD1 (cr1#610): the file-card line into CLAUDE.md, one applied row
+    "release_actions.claude_md_nomd_rule_v1:claude_md_nomd_rule_v1",  # FILECARD1 (cr1#610): the no-Markdown line into CLAUDE.md, one applied row
+    "release_actions.claude_md_notes_line_v1:claude_md_notes_line_v1",  # cr1#1580: the "Project notes" line in CLAUDE.md rewritten to the one notes name, one applied row
+    "release_actions.discuss_list_retired_v1:discuss_list_retired_v1",  # cr1#552: the retired discuss-later list emptied into notes and My Plate tasks, one applied row
+    "deliverables:export_claude_doc",  # DOCS lane (DOCS1 D-2): a Claude Doc landed in the folder + its receipt row
+    "lifecycle_pass:bring_back",  # cr1#753 - see the writer table row
+    "cockpit_helpers:feed_plate",  # COCKPIT1 (cr1#608) - see the writer table row
+    "cockpit_helpers:refresh_all",  # cr1#1530 - the whole refresh in one process (it builds the plate); see the writer table row
+    "cockpit_helpers:prep_all",  # cr1#1603 - the Prep run after call-prep in one process (it keeps its feed in a scratch folder outside the workspace); see the writer table row
+    "cockpit_helpers:inbox_all",  # cr1#1603 - the Inbox run after the fetch in one process (the chain's writer, then its feed); see the writer table row
+    "cockpit_helpers:apply_commitment_choices",  # COCKPIT1 (cr1#608) - see the writer table row
+    "cockpit_helpers:apply_hub_choices",  # cr1#662 - see the writer table row
+    "morning_message:plan_send",  # cr1#1017 - the morning message planned (it builds the plate); see the writer table row
+    "morning_message:record",  # cr1#1017 - the morning message sent or skipped, one row; see the writer table row
+    "cockpit_helpers:add_chat_priority",  # cr1#776 - see the writer table row
+    "cockpit_helpers:apply_review_choices",  # cr1#779 - see the writer table row
+    "cockpit_helpers:apply_week_choices",  # cr1#780 - see the writer table row
+    "cockpit_helpers:apply_settings_choices",  # cr1#781 - see the writer table row
+    "cockpit_helpers:apply_mail_choices",  # cr1#1020 - see the writer table row
+    "cockpit_helpers:apply_people_choices",  # cr1#1020 - see the writer table row
+    "cockpit_helpers:record_page_sends",  # cr1#817 - see the writer table row
+    "cockpit_helpers:record_calendar_changes",  # cr1#1539 - see the writer table row
+    "cockpit_helpers:apply_start",  # cr1#1608 - see the writer table row
+    "cockpit_helpers:apply_run",  # cr1#1608 - see the writer table row
+    "cockpit_helpers:apply_finish",  # cr1#1608 - see the writer table row
+    "cockpit_helpers:save_config",  # COCKPIT1 (cr1#608) - see the writer table row
+    "cockpit_helpers:land_registration",  # cr1#734 - see the writer table row
+    "cockpit_helpers:log_run_receipt",  # COCKPIT1 (cr1#608) - see the writer table row
+    "words:set_words",  # cr1#1017 (train 8) - see the writer table row
+    "advisor_sheet:write_sheet",  # cr1#1017 (train 8) - see the writer table row
+    "onboarding_confirm:apply_confirm",  # cr1#1163 part 2 - see the writer table row
+    "whats_new_setup:apply_walk",  # cr1#1235 - see the writer table row
+    "schedule_config:set_morning_time",  # cr1#1163 part 2 - see the writer table row
+    "project_folder:create_project",  # cr1#1582 - see the writer table row
+    "project_folder:make_project_folders",  # cr1#1582 - see the writer table row
+    "project_folder:undo_create_project",  # cr1#1582 - see the writer table row
+    # KEEP THIS NAME LAST, directly above the closing brace - the same anchor
+    # discipline as `RUN_HELPER_ALLOWLIST`: removal proofs and later lanes
+    # (ORCH2 adds entries) anchor on the two-line string
+    # `"deliverables:land",` + `})`. New entries go ABOVE.
+    "morning_brief_helpers:morning_pack",  # BRIEFDOOR1 - the brief's pack (mints plate numbers)
+    "morning_brief_helpers:plate_lines",  # BRIEFDOOR1 - the plate's brief cut (mints plate numbers)
+    "morning_brief_helpers:plan_lane_asked",  # BRIEFDOOR1 - Phase 6.1's mark (takes the ledger lock)
+    "path_repair:fire_time_guard",  # HYGIENE3 - the bridge's Step 0 root guard (it repairs; D-3)
+    "recover_corruption:run_recovery_if_needed",  # HYGIENE3 - the bridge's Phase 4.4 self-heal
+    "thread_writer:repair_dual_project_key",  # HYGIENE3 - the bridge's Phase 4.4b dual-key repair
+    "eod_helpers:run_end_of_day_pack",  # MIGRATE3-EOD - Phase C, the pack builder the old CLI wrapped (F-T2-15)
+    "eod_helpers:answer_eod_questions",  # MIGRATE3-EOD - the evening answers through the queue writers
+    "eod_helpers:score_coach_answer",  # MIGRATE3-EOD - the self-scored answer, one coaching_answer row
+    "eod_helpers:stage_fire_input",  # MIGRATE3-EOD fix round 2 - the day's fetch staged beside the data (R-2, R-6)
+    "eod_helpers:run_cru_pass",  # MIGRATE3-EOD fix round 2 - the CRU walk and write in one writer (R-2)
+    "eod_helpers:record_fire_stopped",  # MIGRATE3-EOD fix round 2 - a refused step leaves a receipt
+    "eod_helpers:reconcile_sent_staged",  # EODHARD3 - the mail leg over the Sent batch staged raw, one call
+    "eod_helpers:reconcile_chat_staged",  # EODHARD3 - the chat leg over the chat batch staged raw, one call
+    "eod_helpers:inbound_mail_staged",  # cr1#664 - the inbound-mail job over the inbox batch staged raw, one call
+    "eod_helpers:clear_fire_staging",  # EODHARD3 - the fire's staged files removed
+    "eod_helpers:close_from_eod",  # EODTAP2 - a tapped mark done, drop or push on the End of Day's row list (MIGRATE3-EOD N-8)
+    "commitments_helpers:apply_row_action",  # WOTAP1 - a typed or clicked mine, theirs to [name] or drop on a Waiting On row (cr1#513)
+    "commitment_wait:wait_from_chat",  # WAITCHAT1 - a typed wait on an event, set or cleared by the row's number (cr1#1323)
+    "due_set:due_from_chat",  # DUESET1 - a due date set by the row's number, never hidden (cr1#1383, option B)
+    "friday_wrap_helpers:record_offer",  # MIGRATE3-FW - the earned door closed after the post
+    "friday_wrap_helpers:plate_cut",  # MIGRATE3-FW - the wrap's plate cut (mints plate numbers)
+    "friday_wrap_helpers:measure_line",  # MIGRATE3-FW - the one measure line (its plate count mints)
+    "friday_wrap_helpers:coaching_blocks",  # MIGRATE3-FW - the week against the word (next week's three mint)
+    "friday_wrap_helpers:post_turn",  # MIGRATE3-FW - the whole-turn post, the cut re-composed in process
+    "friday_wrap_helpers:land_recap",  # MIGRATE3-FW - the recap document from a payload landed by write (the by-path shape, D-T2B-7)
+    "morning_brief_helpers:run_morning_brief_pack",  # MIGRATE3-MB - Phase 3.9's pack, the CLI's own builder beside the data
+    "morning_brief_helpers:record_fire_stopped",  # MIGRATE3-MB - a refused or timed-out step lands the surface_failed receipt (fix round 1 N-3)
+    "schedule_config:log_schedule_config_change",  # FIRE3 - the maintenance fire's re-enable receipt, one schedule_config_changed row (D-T3-3)
+    # PEOPLEWRITE2
+    "people_writer:door_create_person",  # PEOPLEWRITE2 - people-crm's new person, a duplicate or a one-word name answered (D-W2-5)
+    "people_writer:door_update_person",  # PEOPLEWRITE2 - people-crm's field change on a person on file
+    "people_writer:door_record_person_fact",  # PEOPLEWRITE2 - people-crm's remember-a-fact, one person_fact_observed row
+    "people_writer:door_set_person_field",  # train 2 part 3b - a person's category, introducer or handle-with-care line, set or cleared, with undo
+    "people_writer:door_attach_phone",  # train 2 part 3b - one number attached, normalised, refused when it is someone else's
+    "people_writer:door_remove_phone",  # train 2 part 3b - one number removed, matched in any spelling
+    "people_writer:door_import_person_facts",  # train 2 part 3c - a list of categories, introducers and numbers in one undo batch; an unknown name judged by the add guard (C1)
+    "people_writer:door_auto_add_person",  # PEOPLEWRITE2 - people-crm's rich-context auto-add, the same-name gate first
+    # CFGRESET1 (cr1#249): "reset <skill> to defaults" on a merged seat. The
+    # writer takes a SKILL name checked against the known list, never a file
+    # name; `wipe_skill_config` itself stays off this list (LOWS2).
+    "skill_config_writer:reset_skill_config",
+    "chat_persona:reset_chat_persona",  # cr1#850: the persona back to its defaults, the store cleared, one style_changed row
+    "bug_log:resolve_bug",  # cr1#852: one bug_resolved row for a logged bug
+    "lifecycle_pass:answer_active",  # cr1#845: the owner's `active` on a dormancy row
+    # DOORHELP1 (cr1#518): two WRITES the drafting skills name, refused on
+    # every merged seat until now. The card renderer lands its validated page
+    # under `_hq/.system/widgets`; the correction in passing appends to the
+    # corrections store and the ledger. Both are writers, so they are here
+    # and never on the read door's list.
+    "widget_transport:render_and_persist",  # DOORHELP1 - the card, its audit page landed
+    "needs_review_queue:render_queue_page",  # DOORHELP3 (cr1#1005) - the queue's tap-to-answer page, landed
+    # DOORHELP4 (cr1#1005 part 3, owner ruling 2026-11-12, option a): a
+    # surface's composer and `post` in ONE child process, so `post` vouches
+    # against the register the composer filled. A writer because a refused
+    # post lands its `surface_failed` receipt.
+    "surface_composers:compose_and_post",
+    "correction_turn:handle_correction_turn",  # DOORHELP1 - a correction in passing recorded
+    # DECDOOR1 (cr1#315): the decision-log view's regeneration. It rewrites
+    # the decision log view, so it is a writer and refused on every merged
+    # seat without this door.
+    "render_decision_log:regenerate",  # DECDOOR1 - the decision log view rewritten
+    "past_rulings:pull_past_rulings",  # cr1#1015 - the one-time pull: past rulings proposed on the Review tab
+    "past_rulings:confirm_past_ruling",  # cr1#1015 - the yes to one: the decision and its replacement links
+    "rules_store:state_rule",  # cr1#1016 - a rule the owner stated, confirmed once with its scope
+    "rules_store:retire_rule",  # cr1#1016 - a stated rule taken back
+    "rules_store:record_correction",  # cr1#1016 - a correction recorded against what it corrects
+    "rules_store:rebuild",  # cr1#1016 - the rules folder, rewritten whole from the sources
+    "claude_md_diet:apply_diet",  # cr1#1016 - the brief cut to about 1,500 words, history moved out
+    # OBJDOOR1 (cr1#317): the objective lifecycle writers the objectives
+    # skill and the apply-choices `cr-objectives` entry name. Each writes
+    # the objective thread and its `objective_*` row through the single
+    # objective writer, so each is refused on every merged seat without
+    # this door.
+    "objective_state:create_objective",  # OBJDOOR1 - new objective
+    "objective_state:record_report",  # OBJDOOR1 - the owner's status word
+    "objective_state:complete_objective",  # OBJDOOR1 - the completion path
+    "objective_state:archive_objective",  # OBJDOOR1 - the archive path
+    "objective_state:rebind_objective",  # OBJDOOR1 - a re-chosen tracking path
+    # MNSTEPS1 (cr1#550): meeting-notes' WRITES, refused on every merged
+    # seat until now, so the step was skipped and the reply still said the
+    # result was complete. Step 5e-bis's pass appends review proposals (and
+    # closes, when closing on evidence is on); the tracker regeneration
+    # rewrites its view; the entity-signal scan and the structured facts
+    # append proposals and fact rows; the deal proposer appends proposals;
+    # the card's questions land their page and spend the question budget.
+    "commitment_policy_pass:apply_meeting_closes",  # MNSTEPS1 - Step 5e-bis, the transcript in args_file
+    "render_master_tracker:regenerate",  # MNSTEPS1 - Step 5, the tracker view rewritten
+    "entity_signal_detector:run_entity_signal_scan",  # MNSTEPS1 - Step 5g, proposals
+    "entity_signal_detector:apply_structured_facts",  # MNSTEPS1 - Step 5g, structured facts
+    "deal_signal_detector:propose_candidates",  # MNSTEPS1 - Step 5h, proposals
+    "attribution_doors:render_card_questions",  # MNSTEPS1 - Step 9c-bis, the card's questions
+    # DRAFTREC1 (cr1#586): a Draft click's book record - the email_drafted
+    # row, the snapshot keyed to it, an edited body's corrections - which a
+    # merged seat had no door for, so a click once wrote nothing at all.
+    "voice_corrections:record_draft_click",  # DRAFTREC1 - apply-choices Step 4B, the body in args_file
+    "meeting_substance:record_meeting_substance",  # cr1#1014 - see the writer table row
+    # cr1#615: the record of a run. Every skill that logs its own receipt, and
+    # the detectors' shared signal, were refused on every merged seat, so the
+    # run left no record and the reply still read as if it had.
+    "receipts:log_receipt",  # cr1#615 - a skill's run or scan receipt
+    "dormancy:emit_dormancy_signal",  # cr1#615 - one dormancy_signal row, or nothing to record
+    "doc_shelf:rebuild_shelf",  # cr1#1014 - see the writer table row
+    # SWEEPDOOR1 (cr1#938): the backlog sweep's writes, refused on every
+    # merged seat, so `clean up my commitments` could not run there at all.
+    "commitment_backlog_sweep:scan_staged",  # cr1#938 - the scan over mail staged beside the data
+    "commitment_backlog_sweep:apply_accept_handled",  # cr1#938 - accept all, from the kept receipt
+    "commitment_backlog_sweep:apply_decisions",  # cr1#938 - the owner's choices from the digest
+    "commitment_backlog_sweep:apply_amnesty",  # cr1#938 - the quiet pile, on a yes
+    "commitment_backlog_sweep:apply_review_expiry",  # cr1#938 - the unconfirmed pile, on a yes
+    "commitment_backlog_sweep:apply_ingest_kill",  # cr1#938 - one source's guesses, on a yes
+    "commitment_backlog_sweep:render_digest",  # cr1#938 - the digest and its audit page
+    # cr1#928: the three skill-class maintenance jobs on a merged seat, each
+    # landing its own receipt beside the data.
+    "skill_jobs_door:cleanup_and_receipt",  # cr1#928 - see the writer table row
+    "skill_jobs_door:insights_and_receipt",  # cr1#928 - see the writer table row
+    "skill_jobs_door:monthly_report_and_receipt",  # cr1#928 - see the writer table row
+    "schedule_handoff:log_schedule_changes_applied",  # cr1#970 - see the writer table row
+    "craft_capture:write_craft",  # cr1#398 - see the writer table row
+    "craft_contract:add_scope",  # cr1#398 - see the writer table row
+    "craft_capture:move_renamed_scope_files",  # cr1#1391 - see the writer table row
+    "deliverables:land",
+})
+
+# The key the layer stamps on every helper child process (MF-M2-13). Spelled
+# here and read as a literal in `events_io`, which must not import this module.
+HELPER_DOOR_ENV = "CR_HELPER_DOOR"
+
+#: The ONLY variables `plan` will ever put in front of the command, in this
+#: order. A fixed forward set, never "whatever starts with CR_": the rendered
+#: string is pasted into a shell on the customer's machine, so what crosses is
+#: a reviewed list or it is nothing.
+FORWARD_ENV_KEYS = ("CR_WRITER_ID", "CR_WRITER_DERIVATION",
+                    "CR_FIRED_VIA", "CR_DEVICE_WORKSPACE", "CR_TRIGGERED_BY",
+                    "CR_COMPUTER_MARK", "CR_ACCOUNT_MARK")
+
+#: cr1#1138: the ACCOUNT a write comes from, with no folder name and no
+#: organisation in it (`schedule_holder.derive_account_mark`), so the holder of
+#: a folder's schedules survives a renamed folder and an organisation switch.
+#: Derived HERE from the account uuid, like the writer pair; only the mark
+#: crosses, never the uuid. A seat that keeps today's identities forwards none.
+
+#: cr1#922 / cr1#1061 (owner ruling 1a, 2026-11-11): the computer a write
+#: comes from. The model exports `get_device_info`'s device name as
+#: `CR_DEVICE_NAME`; `plan` derives the mark HERE (`computer_mark.derive`) and
+#: only the mark crosses, as `CR_COMPUTER_MARK`. The raw name is never on a
+#: rendered line. Remembered in this session's own scratch like the basename
+#: (PLANID1), because the container's shell keeps no export between commands.
+COMPUTER_MARK_CACHE_NAME = "cr-computer-mark"
+
+#: Where the customer opens the workspace on their own computer. Read here and
+#: carried on the resolver's context; `deliverables` is what spells a path with
+#: it. Named once, so the layer and the deliverables door cannot disagree.
+DEVICE_WORKSPACE_ENV = "CR_DEVICE_WORKSPACE"
+
+#: Where `plan` rendered the line (IDENT1 I-11, Probe B defect 1). The merged
+#: seat's real fire shape ran `plan` from the STAGED runtime through the device
+#: shell, where no account lives, so every line it rendered crossed with no
+#: writer identity. The rendered line now says where it was rendered, as the
+#: first thing on it: `container` (a plugin root, with an identity to forward)
+#: or `device` (the staged runtime). The door reads it back and names the
+#: cause when a device-rendered write has no identity.
+PLAN_ORIGIN_ENV = "CR_PLAN_ORIGIN"
+PLAN_ORIGIN_CONTAINER = "container"
+PLAN_ORIGIN_DEVICE = "device"
+RENDER_IN_CONTAINER_HINT = "render plan in the container"
+
+#: PLANID1 (cr1#518). The container's shell does not keep an `export` from one
+#: command to the next, so a `CR_DEVICE_WORKSPACE` exported for the first
+#: `plan` is gone by the second, and every later write line went out with no
+#: identity in front of it - refused at the door, 2 of 3 runs. The basename
+#: the pair is derived from is remembered in THIS SESSION'S OWN scratch
+#: (`delete_grant.session_scratch_file`: the session id or the container's
+#: temp directory, since the merged container has no `CLAUDE_CODE_TMPDIR`),
+#: never in the workspace. It is the folder's name, not the account: the uuid
+#: still never leaves this process.
+BASENAME_CACHE_NAME = "cr-workspace-basename"
+#: The verbs the door refuses without a named writer (`run_writer`, `write`,
+#: `append_jsonl`). A `plan` for one of these on a seat that should name its
+#: writer and cannot is refused HERE, so the model fixes the export and plans
+#: again instead of pasting a line the door will refuse. `remove` is not one:
+#: the door lets it through without a writer, so `plan` does too.
+PLAN_WRITE_VERBS = ("run_writer", "write", "append_jsonl")
+PLAN_IDENTITY_HINT = (
+    "export CR_DEVICE_WORKSPACE to the connectedFolders entry whose last "
+    "segment is the workspace basename, in the same command as plan, then "
+    "plan again")
+
+# How a helper child hands back a record it held rather than wrote.
+SIDECAR_MARKER = "\x00CR_SIDECARS\x00"
+
+# Modules no allow-list entry may ever name, asserted in the suite so a future
+# addition cannot quietly re-open B-2.
+RUN_HELPER_FORBIDDEN_MODULES = ("atomic_write", "os", "shutil", "pathlib",
+                                "subprocess", "shlex", "tempfile")
+
+# A helper argument is treated as a PATH (and therefore fenced like any other
+# target) when it is absolute, carries a separator, or ends in one of these.
+PATH_LIKE_SUFFIXES = (".json", ".jsonl", ".md", ".txt", ".html", ".csv",
+                      ".py", ".yaml", ".yml", ".lock", ".rev", ".seqhw",
+                      ".log", ".zip", ".ics", ".docx", ".xlsx", ".pptx")
+
+# Refusal reasons — spelled once so prose, tests and BOOT3 read the same word.
+R_NO_WORKSPACE = "no_workspace_on_this_host"
+R_NOT_ATTACHED = "folder_not_attached"
+R_REFUSED_PATH = "refused_path"
+R_REFUSED_RUNTIME = "refused_runtime_cache"
+R_REFUSED_LOCK = "refused_lock_file"
+R_REFUSED_APPEND_ONLY = "refused_append_only"
+R_REFUSED_PROTECTED = "refused_protected"
+R_NOT_REGISTERED = "not_registered_jsonl"
+R_NOT_IN_MANIFEST = "not_in_manifest"
+R_NOT_ALLOWED_HELPER = "not_allowed_helper"
+R_NOT_ALLOWED_WRITER = "not_allowed_writer"
+R_WRITER_IDENTITY_REQUIRED = "writer_identity_required"
+R_STALE_READ = "stale_read"
+R_TIMEOUT = "timeout"
+R_MISSING_PARENT = "missing_parent"
+R_NOT_FOUND = "not_found"
+R_INVALID_JSON = "invalid_json"
+R_BINARY_UNSUPPORTED = "binary_unsupported"
+R_HELPER_FAILED = "helper_failed"
+R_BAD_ARGS = "bad_args"
+R_WRITE_UNVERIFIED = "write_unverified"
+R_WRITER_OWNED = "writer_owned"
+#: cr1#385: the ledger on disk is older than the copy last written (FS-04); the
+#: append was set aside and the envelope carries `atomic_write`'s plain line.
+R_SUBSTRATE_REGRESSED = "substrate_regressed"
+#: cr1#1058: a run door's argument carried a `computer:` link. The link is
+#: built beside the data, never handed across a command line (the Friday
+#: Wrap's closing lines rest on this). Its own reason, because the text is not
+#: a path outside the folder and `refused_path`'s "Not saved" line would be
+#: wrong about it.
+R_REFUSED_COMPUTER_LINK = "refused_computer_link"
+#: cr1#1376: an activity-log append (`events.jsonl` or a year shard) named a
+#: folder other than the data folder, the workspace root's top above all. The
+#: Hub and Maintenance read a root-level log instead of the real one, so the
+#: door never lands one. `atomic_write.LedgerAtWorkspaceRoot` refuses with the
+#: same word at the one append path below the door.
+R_LEDGER_OUTSIDE_DATA = "ledger_outside_data"
+
+#: WSPLACE1 (cr1#546): the placeholder skill text carries for the anchored
+#: workspace. The run doors put the anchored workspace in for it before
+#: anything runs; the path fence refuses it anywhere it is left. It is never a
+#: folder name: the writer child's working directory is the workspace, so a
+#: literal `<WS>` used to become a stray folder inside the book, and the
+#: envelope said `ok: true` while the real settings did not change.
+WS_PLACEHOLDER = "<WS>"
+#: The one argument that names the workspace itself. On both run doors it must
+#: be the anchored workspace (or the placeholder for it); any other folder is
+#: refused before anything runs.
+WORKSPACE_ROOT_ARG = "workspace_root"
+
+#: WSPLACE1 (cr1#546): the one plain-English sentence a path refusal carries
+#: in `line`, by what the refused call would have done. It names no file,
+#: path or mechanism (preamble rule 6), and the chat says it as the answer.
+NOT_SAVED_LINE = ("Not saved: that change pointed at a folder that is not "
+                  "your Command Room folder, so nothing was written and "
+                  "nothing changed.")
+NOT_READ_LINE = ("Not read: that request pointed at a folder that is not "
+                 "your Command Room folder, so nothing was read.")
+NOT_REMOVED_LINE = ("Not removed: that request pointed at a folder that is "
+                    "not your Command Room folder, so nothing was removed.")
+#: cr1#615: the two writers that record a run after its work is done. A refusal
+#: of one used to answer a reason code and nothing the chat could say, so a
+#: receipt that never saved read as saved. ONLY these two: every other writer's
+#: refusal keeps its shape, because the Morning Brief and End of Day stop rules
+#: read those and many of those steps save nothing.
+RECEIPT_WRITER = "receipts:log_receipt"
+RECORD_WRITERS = frozenset({RECEIPT_WRITER, "dormancy:emit_dormancy_signal"})
+#: Said BESIDE the answer, which stands. "Could not be confirmed" because a
+#: timeout does not prove nothing landed.
+RECORD_REFUSED_LINE = ("Not saved: this run's record could not be confirmed in "
+                       "your Command Room folder, so do not count it as "
+                       "recorded.")
+#: cr1#615: a receipt that is not a skill's own. A job's receipt is what says
+#: the job ran, so a chat writing one would move that job's due-ness.
+JOB_RECEIPT_REFUSED_LINE = ("Not saved: only the job itself can record that "
+                            "run, so nothing was written.")
+
+#: Files ONE named writer owns (cr1#454). `write` refuses them and names the
+#: writer, so the only way in is that writer, which passes its own name as
+#: `owned_by` (the CLI never does). `LAST_TRIAGE.txt` is here because its
+#: time decides where the next triage's window starts, and its writer reads
+#: that time off the clock and takes none: a hand `write` was the one way a
+#: time the chat chose could still land.
+WRITER_OWNED_FILES = {
+    "_hq/inbox/LAST_TRIAGE.txt": "inbox_helpers:stamp_last_triage",
+}
+
+
+class StaleRead(RuntimeError):
+    """The compare-and-swap lost: the file moved under the caller's read.
+
+    Raised INSIDE the sentinel lock by the `write` verb's precheck so the
+    compare and the write are one critical section on one host.
+    """
+
+
+# ---------------------------------------------------------------------------
+# The discover block — the ONE thing that runs in the VM before the runtime is
+# installed. Stdlib only, no plugin imports, byte-identical everywhere it is
+# pasted (guard G68 pins that). Keep it at or under 40 lines.
+#
+# It writes NOTHING in the book (cr1#452, owner ruling 2026-10-27: the probe
+# leaves zero files). A delete test has to create the file it deletes, and on a
+# seat that cannot delete (the desktop bridge default) that file stays, so
+# `replace_over_existing` and `unlink` are left None (not measured). `flock` is
+# measured on the anchor file the block already found, opened read-only with a
+# shared non-blocking lock; a lock someone else holds still proves flock works.
+# ---------------------------------------------------------------------------
+
+DISCOVER_BLOCK = r"""python3 - <<'CR_DISCOVER'
+import json, os, sys
+from pathlib import Path
+P = {"_archive", "_demo-framework"}
+def find(base, md=5):
+    base = Path(base); hits = []
+    for dp, dn, fn in os.walk(str(base)):
+        d = Path(dp); k = len(d.parts) - len(base.parts)
+        dn[:] = [] if k >= md else [x for x in dn if x not in P]
+        if (d / "_hq" / "data" / "entities.json").is_file(): hits.append((len(d.parts), dp)); dn[:] = []
+    return Path(sorted(hits)[0][1]) if hits else None
+ws = find(os.environ.get("CR_WORKSPACE") or (Path.home() / "mnt"))
+o = {"ws": None, "basename": None, "runtime_present": False, "runtime_version": None, "manifest_sha": None, "staged_root": None, "brain_file": None, "device_path": os.environ.get("CR_DEVICE_WORKSPACE") or None, "python": "%d.%d.%d" % sys.version_info[:3], "probes": {"replace_over_existing": None, "unlink": None, "flock": None}, "holder": None}
+if ws is not None:
+    o["ws"] = str(ws); o["basename"] = ws.name
+    try: h = json.loads((ws / "_hq" / ".system" / "schedule_holder.json").read_text(encoding="utf-8")); o["holder"] = h if isinstance(h, dict) else None
+    except Exception: pass
+    o["brain_file"] = str(ws / "CLAUDE.md") if (ws / "CLAUDE.md").is_file() else None
+    rt = ws / "_hq" / ".cache" / "cr-runtime"
+    try:
+        c = json.loads((rt / "current.json").read_text(encoding="utf-8")); d = str(c.get("dir") or c.get("version") or "")
+        if c.get("version") and d and (rt / d).is_dir(): o["runtime_present"] = True; o["runtime_version"] = c["version"]; o["manifest_sha"] = c.get("manifest_sha"); o["staged_root"] = str(rt / d)
+    except Exception: pass
+    try:
+        import fcntl
+        with open(ws / "_hq" / "data" / "entities.json", "rb") as f: fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB); fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        o["probes"]["flock"] = True
+    except BlockingIOError: o["probes"]["flock"] = True
+    except Exception: o["probes"]["flock"] = False
+print(json.dumps(o))
+CR_DISCOVER"""
+
+# The keys `discover` answers with, in both faces. BOOT3's bootloader v3 reads
+# exactly these names — a rename here is a break there.
+#
+# WIDENED by cr1#1138 part 2: `holder`, the content of
+# `_hq/.system/schedule_holder.json` (or None) - who holds this folder's
+# scheduled work, read here because discovery is the one block that runs
+# before the runtime is installed, and a computer that does not hold the
+# schedules must stop BEFORE the runtime check can restage into the folder.
+DISCOVER_KEYS = ("ws", "basename", "runtime_present", "runtime_version",
+                 "manifest_sha", "staged_root", "brain_file", "device_path",
+                 "python", "probes", "holder")
+PROBE_KEYS = ("replace_over_existing", "unlink", "flock")
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _scripts_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _ensure_scripts_on_path() -> None:
+    d = str(_scripts_dir())
+    if d not in sys.path:
+        sys.path.insert(0, d)
+
+
+def plugin_root() -> Path:
+    """The plugin checkout this file belongs to (`command-room/`)."""
+    return _scripts_dir().parent.parent
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_root(d: Path) -> bool:
+    return (d / "_hq" / "data" / "entities.json").is_file()
+
+
+def find_root_up(start: Optional[Path] = None) -> Optional[Path]:
+    """The nearest ancestor of `start` that carries the substrate anchor."""
+    here = Path(start).resolve() if start is not None else Path.cwd().resolve()
+    candidate = here if here.is_dir() else here.parent
+    for d in (candidate, *candidate.parents):
+        if _is_root(d):
+            return d if _walk_may_bind(d) else None  # cr1#1240
+    return None
+
+
+def find_root_down(base: Path, max_depth: int = MAX_SEARCH_DEPTH) -> Optional[Path]:
+    """The SHALLOWEST anchored root at or under `base`, with `_archive/` and
+    `_demo-framework/` pruned — the G43 rule, in Python.
+
+    The decoy class this exists for is real and was found in a customer
+    workspace: cleanup's own archive mirrors `_hq/...` paths, and the demo
+    framework ships a whole fake substrate. First-in-traversal-order binds one
+    of them; shallowest-after-prune binds the real root.
+    """
+    base = Path(base)
+    hits: List[Tuple[int, str]] = []
+    for dirpath, dirnames, _files in os.walk(str(base)):
+        d = Path(dirpath)
+        depth = len(d.parts) - len(base.parts)
+        if depth >= max_depth:
+            dirnames[:] = []
+        else:
+            dirnames[:] = [x for x in dirnames if x not in PRUNE_DIRS]
+        if _is_root(d):
+            hits.append((len(d.parts), dirpath))
+            dirnames[:] = []
+    if not hits:
+        return None
+    hits.sort()
+    return Path(hits[0][1])
+
+
+def _running_from_runtime_cache() -> Optional[Path]:
+    """The workspace root when THIS file is the installed runtime, else None.
+
+    `<ws>/_hq/.cache/cr-runtime/<version>/shared/scripts/workspace_access.py`
+    → `<ws>`, and only when `<ws>` carries the substrate anchor.
+    """
+    here = _scripts_dir()
+    parts = here.parts
+    for i in range(len(parts) - 3):
+        if parts[i] == "_hq" and parts[i + 1] == ".cache" and parts[i + 2] == "cr-runtime":
+            ws = Path(*parts[:i])
+            if _is_root(ws):
+                return ws
+            return None
+    return None
+
+
+def _env_detect_mode(env: Dict[str, str]) -> Optional[str]:
+    """ENV1's `env_detect.detect()`, or None when the module is not on the tree.
+
+    Behind try/except by design (D-5, shared-module-first): this lane's suite is
+    green before E0 arrives and unchanged after, and a legacy seat whose runtime
+    predates `env_detect.py` never breaks on the import.
+    """
+    try:
+        _ensure_scripts_on_path()
+        import env_detect  # type: ignore
+    except Exception:
+        return None
+    try:
+        result = env_detect.detect(env=env)  # type: ignore[call-arg]
+    except TypeError:
+        try:
+            result = env_detect.detect()  # type: ignore[misc]
+        except Exception:
+            return None
+    except Exception:
+        return None
+    # ENV1 answers with an `EnvReport` DATACLASS (`env_detect.EnvReport.mode`).
+    # The dict and str branches below are the fallbacks for an older runtime
+    # whose `env_detect` predates it. Reading only those two shapes is what made
+    # this adapter return None for every mode the moment E0 landed, collapsing
+    # the whole D-1 mapping into the no-module fallback (review finding B-1).
+    attr_mode = getattr(result, "mode", None)
+    if isinstance(attr_mode, str) and attr_mode:
+        return attr_mode
+    if isinstance(result, dict):
+        result = result.get("mode")
+    if isinstance(result, str) and result:
+        return result
+    return None
+
+
+def detect_host_mode(env: Optional[Dict[str, str]] = None,
+                     start: Optional[Path] = None) -> str:
+    """Where the data is, relative to this process (D-1).
+
+    With `env_detect` present the mapping is a lookup, except for
+    `merged_cloud`, which asks a fact: is this file the installed runtime inside
+    an anchored workspace? Yes → `vm`; no → `container`.
+
+    `unknown` is the container posture (D-1, §0.34: writers and fires refuse) —
+    but only after the one FACT that outranks a non-reading has been asked. The
+    VM runs this file out of the installed runtime inside the anchored
+    workspace and sees none of `env_detect`'s signals, so it reads `unknown`;
+    answering `container` there would refuse the verbs on the one host that CAN
+    serve them.
+
+    Without `env_detect` the fallback is deliberately conservative.
+    """
+    env = dict(os.environ) if env is None else env
+    detected = _env_detect_mode(env)
+    staged_ws = _running_from_runtime_cache()
+    if detected == "merged_cloud":
+        return VM if staged_ws is not None else CONTAINER
+    if detected in ("legacy_cowork", "claude_code_local"):
+        return MODE_FROM_ENV[detected]
+    if staged_ws is not None:
+        return VM
+    if detected == "unknown":
+        return MODE_FROM_ENV["unknown"]
+    # Fallback: no env_detect on this tree.
+    if str(env.get("CLAUDE_CODE_REMOTE", "")).strip().lower() == "true":
+        return CONTAINER
+    ws_env = str(env.get("CR_WORKSPACE", "")).strip()
+    if ws_env and _is_root(Path(ws_env)):
+        return LOCAL
+    return LOCAL if find_root_up(start) is not None else CONTAINER
+
+
+def _device_workspace(env: Dict[str, str]) -> Optional[str]:
+    """The workspace folder's path on the CUSTOMER'S OWN COMPUTER, or None.
+
+    The third source `deliverables.device_workspace_root` was written for -
+    "for the day the resolver learns to carry it" - closed. The value comes
+    from `CR_DEVICE_WORKSPACE`, which the Access preamble exports from
+    `get_device_info`'s `connectedFolders` on a merged seat and which the
+    bootloader already holds as its substituted workspace path; `plan`
+    forwards it across the door. Without it a landed document can only be
+    described in words, which is right but poorer, and the walk's prep
+    invented a breadcrumb instead.
+    """
+    value = str(env.get(DEVICE_WORKSPACE_ENV, "") or "").strip()
+    return value or None
+
+
+def _env_mode_name(env: Dict[str, str]) -> Optional[str]:
+    """The `env_detect` mode name to export as `CR_ENV` (None when absent)."""
+    return _env_detect_mode(env)
+
+
+# ---------------------------------------------------------------------------
+# Resolver
+# ---------------------------------------------------------------------------
+
+def resolve(start: Optional[Path] = None,
+            env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """`{basename, vm_path, staged_root, brain_file, mode, data_dir,
+    runtime_version, manifest_sha, tz, python}` — gap analysis §4.2.1.
+
+    In `container` mode every path field is None: there is no workspace on this
+    host and the layer never guesses one.
+    """
+    env = dict(os.environ) if env is None else env
+    mode = detect_host_mode(env, start)
+    out: Dict[str, Any] = {
+        "mode": mode,
+        "basename": None,
+        "vm_path": None,
+        "staged_root": None,
+        "brain_file": None,
+        "data_dir": None,
+        "runtime_version": None,
+        "manifest_sha": None,
+        "tz": None,
+        "device_path": _device_workspace(env),
+        "python": "%d.%d.%d" % sys.version_info[:3],
+    }
+    if mode == CONTAINER:
+        return out
+
+    ws = _running_from_runtime_cache()
+    if ws is None:
+        ws_env = str(env.get("CR_WORKSPACE", "")).strip()
+        if ws_env:
+            candidate = Path(ws_env).expanduser()
+            if _is_root(candidate):
+                ws = candidate.resolve()
+            elif candidate.is_dir():
+                ws = find_root_down(candidate)
+    if ws is None:
+        ws = find_root_up(start)
+    if ws is None and start is not None and Path(start).is_dir():
+        ws = find_root_down(Path(start))
+    if ws is None:
+        return out
+
+    ws = Path(ws).resolve()
+    out["vm_path"] = str(ws)
+    out["basename"] = ws.name
+    brain = ws / "CLAUDE.md"
+    out["brain_file"] = str(brain) if brain.is_file() else None
+    out["data_dir"] = str(_data_dir(ws))
+    out["tz"] = _workspace_tz(ws)
+    version, manifest_sha, staged = _installed_runtime(ws)
+    out["runtime_version"] = version
+    out["manifest_sha"] = manifest_sha
+    out["staged_root"] = str(staged) if staged is not None else None
+    return out
+
+
+def _data_dir(ws: Path) -> Path:
+    """`<ws>/_hq/data` through `data_root.resolve` — with NO override.
+
+    The layer never sets `CR_DATA_ROOT` (`data_root.py:40`); relocating the
+    substrate is a separate, M-gated migration.
+    """
+    try:
+        _ensure_scripts_on_path()
+        import data_root  # type: ignore
+        return Path(data_root.resolve(ws))
+    except Exception:
+        return ws / "_hq" / "data"
+
+
+def _workspace_tz(ws: Path) -> Optional[str]:
+    """`workspace.user_timezone` as a STRING, or None.
+
+    `tz.load_workspace_tz` returns a tzinfo and RAISES when the zone is unset,
+    and a resolver must never raise over a missing preference — so the zone NAME
+    is read here, with the same two-block merge `tz.py:154-161` does (the inner
+    `entities.workspace` block, then the top-level one, top level winning). Same
+    rule, one place it can drift: the pin compares this against `tz.py`'s own
+    answer on the fixture.
+    """
+    try:
+        raw = json.loads((ws / "_hq" / "data" / "entities.json").read_text(encoding="utf-8"))
+        inner = raw.get("entities") if isinstance(raw.get("entities"), dict) else None
+        inner_ws = (inner or {}).get("workspace")
+        top_ws = raw.get("workspace")
+        merged = {
+            **(inner_ws if isinstance(inner_ws, dict) else {}),
+            **(top_ws if isinstance(top_ws, dict) else {}),
+        }
+        value = merged.get("user_timezone")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except Exception:
+        pass
+    return None
+
+
+def runtime_cache_dir(ws: Path) -> Path:
+    return Path(ws) / "_hq" / ".cache" / "cr-runtime"
+
+
+def _installed_runtime(ws: Path) -> Tuple[Optional[str], Optional[str], Optional[Path]]:
+    """`(version, manifest_sha, staged_root)` from the `current.json` pointer.
+
+    A pointer FILE, never a symlink: Drive and FUSE do not carry symlinks
+    reliably, and a dangling one would silently resolve to nothing.
+    """
+    cache = runtime_cache_dir(ws)
+    try:
+        payload = json.loads((cache / CURRENT_POINTER).read_text(encoding="utf-8"))
+    except Exception:
+        return None, None, None
+    if not isinstance(payload, dict):
+        return None, None, None  # REVIEW_T2B_BRIDGE3 N-7: a damaged pointer is no runtime
+    version = payload.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None, None, None
+    # IDENT1 I-7: the pointer names the DIRECTORY when an install could not
+    # reuse the bare version directory (`<version>-<sha8>`); the version it
+    # reports stays the plugin's version. Never the bare dir by assumption.
+    folder = payload.get("dir")
+    folder = folder if isinstance(folder, str) and folder.strip() else version
+    staged = cache / folder
+    if not staged.is_dir():
+        return None, None, None
+    sha = payload.get("manifest_sha")
+    return version, sha if isinstance(sha, str) else None, staged
+
+
+# ---------------------------------------------------------------------------
+# Envelopes and the path fence
+# ---------------------------------------------------------------------------
+
+def _folder_attached(ctx: Dict[str, Any]) -> bool:
+    vm_path = ctx.get("vm_path")
+    return bool(vm_path) and Path(vm_path).is_dir()
+
+
+def _envelope(verb: str, ctx: Dict[str, Any], started: float,
+              **fields: Any) -> Dict[str, Any]:
+    env: Dict[str, Any] = {
+        "ok": bool(fields.pop("ok", False)),
+        "verb": verb,
+        "ws": ctx.get("vm_path"),
+        "mode": ctx.get("mode"),
+        "runtime_version": ctx.get("runtime_version"),
+        "host_python": ctx.get("python"),
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "folder_attached": _folder_attached(ctx),
+    }
+    env.update(fields)
+    return env
+
+
+def _refuse(verb: str, ctx: Dict[str, Any], started: float, reason: str,
+            **fields: Any) -> Dict[str, Any]:
+    # cr1#615: a refused record writer carries the sentence the chat says. One
+    # with its own sentence keeps it; one with a `next` is a dropped folder or
+    # a missing workspace, which is re-requested and retried, not reported.
+    if (verb == "run_writer" and fields.get("name") in RECORD_WRITERS
+            and not fields.get("line") and "next" not in fields):
+        fields["line"] = RECORD_REFUSED_LINE
+    return _envelope(verb, ctx, started, ok=False, reason=reason, **fields)
+
+
+def _preflight(verb: str, ctx: Dict[str, Any], started: float) -> Optional[Dict[str, Any]]:
+    """The two refusals every data verb shares, in order.
+
+    `container` first (§0.25 — there is no workspace on this host, and the
+    layer never stages), then re-request safety (F22 side finding: the folder
+    grant can drop mid-session on a bridge reconnect, so one verb per call means
+    the model re-requests and retries the SAME command string).
+    """
+    if ctx.get("mode") == CONTAINER or not ctx.get("vm_path"):
+        return _refuse(verb, ctx, started, R_NO_WORKSPACE, next="device_bash")
+    if not _folder_attached(ctx):
+        return _refuse(verb, ctx, started, R_NOT_ATTACHED,
+                       next="device_request_folder_access")
+    return None
+
+
+def fence_path(vm_path: Path, rel: str) -> Tuple[Optional[Path], Optional[str]]:
+    """`(absolute path, None)` when `rel` is a legal target, else `(None, reason)`.
+
+    Three fences, in order: inside the workspace (an absolute `rel` or any `..`
+    escape fails `relative_to`), never under the runtime cache (code is not
+    data), never the writer lock (its bytes must not change).
+    """
+    # WSPLACE1 (cr1#546): a placeholder segment is never a folder name.
+    if isinstance(rel, str) and _has_placeholder(rel):
+        return None, R_REFUSED_PATH
+    # LEDGERPLACE1 (cr1#124): a Windows drive or share path on a host where it
+    # is not absolute would be joined onto the book as a folder name.
+    if isinstance(rel, str) and _foreign_windows_path(rel):
+        return None, R_REFUSED_PATH
+    vm_path = Path(vm_path).resolve()
+    try:
+        target = (vm_path / rel).resolve()
+    except (OSError, ValueError):
+        return None, R_REFUSED_PATH
+    try:
+        inside = target.relative_to(vm_path)
+    except ValueError:
+        return None, R_REFUSED_PATH
+    posix = inside.as_posix()
+    if posix == RUNTIME_CACHE_REL or posix.startswith(RUNTIME_CACHE_REL + "/"):
+        return None, R_REFUSED_RUNTIME
+    # cr1#1602 (review round 2 of #1613): compared casefolded, because a
+    # Windows or macOS folder takes `TASK-STEPS.jsonl` as the same file; an
+    # exact compare let a differently cased name write the step log by hand.
+    # Review round 3: and with each part's trailing dots and spaces taken off,
+    # which Windows drops from a name (`task-steps.jsonl.` is the same file).
+    same = "/".join(seg.rstrip(". ") for seg in posix.split("/")).casefold()
+    if same == LOCK_REL.casefold():
+        return None, R_REFUSED_LOCK
+    # cr1#1602 (review of #1613): the door's own step log is a cache only the
+    # door writes; a row written by hand would read as measured.
+    if same == STEPS_LOG_REL.casefold():
+        return None, R_REFUSED_RUNTIME
+    return target, None
+
+
+#: LEDGERPLACE1 (cr1#124): whether this host reads a drive path as absolute.
+#: A module flag so the suite can ask the question a Linux host asks.
+_IS_WINDOWS = os.name == "nt"
+
+#: A drive path (`C:` then a slash or backslash) or a share path (two
+#: backslashes) at the start of the value.
+_WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def _foreign_windows_path(value: str) -> bool:
+    """True when `value` is spelled as a Windows drive or share path on a
+    host that does not read it as absolute. There it would resolve to a
+    folder INSIDE the book named after the drive, and a write or append would
+    create that folder (cr1#124)."""
+    return (not _IS_WINDOWS) and bool(_WINDOWS_PATH_RE.match(value.strip()))
+
+
+def _has_placeholder(value: str) -> bool:
+    """True when one path segment of `value` is the `<WS>` placeholder."""
+    return any(seg.strip() == WS_PLACEHOLDER
+               for seg in re.split(r"[\\/]", value))
+
+
+def path_refusal_line(verb: str) -> str:
+    """WSPLACE1 (cr1#546): the plain-English sentence for a path refusal on
+    `verb` - the one the chat says, so a refused save is never reported as
+    saved."""
+    if verb in ("read", "run_helper"):
+        return NOT_READ_LINE
+    if verb == "remove":
+        return NOT_REMOVED_LINE
+    return NOT_SAVED_LINE
+
+
+def _path_line(verb: str, reason: Optional[str]) -> Dict[str, str]:
+    """`{"line": ...}` for a `refused_path` refusal on `verb`, else nothing:
+    the other fence reasons are not about the folder and keep their shape."""
+    return {"line": path_refusal_line(verb)} if reason == R_REFUSED_PATH else {}
+
+
+def _placeholder_line(verb: str, rel: Any) -> Dict[str, str]:
+    """`{"line": ...}` when a path verb's `rel` was refused for a `<WS>`
+    segment, else nothing: an ordinary outside path keeps main's envelope, so
+    `deliverables` still says its own sentence for it."""
+    if isinstance(rel, str) and _has_placeholder(rel):
+        return {"line": path_refusal_line(verb)}
+    return {}
+
+
+#: The argument names that hold a path, and so may carry `<WS>` for the
+#: anchored workspace: `workspace_root`, `root_or_file`, and any name ending
+#: in one of these. Any other argument's text is content and is never
+#: rewritten (a note that happens to begin `<WS>/` keeps its words).
+PATH_ARG_SUFFIXES = ("_path", "_root", "_dir", "_file")
+PATH_ARG_NAMES = frozenset({WORKSPACE_ROOT_ARG, "root_or_file"})
+
+
+def _is_path_arg(key: Any) -> bool:
+    return isinstance(key, str) and (key in PATH_ARG_NAMES
+                                     or key.lower().endswith(PATH_ARG_SUFFIXES))
+
+
+def _fill_placeholder(value: Any, anchored: str, depth: int = 0,
+                      key: Any = None, left: Optional[List[str]] = None) -> Any:
+    """`value` with the anchored workspace put in for `<WS>` in every
+    PATH-NAMED argument: a value that IS the placeholder, or begins `<WS>/`.
+    A bare `<WS>` under any other name is collected in `left` (the door
+    refuses it); other text is content and is left as it is. A content key's
+    value (bytes in base64) is never walked, as the fence never walks it;
+    past the fence's own depth cap nothing is touched and the fence refuses."""
+    if depth > ARG_DEPTH_CAP:
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not _is_path_arg(key):
+            if text == WS_PLACEHOLDER and left is not None:
+                left.append(value)
+            return value
+        if text == WS_PLACEHOLDER:
+            return anchored
+        for sep in ("/", "\\"):
+            if text.startswith(WS_PLACEHOLDER + sep):
+                return anchored + "/" + text[len(WS_PLACEHOLDER) + 1:]
+        return value
+    if isinstance(value, dict):
+        return {k: (v if isinstance(k, str)
+                    and k.lower().endswith(CONTENT_KEY_SUFFIXES)
+                    else _fill_placeholder(v, anchored, depth + 1, k, left))
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_fill_placeholder(v, anchored, depth + 1, key, left)
+                for v in value]
+    return value
+
+
+def fill_workspace_args(vm_path: Path, args: Dict[str, Any]
+                        ) -> Tuple[Dict[str, Any], Optional[Tuple[str, str]]]:
+    """`(arguments, None)` with the anchored workspace put in for `<WS>`, or
+    `(arguments, (offending value, reason))` when `workspace_root` names a
+    folder that is not the anchored workspace, or a bare `<WS>` sits under an
+    argument that is not a path (WSPLACE1, cr1#546).
+
+    The door fills in the workspace itself instead of trusting the model to
+    have substituted it. `workspace_root` must then BE the anchored
+    workspace: a folder outside it, a folder inside it that is not its root,
+    or a bare name that would become a new folder inside it, are all refused
+    `refused_path`. A `workspace_root` that is not a string is the writer's
+    own argument error, left to it.
+    """
+    anchored = str(vm_path)
+    left: List[str] = []
+    filled = _fill_placeholder(dict(args or {}), anchored, left=left)
+    if left:
+        return filled, (left[0], R_REFUSED_PATH)
+    root = filled.get(WORKSPACE_ROOT_ARG)
+    if isinstance(root, str):
+        here = Path(anchored).resolve()
+        try:
+            named = (here / root).resolve()
+        except (OSError, ValueError):
+            named = None
+        if named != here:
+            return filled, (root, R_REFUSED_PATH)
+    return filled, None
+
+
+# ---------------------------------------------------------------------------
+# Host-face verbs
+# ---------------------------------------------------------------------------
+
+def read(rel: str, *, binary: bool = False, ctx: Optional[Dict[str, Any]] = None,
+         env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """`{ok, rel, text|b64, size, mtime_ns, sha256}` for one workspace file.
+
+    A text read of the rules file at the book's root (BRAIN) also carries
+    `rules_mark`, `rules_check` and `rules_missing_line` (RULESLINE1,
+    cr1#517; `rules_check_fields`)."""
+    started = time.time()
+    ctx = resolve(env=env) if ctx is None else ctx
+    refusal = _preflight("read", ctx, started)
+    if refusal is not None:
+        return refusal
+    target, reason = fence_path(Path(ctx["vm_path"]), rel)
+    if reason is not None:
+        return _refuse("read", ctx, started, reason, rel=rel,
+                       **_placeholder_line("read", rel))
+    try:
+        raw = target.read_bytes()
+        stat = target.stat()
+    except FileNotFoundError:
+        return _refuse("read", ctx, started, R_NOT_FOUND, rel=rel)
+    except OSError as exc:
+        return _refuse("read", ctx, started, "read_failed", rel=rel, detail=str(exc))
+    out: Dict[str, Any] = {
+        "rel": rel,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    if binary:
+        out["b64"] = base64.b64encode(raw).decode("ascii")
+    else:
+        try:
+            out["text"] = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            out["b64"] = base64.b64encode(raw).decode("ascii")
+    if "text" in out and _is_brain_target(Path(ctx["vm_path"]), target):
+        out.update(rules_check_fields(out["text"], env))
+    return _envelope("read", ctx, started, ok=True, **out)
+
+
+# ---------------------------------------------------------------------------
+# RULESLINE1 (cr1#517) - is the book's always-loaded rules file in this chat?
+#
+# On a merged seat the rules file can drop out of a chat partway through (the
+# one seen trigger is a repo attached mid-chat), and every routing rule the
+# owner wrote goes with it, silently. Only the model can see its own context,
+# so the comparison is the model's; the door supplies what it compares. Every
+# skill already reads BRAIN first (preamble rule 2), so the read of the rules
+# file is the one shared place: its envelope carries a short, stable line from
+# the file, the instruction, and the one sentence to say. Detection, not
+# prevention (owner ruling on cr1#517, 2026-10-29).
+# ---------------------------------------------------------------------------
+
+#: The one sentence the chat says when the rules are missing. No file name,
+#: path or mechanism in it (preamble rule 6).
+RULES_MISSING_LINE = ("Your workspace rules are not loaded in this chat, so I "
+                      "am working without them; start a new chat to load them.")
+
+#: What the model does with `rules_mark`. Read by the model, never said.
+RULES_CHECK = (
+    "Look for the rules_mark line in the workspace rules this chat loaded when "
+    "it started, not in this reply or in any file read since. If it is not "
+    "there, or the chat was told that the rules file at the root of this "
+    "workspace folder is no longer present, say rules_missing_line once in "
+    "this chat, as its own sentence, then carry on with the task. A notice "
+    "about any other rules file, such as one inside an attached repo, does "
+    "not count. If the line is there, say nothing about it. Never quote "
+    "rules_mark."
+)
+
+#: The longest mark, in characters; a longer line is cut on a word.
+RULES_MARK_MAX = 100
+
+#: The shortest body line that may be the mark, in words and characters.
+RULES_MARK_MIN_WORDS = 3
+RULES_MARK_MIN_CHARS = 20
+
+# A line naming a path, a file or an address, or carrying a digit or a
+# currency sign (a phone number, an amount, a date), is never the mark. The
+# same reply already carries the whole file in `text`, so the mark adds no new
+# exposure; the filter keeps the one line the chat is told to look for free of
+# locations and figures.
+_RULES_MARK_SKIP_RE = re.compile(
+    r"[\\/@\d$\u00a2\u00a3\u00a5\u20ac\u20b9\u20a9\u20bd\u20ba]"
+    r"|\b[\w.-]+\.(?:md|json|jsonl|py|txt|html?|docx|xlsx|pptx|pdf|csv"
+    r"|ya?ml|sh)\b", re.I)
+_RULES_MARK_LEAD_RE = re.compile(r"^(?:>+\s*)*(?:[-*+]|\d+[.)])?\s*")
+_RULES_MARK_FENCES = ("```", "~~~")
+
+
+def _is_brain_target(ws: Path, target: Path) -> bool:
+    """True when `target` is exactly the file `discover` answers as BRAIN:
+    `CLAUDE.md` at the book's root. A project folder's file of the same name,
+    or another spelling of the name, is not it."""
+    try:
+        return target.name == "CLAUDE.md" and target.parent == Path(ws).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _rules_mark_text(line: str) -> str:
+    """`line` with its lead marks (a quote, a list mark) and its bold, code
+    and strike marks taken off, spaces collapsed."""
+    line = _RULES_MARK_LEAD_RE.sub("", line, count=1)
+    for mark in ("**", "__", "~~", "`"):
+        line = line.replace(mark, "")
+    return " ".join(line.split())
+
+
+def _rules_mark_cut(line: str) -> str:
+    if len(line) <= RULES_MARK_MAX:
+        return line
+    cut = line[:RULES_MARK_MAX + 1].rsplit(" ", 1)[0]
+    return cut if cut else line[:RULES_MARK_MAX]
+
+
+def rules_mark(text: Any) -> Optional[str]:
+    """One short, stable line from the rules file, or None when it has none.
+
+    The first plain body line, in file order: not a heading, not a table row,
+    outside generated `LIVE-STATE` blocks, HTML comments and code fences
+    (backtick or tilde), with its quote or list mark and its bold, code and
+    strike marks taken off, at least `RULES_MARK_MIN_WORDS` words and
+    `RULES_MARK_MIN_CHARS` characters long, and naming no path, file or
+    address and carrying no digit or currency sign. Only when no body line
+    qualifies, the first heading that passes the same filter. Cut to
+    `RULES_MARK_MAX` characters on a word. A leading byte order mark is
+    dropped first. Hand-written lines come first in a book's rules file, so
+    the mark does not move when a generated register is rewritten.
+    """
+    if not isinstance(text, str):
+        return None
+    text = text.lstrip("\ufeff")
+    heading: Optional[str] = None
+    in_fence = in_comment = in_live = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if in_live:
+            if line.startswith("<!-- /LIVE-STATE"):
+                in_live = False
+            continue
+        if line.startswith(_RULES_MARK_FENCES):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if in_comment:
+            if "-->" in line:
+                in_comment = False
+            continue
+        if line.startswith("<!-- LIVE-STATE"):
+            in_live = True
+            continue
+        if line.startswith("<!--"):
+            in_comment = "-->" not in line
+            continue
+        if not line or line.startswith("|"):
+            continue
+        if line.startswith("#"):
+            if heading is None:
+                text_h = _rules_mark_text(line.lstrip("#"))
+                if (len(text_h.split()) >= RULES_MARK_MIN_WORDS
+                        and not _RULES_MARK_SKIP_RE.search(text_h)):
+                    heading = _rules_mark_cut(text_h)
+            continue
+        body = _rules_mark_text(line)
+        if (len(body.split()) < RULES_MARK_MIN_WORDS
+                or len(body) < RULES_MARK_MIN_CHARS
+                or _RULES_MARK_SKIP_RE.search(body)):
+            continue
+        return _rules_mark_cut(body)
+    return heading
+
+
+def rules_check_fields(text: Any, env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """`{rules_mark, rules_check, rules_missing_line}` for a read of the rules
+    file, or `{}`: on a scheduled fire (there is no chat to start afresh) and
+    when the file has no line to mark."""
+    env = os.environ if env is None else env
+    if str(env.get("CR_FIRED_VIA", "") or "").strip().lower() == "scheduled":
+        return {}
+    mark = rules_mark(text)
+    if not mark:
+        return {}
+    return {"rules_mark": mark, "rules_check": RULES_CHECK,
+            "rules_missing_line": RULES_MISSING_LINE}
+
+
+def manifest_modules(ctx: Dict[str, Any]) -> frozenset:
+    """The module names `run_helper` may import.
+
+    From the installed runtime's `manifest.json` when one is installed — the
+    allow-list is the manifest, so a modified or partial runtime cannot widen
+    it. On a machine with no runtime installed (a developer box, this lane's
+    fixtures, a legacy seat) the same set is derived from the plugin checkout's
+    own `shared/scripts/**/*.py`, which is exactly what the manifest would ship.
+    """
+    staged = ctx.get("staged_root")
+    names = set()
+    if staged:
+        try:
+            payload = json.loads((Path(staged) / MANIFEST_NAME).read_text(encoding="utf-8"))
+            for rel in (payload.get("files") or {}):
+                if rel.startswith("shared/scripts/") and rel.endswith(".py"):
+                    names.add(Path(rel).stem)
+        except Exception:
+            names = set()
+    if not names:
+        for path in _iter_runtime_scripts(plugin_root()):
+            names.add(path.stem)
+    names.discard("__init__")
+    return frozenset(names)
+
+
+def _tz_reaches_the_child(ctx: Dict[str, Any], platform: str) -> bool:
+    """Whether `TZ=<IANA name>` may be handed to the helper child (DOORTZ1,
+    cr1#243). The Windows C runtime does not read IANA names in `TZ`: it
+    falls back to a fixed offset, and a naive local read inside the child
+    (`datetime.now()`, a day boundary, a due phrase) is shifted, so an evening
+    write can be dated tomorrow. A child started by a door process on a
+    Windows host therefore gets NO `TZ`, and reads the host's own clock, which
+    on a desktop seat is the owner's. The merged seat's sandbox VM is Linux
+    whatever the computer runs, so a VM-mode child keeps the zone; so does
+    every POSIX host."""
+    if ctx.get("mode") == VM:
+        return True
+    return not str(platform or "").lower().startswith("win")
+
+
+def _helper_child_env(ctx: Dict[str, Any],
+                      env: Optional[Dict[str, str]] = None,
+                      *, platform: Optional[str] = None) -> Dict[str, str]:
+    """The env block every helper process gets (gap analysis §4.2.4).
+
+    `TZ` is the workspace zone, not the host's: under strategy 2 the helpers run
+    in a UTC VM, and the machine-local naive reads (`late_fire`, `receipts`, the
+    lock diagnostics) would otherwise resolve to the wrong day. On a Windows
+    host outside the VM the zone is withheld instead (`_tz_reaches_the_child`,
+    DOORTZ1 cr1#243): the C runtime there misreads an IANA name as a fixed
+    offset. `platform` defaults to this process's `sys.platform` and is the
+    lane suite's seam. `CR_DATA_ROOT` is REMOVED, never set — relocating the
+    substrate is not this layer's call.
+    """
+    base = dict(os.environ if env is None else env)
+    base.pop("CR_DATA_ROOT", None)
+    base["CR_WORKSPACE"] = str(ctx.get("vm_path") or "")
+    base["PYTHONDONTWRITEBYTECODE"] = "1"
+    # cr1#1413: the child writes its streams in UTF-8, the encoding the door
+    # reads them with; left to each side's default, a Windows child wrote its
+    # error text in the code page and a refusal came back with none of it.
+    base["PYTHONIOENCODING"] = "utf-8"
+    # THE DOOR SAYS SO (MF-M2-13). `run_helper` promises it writes nothing to
+    # the book (cr1#1602: only the door's own timing row, in the cache), and the allow-list is read/compute only — but a listed READ can
+    # still reach a best-effort diagnostic writer two frames down
+    # (`events_io._record_stale_read` did, and dropped a sidecar beside the
+    # customer's ledger). A helper child is told it is a helper child, so a
+    # best-effort writer on a read path can hold its record; nothing else
+    # changes, and an in-process or in-shell reader never sees this key.
+    base[HELPER_DOOR_ENV] = "run_helper"
+    # cr1#1679: a helper started from inside a writer child does not inherit
+    # the writer's running-step name (only `_writer_child_env` sets it).
+    base.pop(RUNNING_STEP_ENV, None)
+    if ctx.get("tz") and _tz_reaches_the_child(ctx, platform or sys.platform):
+        base["TZ"] = str(ctx["tz"])
+    if ctx.get("runtime_version"):
+        base["CR_RUNTIME_VERSION"] = str(ctx["runtime_version"])
+    base["CR_HOST_MODE"] = str(ctx.get("mode") or "")
+    env_name = _env_mode_name(dict(os.environ if env is None else env))
+    if ctx.get("mode") == VM and env_name in (None, "", "unknown"):
+        # In the sandbox VM `env_detect` sees none of the container's signals
+        # and answers `unknown` — the value reserved for "a writer refuses".
+        # The layer already knows better: a VM only exists on a merged seat,
+        # which is the D-1 row `vm -> merged_cloud`. Without this, every helper
+        # run beside the data is told the environment is unknown, and the M2
+        # writers that read `CR_ENV` would refuse the one host that can serve
+        # them (merged-tree review M-1).
+        env_name = "merged_cloud"
+    if env_name:
+        base["CR_ENV"] = env_name
+    # THE DOOR DOES NOT STRIP THE FORWARD SET. These four arrive on the
+    # command line that started THIS process (`plan` renders them), so they are
+    # already in the copied environment — restating them is the pin: a future
+    # edit that filters this dict cannot silently drop the writer identity and
+    # send the ledger back to session tokens. Only keys actually present are
+    # re-set, so nothing is invented on a seat that forwarded nothing.
+    source = dict(os.environ if env is None else env)
+    for key in FORWARD_ENV_KEYS:
+        value = str(source.get(key, "")).strip()
+        if value:
+            base[key] = value
+    return base
+
+
+_HELPER_RUNNER = r"""
+import json, sys
+payload = json.loads(sys.stdin.read())
+sys.path.insert(0, payload["scripts"])
+import importlib
+mod = importlib.import_module(payload["module"])
+fn = getattr(mod, payload["function"])
+# ROOTFILL1 (cr1#924): a call that leaves `workspace_root` out of a function
+# that requires it gets the anchored workspace, the one value the door's
+# fence accepts. A default is the function's own and is left alone.
+anchored = payload.get("anchored")
+if anchored and "workspace_root" not in payload["args"]:
+    import inspect
+    try:
+        _param = inspect.signature(fn).parameters.get("workspace_root")
+    except (TypeError, ValueError):
+        _param = None
+    if (_param is not None and _param.default is inspect.Parameter.empty
+            and _param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                inspect.Parameter.KEYWORD_ONLY)):
+        payload["args"]["workspace_root"] = anchored
+def plain(value):
+    import dataclasses
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return plain(dataclasses.asdict(value))
+        except (TypeError, RecursionError):
+            return str(value)
+    if isinstance(value, dict):
+        return {str(k): plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [plain(v) for v in value]
+    return str(value)
+def hand_back_held():
+    try:
+        import read_alarm
+        held = read_alarm.held_sidecars()
+    except Exception:
+        held = []
+    if held:
+        sys.stderr.write("\x00CR_SIDECARS\x00" + json.dumps(plain(held)) + chr(10))
+try:
+    result = fn(**payload["args"])
+except BaseException as exc:
+    hand_back_held()
+    reason = getattr(exc, "cr_refusal_reason", None)
+    if reason or type(exc).__name__ == "WriterIdentityRequired":
+        sys.stdout.write("\x00CR_REFUSAL\x00" + json.dumps({
+            "reason": str(reason or "writer_identity_required"),
+            "line": str(getattr(exc, "line", "") or ""),
+            "cause": str(getattr(exc, "cause", "") or "")}))
+        sys.exit(0)
+    raise
+sys.stdout.write("\x00CR_RESULT\x00" + json.dumps(plain(result)))
+hand_back_held()
+"""
+
+#: How a child hands back a writer-identity refusal instead of a traceback.
+REFUSAL_MARKER = "\x00CR_REFUSAL\x00"
+
+
+#: Longer than any path a filesystem will take (Windows' widest is 32,767
+#: characters; POSIX PATH_MAX is 4,096). A string past this is CONTENT - a
+#: document's bytes, a section body - and fencing it as a path answers the
+#: wrong question: `Path.resolve` raises on it, so the door refused every
+#: export whose base64 carried a `/` (DOCS1 fix round 3, review N-19), and
+#: would refuse a long brief section for the same reason.
+PATH_MAX_CHARS = 4096
+
+#: The door's argument cap (ruling D-T2B-7, D-W2-1): how many items
+#: `fence_helper_args` walks (every dict key and value, every list element,
+#: the value itself) before the payload is refused `bad_args`. The walk is
+#: what bounds the fence's own time; a payload past it is pathological. The
+#: by-path shapes (a staged file read by a `*_rel`) stay the product: this is
+#: headroom, not a licence to hand a day's fetch inline. Every pin that names
+#: the cap reads this constant.
+ARG_WALK_CAP = 20000
+
+#: The byte ceiling on an `args_file` (ruling D-T2B-7, D-W2-1), measured on
+#: disk before the file is read: it bounds one read of a session's scratch
+#: file into memory, so a runaway payload is refused before it is parsed.
+#: SIZED OVER the staging primitive's own ceiling (CAP1, a deviation from
+#: D-W2-1's 2 MiB for the reviewer to rule): `eod_helpers.STAGE_MAX_BYTES`
+#: is 32 MiB decoded, which rides this file as base64 (about 42.7 MiB), and
+#: a worst real day's transcript stage (1.8 MB decoded, REVIEW_T2B_EODHARD3)
+#: is already past 2 MiB as base64. A smaller ceiling here would refuse the
+#: End of Day's own stage before its writer could answer its one sentence.
+ARGS_FILE_MAX_BYTES = 48 * 1024 * 1024
+
+#: How deep the fence walks before a payload is refused `bad_args` (CAP1 fix
+#: round 1, REVIEW_W2_CAP1 N-2). The walk itself is iterative and cannot
+#: raise, but a structure nested deeper than this is refused before the door
+#: serialises it for the child, where a `RecursionError` would escape the
+#: door. No real form nests past about a dozen levels.
+ARG_DEPTH_CAP = 100
+
+#: The `detail` a refused oversized `args_file` carries (reason `bad_args`).
+ARGS_FILE_TOO_LARGE = "args_file_too_large"
+
+#: The `detail` an `args_file` that is not a regular file carries (a pipe, a
+#: device, anything whose size on disk says nothing about its read).
+ARGS_FILE_NOT_A_FILE = "args_file: not a file"
+
+
+def _read_args_file(args_file: Any) -> Tuple[Any, Optional[str]]:
+    """`(parsed JSON, None)` for a session's `args_file`, else `(None,
+    detail)` for a refusal (reason `bad_args`) - the ONE read both doors do.
+
+    CAP1 fix round 1 (REVIEW_W2_CAP1 N-1): opened ONCE; the open handle is
+    measured (`os.fstat`), so the size and the read are of the same file; a
+    handle that is not a regular file is refused; and the read itself is
+    bounded at `ARGS_FILE_MAX_BYTES + 1` bytes, so a file that grew after
+    the measure is refused as too large and never read whole. A missing or
+    unopenable file answers its `OSError` name, as before. The open does not
+    wait on a pipe with no writer (`O_NONBLOCK` where the platform has it).
+    """
+    import stat as _stat
+
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+             | getattr(os, "O_NONBLOCK", 0))
+    try:
+        with os.fdopen(os.open(str(args_file), flags), "rb") as fh:
+            status = os.fstat(fh.fileno())
+            if not _stat.S_ISREG(status.st_mode):
+                return None, ARGS_FILE_NOT_A_FILE
+            if status.st_size > ARGS_FILE_MAX_BYTES:
+                return None, ARGS_FILE_TOO_LARGE
+            raw = fh.read(ARGS_FILE_MAX_BYTES + 1)
+        if len(raw) > ARGS_FILE_MAX_BYTES:
+            return None, ARGS_FILE_TOO_LARGE
+        return json.loads(raw.decode("utf-8")), None
+    except (OSError, ValueError, RecursionError) as exc:
+        # fix round 1 N-2: a file nested past the parser's own depth is a
+        # refusal (`args_file: RecursionError`), never a raise out of the door
+        return None, "args_file: " + type(exc).__name__
+
+#: Argument keys whose VALUE is a document's bytes, never a path: the export
+#: payload's `content_base64` (DOCS1 D-2). The key itself is still walked;
+#: the value is decoded by the writer and meets `land`'s fences as bytes.
+CONTENT_KEY_SUFFIXES = ("_base64",)
+
+#: cr1#931: the read helpers that take the scheduler's listing as DATA, and
+#: the argument that carries it. A listing record's `folders` (or the
+#: listing's own `derived_state.folders`) names the folder the task runs in
+#: ON THE CUSTOMER'S COMPUTER: the helper compares it with this seat's
+#: forwarded folder and never opens it, and on a merged seat it is never a
+#: path on this host. So the fence leaves exactly that value alone, and walks
+#: every other value of every record as before. The health check used to be
+#: refused here, and its chat stripped the folder to get through.
+LISTING_ARG_HELPERS = {"staff_meeting_helpers:health_report": "task_records",
+                       # cr1#1005 part 4: the verdict the report wraps, the same listing
+                       "task_watchdog:health_verdict": "task_records",
+                       # cr1#967: compares each record's folder by digest, never opens it
+                       "schedule_backend:plan_default_cron_moves": "registered",
+                       # cr1#1585: the one "is everything OK?" answer hands the same listing to the health report
+                       "everything_ok:answer": "task_records"}
+LISTING_FOLDER_KEYS = ("folders",)
+
+
+def listing_fence_view(name: str, args: Any) -> Any:
+    """The arguments as the path fence sees them: for a helper in
+    `LISTING_ARG_HELPERS`, its listing's records without their computer
+    folders; for any other helper, the arguments unchanged. Only the fence
+    reads this view; the helper gets the arguments as they were handed."""
+    key = LISTING_ARG_HELPERS.get(name)
+    if not key or not isinstance(args, dict) or not isinstance(args.get(key), list):
+        return args
+
+    def _without_folders(rec):
+        if not isinstance(rec, dict):
+            return rec
+        out = {k: v for k, v in rec.items() if k not in LISTING_FOLDER_KEYS}
+        derived = out.get("derived_state")
+        if isinstance(derived, dict):
+            out["derived_state"] = {k: v for k, v in derived.items()
+                                    if k not in LISTING_FOLDER_KEYS}
+        return out
+
+    return dict(args, **{key: [_without_folders(r) for r in args[key]]})
+
+
+#: cr1#1058: the `computer:` link scheme in any of its spellings
+#: (`computer:///...`, the Windows-native `computer://C:\...`), any case. The
+#: scheme and its slash, never the bare word, so prose such as "on your
+#: computer: a card is open" stays content.
+COMPUTER_LINK_RE = re.compile(r"computer:/", re.IGNORECASE)
+
+
+def _carries_computer_link(value: str) -> bool:
+    """True when a helper argument carries a `computer:` link anywhere in it,
+    at any length. Until cr1#1058 only Windows refused one, and only because
+    `Path.resolve` fails on that text there; on macOS and Linux the text
+    resolved inside the workspace and passed."""
+    return bool(COMPUTER_LINK_RE.search(value))
+
+
+def _looks_like_path(value: str) -> bool:
+    """True when a helper argument is path-shaped and must therefore be fenced.
+
+    Deliberately wide: absolute, carrying a separator, or ending in a known
+    substrate extension. A false positive costs a caller one relative path
+    inside the workspace; a false negative is B-2 again. A string longer than
+    any path can be (`PATH_MAX_CHARS`) is content, not a path.
+    """
+    text = value.strip()
+    if not text:
+        return False
+    if len(text) > PATH_MAX_CHARS:
+        return False
+    if "/" in text or "\\" in text:
+        return True
+    try:
+        if Path(text).is_absolute():
+            return True
+    except (OSError, ValueError):
+        return False
+    return text.lower().endswith(PATH_LIKE_SUFFIXES)
+
+
+def fence_helper_args(vm_path: Path, args: Any) -> Optional[Tuple[str, str]]:
+    """`(offending value, reason)` for the first path-shaped argument that is
+    not a legal target, else None.
+
+    Every string anywhere in the argument structure is walked — a path hidden
+    one list or dict deep is still a path. The fence is `fence_path`'s, so a
+    helper argument can reach exactly what `read` and `write` can reach. A
+    string carrying a `computer:` link is refused `refused_computer_link`
+    first, whatever its shape or length (cr1#1058).
+    """
+    stack = [args]
+    seen = 0
+    # CAP1 fix round 1 (N-2): each stacked item's depth, kept beside the
+    # stack so the walk itself reads exactly as before
+    depths = [0]
+    while stack:
+        item = stack.pop()
+        depth = depths.pop()
+        seen += 1
+        if seen > ARG_WALK_CAP:              # a pathological payload is bad_args
+            return ("<too many arguments to fence>", R_BAD_ARGS)
+        if depth > ARG_DEPTH_CAP:            # nested past any real form
+            return ("<arguments nested too deep to fence>", R_BAD_ARGS)
+        if isinstance(item, str):
+            # cr1#1058: a `computer:` link never crosses a command line, on
+            # any host and at any length; checked before the path shape,
+            # which a long text skips.
+            if _carries_computer_link(item):
+                return (item, R_REFUSED_COMPUTER_LINK)
+            if not _looks_like_path(item):
+                continue
+            _, reason = fence_path(vm_path, item)
+            if reason is not None:
+                return (item, reason)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            # A content key's value is a document's bytes (base64), never a
+            # path (DOCS1 fix round 3, review N-19); every other value walks.
+            stack.extend(v for k, v in item.items()
+                         if not (isinstance(k, str)
+                                 and k.lower().endswith(CONTENT_KEY_SUFFIXES)))
+        elif isinstance(item, (list, tuple, set)):
+            stack.extend(item)
+        depths.extend([depth + 1] * (len(stack) - len(depths)))
+    return None
+
+
+#: cr1#1602 (review round 4 of #1613, N4): the writer child's environment
+#: names the step it runs; `task_timings.RUNNING_STEP_ENV` reads the same key.
+RUNNING_STEP_ENV = "CR_TIMED_STEP"
+
+#: cr1#1602: the door reasons that mean the call's helper or writer ran (or
+#: began to), so its time is kept; every other refusal ran nothing.
+_TIMED_REFUSALS = frozenset({R_TIMEOUT, R_HELPER_FAILED, R_WRITE_UNVERIFIED})
+
+
+def _timed_door(fn: Callable[..., Dict[str, Any]]) -> Callable[..., Dict[str, Any]]:
+    """cr1#1602: time one door call by code and keep ONE row in the runtime
+    cache (`task_timings.append_step`, `_hq/.cache/task-steps.jsonl`), which
+    a scheduled task's receipt reads for its phases. Monotonic for the
+    duration, the clock for the start. The helper or writer never sees the
+    file and is never told the time; a row that cannot be kept is dropped and
+    the call's answer is unchanged."""
+    import functools
+
+    @functools.wraps(fn)
+    def door(name, args=None, **kw):
+        started = time.time()
+        t0 = time.monotonic()
+        out = fn(name, args, **kw)
+        try:
+            ran = isinstance(out, dict) and (out.get("ok") or out.get("reason") in _TIMED_REFUSALS)
+            if ran and out.get("ws") and isinstance(name, str):
+                _ensure_scripts_on_path()
+                import task_timings
+
+                # Review round 4 of #1613 (N3): a helper that answers ok false
+                # ran and failed; its row says so, as a door refusal does.
+                res = out.get("result")
+                ok = bool(out.get("ok")) and not (isinstance(res, dict) and res.get("ok") is False)
+                task_timings.append_step(out["ws"], name, started=started,
+                                         elapsed_ms=int((time.monotonic() - t0) * 1000),
+                                         ok=ok, args=args)
+        except Exception:  # noqa: BLE001 - a timing never changes the call's answer
+            pass
+        return out
+
+    return door
+
+
+@_timed_door
+def run_helper(name: str, args: Optional[Dict[str, Any]] = None, *,
+               timeout_s: int = DEFAULT_TIMEOUT_S,
+               ctx: Optional[Dict[str, Any]] = None,
+               env: Optional[Dict[str, str]] = None,
+               args_file: Optional[str] = None) -> Dict[str, Any]:
+    """`{ok, result, stderr_tail, elapsed_ms}` — run ONE shared helper in place.
+
+    `name` is `module:function` and passes THREE gates before anything runs:
+    the module is in the installed runtime's manifest, the whole `module:
+    function` pair is in `RUN_HELPER_ALLOWLIST`, and every path-shaped argument
+    fences exactly as a `read` or `write` target would. The manifest alone was
+    not enough — `atomic_write` is in it by construction, which made this verb a
+    write-anywhere primitive (review B-2) — and neither is a gated writer:
+    every entry reads or computes, so this verb writes nothing to the book;
+    the door appends one timing row to the runtime cache (review B-1, amended
+    by cr1#1602: `_timed_door`, `_hq/.cache/task-steps.jsonl`). Writes go through `write` and `append_jsonl`, which carry the
+    `REGISTERED_JSONL` rule this door cannot express. The helper runs in a child process
+    with cwd = the workspace root and
+    `sys.path[0]` = the installed runtime's scripts dir, under a wall-clock
+    budget the LAYER enforces — a hang comes back as `reason: timeout` with an
+    envelope, never as a truncated device_bash reply.
+    """
+    started = time.time()
+    ctx = resolve(env=env) if ctx is None else ctx
+    refusal = _preflight("run_helper", ctx, started)
+    if refusal is not None:
+        return refusal
+    if not isinstance(name, str) or name.count(":") != 1:
+        return _refuse("run_helper", ctx, started, R_BAD_ARGS, name=name,
+                       detail="name must be 'module:function'")
+    module, function = name.split(":", 1)
+    if not module or not function:
+        return _refuse("run_helper", ctx, started, R_BAD_ARGS, name=name)
+    if module not in manifest_modules(ctx):
+        return _refuse("run_helper", ctx, started, R_NOT_IN_MANIFEST, name=name)
+    # DOORHELP1 (cr1#518): a WRITER asked for through the read door is still
+    # refused, and the refusal names the door that runs it, so a skill that
+    # took the wrong verb learns the route instead of a bare no.
+    if name in RUN_WRITER_ALLOWLIST:
+        return _refuse("run_helper", ctx, started, R_NOT_ALLOWED_HELPER, name=name,
+                       next="run_writer")
+    if name not in RUN_HELPER_ALLOWLIST:
+        return _refuse("run_helper", ctx, started, R_NOT_ALLOWED_HELPER, name=name)
+    # BRIDGE3 (Train 2b §5 MUST 1): a read's payload too large or too
+    # quote-laden for a pasted line (the bridge's registered listing) travels
+    # as `args_file`, exactly as `run_writer` takes it: a JSON object in THIS
+    # SESSION'S OWN scratch, read here, fenced like every other argument.
+    if args_file:
+        # CAP1 (D-T2B-7, fix round 1 N-1): one open, measured on the handle,
+        # a bounded read; a missing file is its OSError name, as before.
+        loaded, refused = _read_args_file(args_file)
+        if refused is not None:
+            return _refuse("run_helper", ctx, started, R_BAD_ARGS, name=name,
+                           detail=refused)
+        if not isinstance(loaded, dict):
+            return _refuse("run_helper", ctx, started, R_BAD_ARGS, name=name,
+                           detail="args_file must hold a JSON object")
+        args = dict(loaded, **dict(args or {}))
+    # WSPLACE1 (cr1#546): the door puts the anchored workspace in for `<WS>`
+    # and refuses a `workspace_root` that is any other folder.
+    args, wrong_root = fill_workspace_args(Path(ctx["vm_path"]), dict(args or {}))
+    if wrong_root is not None:
+        return _refuse("run_helper", ctx, started, wrong_root[1], name=name,
+                       arg=wrong_root[0], line=path_refusal_line("run_helper"))
+    offender = fence_helper_args(Path(ctx["vm_path"]), listing_fence_view(name, dict(args or {})))
+    if offender is not None:
+        return _refuse("run_helper", ctx, started, offender[1], name=name,
+                       arg=offender[0], **_path_line("run_helper", offender[1]))
+
+    staged = ctx.get("staged_root")
+    scripts = str(Path(staged) / "shared" / "scripts") if staged else str(_scripts_dir())
+    payload = json.dumps({
+        "scripts": scripts,
+        "module": module,
+        "function": function,
+        "args": dict(args or {}),
+        "anchored": str(ctx["vm_path"]),
+    })
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _HELPER_RUNNER],
+            input=payload,
+            capture_output=True,
+            text=True,
+            # cr1#1413: both sides name the encoding (the child is told
+            # PYTHONIOENCODING), so a refusal's words are never lost to a
+            # decode error on a Windows host.
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(ctx["vm_path"]),
+            env=_helper_child_env(ctx, env),
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return _refuse("run_helper", ctx, started, R_TIMEOUT, name=name,
+                       timeout_s=timeout_s)
+    # MF-M2-13: a read helper that would have dropped a sidecar beside the
+    # customer's file holds the record instead, and it comes back HERE. The
+    # layer carries the evidence; the write never happens.
+    stderr_out = proc.stderr or ""
+    sidecars: List[Dict[str, Any]] = []
+    if SIDECAR_MARKER in stderr_out:
+        head, _sep, raw = stderr_out.partition(SIDECAR_MARKER)
+        line, _nl, rest = raw.partition(chr(10))
+        # whatever the helper wrote on its own account — a traceback,
+        # a warning — is kept; only the layer's own line comes out.
+        stderr_out = head + rest
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, list):
+                sidecars = parsed
+        except ValueError:
+            sidecars = []
+    stderr_tail = stderr_out[-2000:]
+    marker = "\x00CR_RESULT\x00"
+    stdout = proc.stdout or ""
+    refused = _child_refusal(stdout)
+    if refused is not None:
+        return _refuse("run_helper", ctx, started,
+                       refused.get("reason") or R_WRITER_IDENTITY_REQUIRED,
+                       name=name, line=refused.get("line"),
+                       cause=refused.get("cause"), sidecars=sidecars)
+    if proc.returncode != 0 or marker not in stdout:
+        return _refuse("run_helper", ctx, started, R_HELPER_FAILED, name=name,
+                       stderr_tail=stderr_tail, returncode=proc.returncode,
+                       sidecars=sidecars)
+    try:
+        result = json.loads(stdout.split(marker, 1)[1])
+    except ValueError:
+        return _refuse("run_helper", ctx, started, R_HELPER_FAILED, name=name,
+                       stderr_tail=stderr_tail, sidecars=sidecars)
+    return _envelope("run_helper", ctx, started, ok=True, name=name,
+                     result=result, stderr_tail=stderr_tail,
+                     sidecars=sidecars, receipt=_door_receipt(name),
+                     **_origin_fields(env))
+
+
+def _door_receipt(name: str) -> str:
+    """The receipt an ok door call carries (cr1#1413): a merged seat's
+    closing counts a doored step only on it. "" when it cannot be made."""
+    try:
+        _ensure_scripts_on_path()
+        import turn_receipts  # type: ignore
+        return turn_receipts.issue_door(name)
+    except Exception:  # noqa: BLE001 - a receipt never blocks an answer
+        return ""
+
+
+def _child_refusal(stdout: str) -> Optional[Dict[str, Any]]:
+    """The writer-identity refusal a child handed back, or None."""
+    if REFUSAL_MARKER not in (stdout or ""):
+        return None
+    try:
+        parsed = json.loads(stdout.split(REFUSAL_MARKER, 1)[1])
+    except ValueError:
+        return {"line": "", "cause": ""}
+    return parsed if isinstance(parsed, dict) else {"line": "", "cause": ""}
+
+
+def _module_in_manifest(module: str, ctx: Dict[str, Any]) -> bool:
+    """`manifest_modules`, taught one more spelling: a DOTTED module (the
+    update bridge's re-pin lives in `release_actions/`) is in the runtime when
+    its own file is, never because a module with the same last name is."""
+    if "." not in module:
+        return module in manifest_modules(ctx)
+    rel = "shared/scripts/" + module.replace(".", "/") + ".py"
+    staged = ctx.get("staged_root")
+    if staged:
+        try:
+            payload = json.loads((Path(staged) / MANIFEST_NAME).read_text(encoding="utf-8"))
+            files = payload.get("files") or {}
+            if files:
+                return rel in files
+        except Exception:
+            pass
+    return (plugin_root() / rel).is_file()
+
+
+def _relativize(value: Any, vm_path: Path) -> Any:
+    """Every absolute path inside the workspace, spelled workspace-relative.
+
+    A writer answers with where it wrote, and on a merged seat that spelling
+    is the sandbox mount (`/sessions/<id>/mnt/...`) - a session id in the
+    envelope the model reads back, which is the leak class R-DELIV1-2 closed
+    for landed files. The envelope names the file by `rel`; the customer's own
+    path is `deliverables`' to spell."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text and ("/" in text or "\\" in text):
+            try:
+                candidate = Path(text)
+                if candidate.is_absolute():
+                    return candidate.resolve().relative_to(vm_path).as_posix()
+            except (OSError, ValueError):
+                return value
+        return value
+    if isinstance(value, dict):
+        return {k: _relativize(v, vm_path) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_relativize(v, vm_path) for v in value]
+    return value
+
+
+def _writer_child_env(ctx: Dict[str, Any],
+                      env: Optional[Dict[str, str]] = None, step: Optional[str] = None) -> Dict[str, str]:
+    """The helper child's environment, minus the one key that says "read
+    door": a writer child is not a helper child, so a best-effort writer
+    beneath it (the identity cache) is allowed to write. cr1#1602 (review
+    round 4 of #1613, N4): `step` names the writer being run, so a receipt it
+    writes marks its own phase (`task_timings.RUNNING_STEP_ENV`)."""
+    base = _helper_child_env(ctx, env)
+    base.pop(HELPER_DOOR_ENV, None)
+    base.pop(RUNNING_STEP_ENV, None)
+    if step:
+        base[RUNNING_STEP_ENV] = str(step)
+    return base
+
+
+@_timed_door
+def run_writer(name: str, args: Optional[Dict[str, Any]] = None, *,
+               args_file: Optional[str] = None,
+               timeout_s: int = DEFAULT_TIMEOUT_S,
+               ctx: Optional[Dict[str, Any]] = None,
+               env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """`{ok, result, rel?, stderr_tail, elapsed_ms}` - run ONE writer in place.
+
+    THE WRITE DOOR (IDENT1 I-0; ruling R-M3-2). `run_helper` stays a read
+    door; a document, a receipt, a close or a re-pin runs HERE, and passes
+    these gates in order before anything is started:
+
+      1. there is a workspace on this host and it is attached (`_preflight`:
+         `container` refuses `no_workspace_on_this_host`);
+      2. the name is `module:function` and on `RUN_WRITER_ALLOWLIST`
+         (`not_allowed_writer` - a read helper's name is refused here, as a
+         writer's name is refused by `run_helper`);
+      3. the module is in the installed runtime (`not_in_manifest`);
+      4. every path-shaped argument fences exactly as a `write` target would;
+      5. the WRITER IS NAMED: `receipts.require_writer_identity`, asked of the
+         environment the writer will run with. A merged seat's VM with no
+         forwarded writer id, or a scheduled fire that is not the
+         workspace's declared writer, refuses `writer_identity_required` with
+         the one sentence in `line` - and nothing has run.
+
+    `args` are bound by NAME onto the writer's own parameters. A payload too
+    large or too quote-laden to survive a pasted command line (a brief's
+    sections) travels as `args_file`: a JSON object in THIS SESSION'S OWN
+    scratch, read here as the arguments and never written into the
+    workspace. The envelope names a landed file by `rel`, never by the mount
+    path.
+    """
+    started = time.time()
+    ctx = resolve(env=env) if ctx is None else ctx
+    refusal = _preflight("run_writer", ctx, started)
+    if refusal is not None:
+        return refusal
+    if not isinstance(name, str) or name.count(":") != 1:
+        return _refuse("run_writer", ctx, started, R_BAD_ARGS, name=name,
+                       detail="name must be 'module:function'")
+    module, function = name.split(":", 1)
+    if not module or not function:
+        return _refuse("run_writer", ctx, started, R_BAD_ARGS, name=name)
+    if name not in RUN_WRITER_ALLOWLIST:
+        return _refuse("run_writer", ctx, started, R_NOT_ALLOWED_WRITER, name=name)
+    if not _module_in_manifest(module, ctx):
+        return _refuse("run_writer", ctx, started, R_NOT_IN_MANIFEST, name=name)
+    bound: Dict[str, Any] = {}
+    if args_file:
+        # CAP1 (D-T2B-7, fix round 1 N-1): one open, measured on the handle,
+        # a bounded read; a missing file is its OSError name, as before.
+        loaded, refused = _read_args_file(args_file)
+        if refused is not None:
+            return _refuse("run_writer", ctx, started, R_BAD_ARGS, name=name,
+                           detail=refused)
+        if not isinstance(loaded, dict):
+            return _refuse("run_writer", ctx, started, R_BAD_ARGS, name=name,
+                           detail="args_file must hold a JSON object")
+        bound.update(loaded)
+    bound.update(dict(args or {}))
+    # WSPLACE1 (cr1#546): the door puts the anchored workspace in for `<WS>`
+    # and refuses a `workspace_root` that is any other folder, with the one
+    # sentence that says nothing was saved. Nothing has run.
+    bound, wrong_root = fill_workspace_args(Path(ctx["vm_path"]), bound)
+    if wrong_root is not None:
+        return _refuse("run_writer", ctx, started, wrong_root[1], name=name,
+                       arg=wrong_root[0], line=path_refusal_line("run_writer"))
+    offender = fence_helper_args(Path(ctx["vm_path"]), bound)
+    if offender is not None:
+        return _refuse("run_writer", ctx, started, offender[1], name=name,
+                       arg=offender[0], **_path_line("run_writer", offender[1]))
+
+    refusal = _device_origin_refusal("run_writer", ctx, started, env)
+    if refusal is not None:
+        refusal["name"] = name
+        return refusal
+    child_env = _writer_child_env(ctx, env, step=name)
+    # THE WRITER IS NAMED BEFORE ANYTHING RUNS - asked of the environment the
+    # writer itself will see, so the door and the writer cannot disagree.
+    try:
+        _ensure_scripts_on_path()
+        import receipts as _receipts  # type: ignore
+        # cr1#603: the ONE writer a foreign fire may run is the record of its
+        # own stop; every other name keeps the foreign refusal.
+        _receipts.require_writer_identity(child_env,
+                                          workspace_root=str(ctx["vm_path"]),
+                                          allow_foreign=(name == FIRE_STOP_WRITER))
+    except Exception as exc:  # noqa: BLE001 - ours is a refusal; any other is too
+        if type(exc).__name__ == "WriterIdentityRequired":
+            return _refuse("run_writer", ctx, started, R_WRITER_IDENTITY_REQUIRED,
+                           name=name, line=getattr(exc, "line", ""),
+                           cause=getattr(exc, "cause", ""))
+        return _refuse("run_writer", ctx, started, R_HELPER_FAILED, name=name,
+                       detail="identity check: " + type(exc).__name__)
+    # cr1#615: through this door a receipt is a skill's own, never a job's. The
+    # task is read as the writer will read it, so an alias does not get round
+    # this. It comes after the identity question, which every name answers
+    # first. `log_receipt` itself stays open to the jobs that import it.
+    if name == RECEIPT_WRITER and (_receipts.normalize_task_id(bound.get("task_id"))
+                                   not in _receipts.CHAT_RECEIPT_TASKS):
+        return _refuse("run_writer", ctx, started, R_NOT_ALLOWED_WRITER, name=name,
+                       line=JOB_RECEIPT_REFUSED_LINE)
+    # cr1#615: both receipt writers make the ledger's folder before they append,
+    # which steps round LEDGERPLACE1's refusal. Asked here, not in the writers:
+    # in-process callers start ledgers that way, and a chat never should.
+    if module == "receipts" and not (Path(ctx["vm_path"]) / "_hq" / "data").is_dir():
+        import atomic_write as _aw  # type: ignore
+
+        return _refuse("run_writer", ctx, started, R_MISSING_PARENT, name=name,
+                       line=_aw.LEDGER_FOLDER_MISSING_LINE)
+
+    staged = ctx.get("staged_root")
+    scripts = str(Path(staged) / "shared" / "scripts") if staged else str(_scripts_dir())
+    payload = json.dumps({"scripts": scripts, "module": module,
+                          "function": function, "args": bound,
+                          "anchored": str(ctx["vm_path"])})
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _HELPER_RUNNER],
+            input=payload, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",  # cr1#1413, as run_helper
+            cwd=str(ctx["vm_path"]), env=child_env, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return _refuse("run_writer", ctx, started, R_TIMEOUT, name=name,
+                       timeout_s=timeout_s)
+    stdout = proc.stdout or ""
+    stderr_out = proc.stderr or ""
+    if SIDECAR_MARKER in stderr_out:
+        head, _sep, raw = stderr_out.partition(SIDECAR_MARKER)
+        _line, _nl, rest = raw.partition(chr(10))
+        stderr_out = head + rest
+    stderr_tail = stderr_out[-2000:]
+    refused = _child_refusal(stdout)
+    if refused is not None:
+        return _refuse("run_writer", ctx, started,
+                       refused.get("reason") or R_WRITER_IDENTITY_REQUIRED,
+                       name=name, line=refused.get("line"),
+                       cause=refused.get("cause"))
+    result_marker = "\x00CR_RESULT\x00"
+    if proc.returncode != 0 or result_marker not in stdout:
+        return _refuse("run_writer", ctx, started, R_HELPER_FAILED, name=name,
+                       stderr_tail=stderr_tail, returncode=proc.returncode)
+    try:
+        result = json.loads(stdout.split(result_marker, 1)[1])
+    except ValueError:
+        return _refuse("run_writer", ctx, started, R_HELPER_FAILED, name=name,
+                       stderr_tail=stderr_tail)
+    vm_path = Path(str(ctx["vm_path"])).resolve()
+    shaped = _relativize(result, vm_path)
+    extra: Dict[str, Any] = {}
+    # A landed document is also SAID (IDENT1 I-2/I-3): the one sentence
+    # `deliverables` composes for it - the path on the customer's own
+    # computer in a code span when this run knows that spelling, the words
+    # form when it does not. The caller prints it verbatim.
+    if isinstance(shaped, str) and shaped.strip():
+        # A writer that answers with a file (the brief writer answers with
+        # where it saved) is named by that file's workspace-relative path,
+        # whichever spelling it answered in - including the customer's own
+        # computer's spelling, which the brief writer answers with whenever
+        # the device path is forwarded (every merged seat; fix pass 1, H-1).
+        shaped = _device_relative(shaped, ctx.get("device_path"))
+        try:
+            landed = (vm_path / shaped).resolve()
+            if landed.is_file():
+                extra["rel"] = landed.relative_to(vm_path).as_posix()
+        except (OSError, ValueError):
+            pass
+    if extra.get("rel"):
+        try:
+            _ensure_scripts_on_path()
+            import deliverables as _dl  # type: ignore
+
+            root = ctx.get("device_path")
+            device = _dl.device_join(root, extra["rel"]) if root else ""
+            extra["opener_line"] = _dl.opener_line(device, extra["rel"])
+        except Exception:  # noqa: BLE001 - a sentence never blocks a landing
+            pass
+    extra.update(_origin_fields(env))
+    extra.setdefault("receipt", _door_receipt(name))  # cr1#1413
+    return _envelope("run_writer", ctx, started, ok=True, name=name,
+                     result=shaped, stderr_tail=_relativize(stderr_tail, vm_path),
+                     **extra)
+
+
+def _device_relative(answer: str, device_path: Any) -> str:
+    """`answer` spelled workspace-relative when it names a file under the
+    customer's own computer's copy of the workspace (`device_path`, either
+    slash, any case of the drive letter); any other answer unchanged.
+
+    The door cannot `is_file` a device path from the VM, so without this a
+    landed brief came back with no `rel` and no sentence, and the prep's
+    receipt had no valid path to record (IDENT1 fix pass 1, H-1)."""
+    dev = str(device_path or "").replace(chr(92), "/").rstrip("/")
+    text = answer.strip().replace(chr(92), "/")
+    if dev and text.lower().startswith(dev.lower() + "/"):
+        return text[len(dev) + 1:]
+    return answer
+
+
+def _is_append_only(target_name: str) -> bool:
+    return target_name == "events.jsonl" or bool(_EVENTS_SHARD_RE.match(target_name))
+
+
+def _inside_data_dir(vm_path: Path, target: Path) -> bool:
+    """cr1#1376: True when the fenced `target` sits inside the workspace's data
+    folder (`_hq/data`, through `data_root.resolve`, or its per-computer
+    `computers/<writer>/` folders below it). The default `_hq/data` always
+    counts, so an override never strands a caller that names it."""
+    homes = [Path(vm_path).resolve() / "_hq" / "data"]
+    try:
+        homes.append(Path(_data_dir(Path(vm_path).resolve())).resolve())
+    except Exception:  # noqa: BLE001 - the default alone decides then
+        pass
+    for home in homes:
+        try:
+            target.relative_to(home)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+#: cr1#1376: the door's sentence for `R_LEDGER_OUTSIDE_DATA`. It names no
+#: file, path or mechanism (preamble rule 6).
+LEDGER_OUTSIDE_DATA_LINE = ("Not saved: that entry named a folder other than the "
+                            "one that holds your activity log, so nothing was "
+                            "written and nothing changed.")
+
+
+def _ledger_outside_line() -> str:
+    """The plain sentence for `R_LEDGER_OUTSIDE_DATA` on the door."""
+    return LEDGER_OUTSIDE_DATA_LINE
+
+
+def _writer_owner(root: Path, target: Path) -> Optional[str]:
+    """The writer that owns `target` (`WRITER_OWNED_FILES`), or None.
+
+    Compared on the fenced, resolved target, relative to the workspace root and
+    case-folded, so a different spelling of the same file is still that file.
+    """
+    try:
+        rel = target.resolve().relative_to(Path(root).resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+    for owned, writer in WRITER_OWNED_FILES.items():
+        if rel.casefold() == owned.casefold():
+            return writer
+    return None
+
+
+def write(rel: str, data, expected_mtime: Optional[int] = None, *,
+          expected_rev: Optional[int] = None,
+          create_parents: Optional[bool] = None,
+          holder: str = "workspace_access",
+          ctx: Optional[Dict[str, Any]] = None,
+          env: Optional[Dict[str, str]] = None,
+          owned_by: Optional[str] = None) -> Dict[str, Any]:
+    """Compare-and-swap one workspace file through the canonical writers.
+
+    A file on `WRITER_OWNED_FILES` is refused `writer_owned`, naming its
+    writer, unless `owned_by` is that writer (cr1#454). Only the owning writer
+    passes it; the CLI has no way to.
+
+    `events.jsonl` (and its year shards) are REFUSED: an append-only ledger is
+    never whole-file written, and `append_jsonl` is the door. `entities.json` /
+    `aliases.json` go through `atomic_write_json_locked`, with the mtime compare
+    running INSIDE that lock on this host, so it is a real compare-and-swap
+    rather than a narrowed window; `expected_rev` is the stronger guard there
+    because the substrate's own version signals are `version`, `.rev` and
+    `.seqhw` — never mtime. Everything else goes through `atomic_write_text`,
+    with FOLDERGUARD's `create_parents=False` outside `_hq/` so a missing
+    project folder is a loud refusal, not a fabricated directory.
+
+    THIS VERB IS TEXT ONLY, ON PURPOSE, AND THERE IS NO SECOND WRITE DOOR
+    (MF-M2-1, night M2 — decided by reading and by driving, and recorded here
+    so the next reader does not re-open it). A payload that is not valid
+    UTF-8 is refused `binary_unsupported`, and the CLI's `b64` argument is
+    NOT an exception to that: it decodes at the door and the refusal below is
+    what the decoded bytes meet. That is a documented one-way door, not a
+    hole — `read` hands `b64` back because a reader must be able to see a
+    file it cannot render, while a WRITE of bytes is a deliverable landing
+    and belongs to the one place that knows what a deliverable is.
+
+    That place is `deliverables.land`, and it is not a way around anything:
+    it asks `_preflight` for both of its halves before it decides anything,
+    then `fence_path`, `_is_append_only`, `REV_FILES` and
+    `_create_parents_default` — every fence this verb applies, asked of this
+    module, so a fence tightened here tightens there. Driven on the merged
+    tree: a `.docx` lands in `vm` mode byte-identical, the ledger comes back
+    `not_a_deliverable`, a `..` escape `refused_path`, a rev-file name
+    `not_a_deliverable`, and a dropped grant `no_workspace_on_this_host`.
+    Nothing in the instruction layer hands bytes to this CLI, so a
+    `write_bytes` verb tonight would add a second write surface with no
+    caller. M3 owns the question of whether the bytes door should MOVE here.
+    """
+    started = time.time()
+    ctx = resolve(env=env) if ctx is None else ctx
+    refusal = _preflight("write", ctx, started)
+    if refusal is not None:
+        return refusal
+    # BRIEFDOOR1 MUST 5 -- the write door names its writer the way the append
+    # door and the writer door do (a VM seat with no identity refuses).
+    refusal = _device_origin_refusal("write", ctx, started, env)
+    if refusal is not None:
+        refusal["rel"] = rel
+        return refusal
+    target, reason = fence_path(Path(ctx["vm_path"]), rel)
+    if reason is not None:
+        return _refuse("write", ctx, started, reason, rel=rel,
+                       **_placeholder_line("write", rel))
+    if _is_append_only(target.name):
+        return _refuse("write", ctx, started, R_REFUSED_APPEND_ONLY, rel=rel,
+                       next="append_jsonl")
+    owner = _writer_owner(Path(ctx["vm_path"]), target)
+    if owner is not None and owned_by != owner:
+        return _refuse("write", ctx, started, R_WRITER_OWNED, rel=rel,
+                       next="run_writer", name=owner)
+
+    if isinstance(data, str):
+        payload = data.encode("utf-8")
+    elif isinstance(data, (bytes, bytearray)):
+        payload = bytes(data)
+    else:
+        return _refuse("write", ctx, started, R_BAD_ARGS, rel=rel,
+                       detail="data must be text or bytes")
+
+    before = _mtime_ns(target)
+    if target.name in REV_FILES:
+        return _write_rev_file(rel, target, payload, expected_mtime, expected_rev,
+                               holder, ctx, started, before)
+
+    if expected_mtime is not None and before != int(expected_mtime):
+        return _refuse("write", ctx, started, R_STALE_READ, rel=rel,
+                       current_mtime_ns=before)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return _refuse("write", ctx, started, R_BINARY_UNSUPPORTED, rel=rel)
+    parents = _create_parents_default(rel) if create_parents is None else bool(create_parents)
+    try:
+        _ensure_scripts_on_path()
+        from atomic_write import atomic_write_text  # type: ignore
+        atomic_write_text(target, text, create_parents=parents)
+    except FileNotFoundError:
+        return _refuse("write", ctx, started, R_MISSING_PARENT, rel=rel)
+    except OSError as exc:
+        return _refuse("write", ctx, started, "write_failed", rel=rel, detail=str(exc))
+    # IDENT1 I-6 (the re-walk's 0-byte page). `atomic_write_text` answered, so
+    # this verb used to answer ok:true - and on the merged mount a NEW file
+    # landed EMPTY (5,091 bytes intended, 0 on the PC). The bytes are read
+    # back; a mismatch gets ONE direct write (no rename - the step the mount
+    # mishandles) and a second read; still wrong is `write_unverified`, never
+    # a claimed success.
+    found = _verify_bytes(target, payload)
+    if found != len(payload) or not _same_bytes(target, payload):
+        try:
+            with open(target, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        except OSError as exc:
+            return _refuse("write", ctx, started, R_WRITE_UNVERIFIED, rel=rel,
+                           bytes_expected=len(payload), bytes_found=found,
+                           detail=str(exc))
+        found = _verify_bytes(target, payload)
+        if found != len(payload) or not _same_bytes(target, payload):
+            return _refuse("write", ctx, started, R_WRITE_UNVERIFIED, rel=rel,
+                           bytes_expected=len(payload), bytes_found=found)
+    return _envelope("write", ctx, started, ok=True, rel=rel,
+                     mtime_ns_before=before, mtime_ns_after=_mtime_ns(target),
+                     rev=None, bytes_written=len(payload), verified=True,
+                     **_origin_fields(env))
+
+
+def _verify_bytes(target: Path, payload: bytes) -> int:
+    """How many bytes are actually at `target` now (-1 when unreadable)."""
+    try:
+        return len(Path(target).read_bytes())
+    except OSError:
+        return -1
+
+
+def _same_bytes(target: Path, payload: bytes) -> bool:
+    try:
+        return hashlib.sha256(Path(target).read_bytes()).hexdigest() == \
+            hashlib.sha256(payload).hexdigest()
+    except OSError:
+        return False
+
+
+def _create_parents_default(rel: str) -> bool:
+    """FOLDERGUARD by location: `_hq/` self-creates, a project folder does not."""
+    posix = Path(rel).as_posix()
+    return posix == "_hq" or posix.startswith("_hq/")
+
+
+def _mtime_ns(path: Path) -> Optional[int]:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _write_rev_file(rel: str, target: Path, payload: bytes,
+                    expected_mtime: Optional[int], expected_rev: Optional[int],
+                    holder: str, ctx: Dict[str, Any], started: float,
+                    before: Optional[int]) -> Dict[str, Any]:
+    """entities.json / aliases.json — the compare runs inside the sentinel lock."""
+    try:
+        obj = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return _refuse("write", ctx, started, R_INVALID_JSON, rel=rel, detail=str(exc))
+
+    def precheck(path: Path) -> None:
+        current = _mtime_ns(path)
+        if expected_mtime is not None and current != int(expected_mtime):
+            raise StaleRead(str(current))
+        if expected_rev is not None and _read_rev(path) != int(expected_rev):
+            raise StaleRead(str(current))
+
+    try:
+        _ensure_scripts_on_path()
+        from atomic_write import atomic_write_json_locked  # type: ignore
+        atomic_write_json_locked(target, obj, holder=holder, precheck=precheck)
+    except StaleRead:
+        return _refuse("write", ctx, started, R_STALE_READ, rel=rel,
+                       current_mtime_ns=_mtime_ns(target), rev=_read_rev(target))
+    except TimeoutError:
+        return _refuse("write", ctx, started, "lock_timeout", rel=rel)
+    except OSError as exc:
+        return _refuse("write", ctx, started, "write_failed", rel=rel, detail=str(exc))
+    # IDENT1 I-6: the locked JSON writer serialises the object itself, so the
+    # check is that what landed PARSES back to the same object - an empty or
+    # truncated file on the mount is `write_unverified`, never ok:true.
+    try:
+        landed = json.loads(Path(target).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        landed = None
+    if landed != obj:
+        return _refuse("write", ctx, started, R_WRITE_UNVERIFIED, rel=rel,
+                       bytes_found=_verify_bytes(target, payload))
+    return _envelope("write", ctx, started, ok=True, rel=rel,
+                     mtime_ns_before=before, mtime_ns_after=_mtime_ns(target),
+                     rev=_read_rev(target), verified=True)
+
+
+def _read_rev(path: Path) -> Optional[int]:
+    try:
+        raw = json.loads(path.with_name(path.name + ".rev").read_text(encoding="utf-8"))
+        value = raw.get("rev")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    except Exception:
+        return None
+
+
+def append_jsonl(rel: str, rows: Iterable[Dict[str, Any]], *,
+                 holder: str = "workspace_access",
+                 ctx: Optional[Dict[str, Any]] = None,
+                 env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """`{ok, n, stamped}` — the ONLY append door, routed through the gate.
+
+    No mtime guard, by design: an append-only ledger's mtime changes on every
+    legitimate append, so an mtime compare-and-swap would refuse every contended
+    write. The guards are the writer lock, `.seqhw` and FS-04 — all of which run
+    unchanged, in one process, on the live file, because the runtime is beside
+    the data rather than a continent away.
+    """
+    started = time.time()
+    ctx = resolve(env=env) if ctx is None else ctx
+    refusal = _preflight("append_jsonl", ctx, started)
+    if refusal is not None:
+        return refusal
+    refusal = _device_origin_refusal("append_jsonl", ctx, started, env)
+    if refusal is not None:
+        return refusal
+    target, reason = fence_path(Path(ctx["vm_path"]), rel)
+    if reason is not None:
+        return _refuse("append_jsonl", ctx, started, reason, rel=rel,
+                       **_placeholder_line("append_jsonl", rel))
+    if not (target.name in REGISTERED_JSONL or _EVENTS_SHARD_RE.match(target.name)):
+        return _refuse("append_jsonl", ctx, started, R_NOT_REGISTERED, rel=rel)
+    if (_is_append_only(target.name) and target.parent.is_dir()
+            and not _inside_data_dir(Path(ctx["vm_path"]), target)):
+        # A folder that does not exist keeps LEDGERPLACE1's `missing_parent`
+        # answer from the one append path below.
+        # cr1#1376: `rel: "events.jsonl"` used to land a second log at the
+        # workspace root, and every reader handed the root read it instead.
+        return _refuse("append_jsonl", ctx, started, R_LEDGER_OUTSIDE_DATA, rel=rel,
+                       line=_ledger_outside_line())
+    rows = list(rows or [])
+    if not all(isinstance(r, dict) for r in rows):
+        return _refuse("append_jsonl", ctx, started, R_BAD_ARGS, rel=rel,
+                       detail="rows must be a list of objects")
+    capture_once = None
+    try:
+        _ensure_scripts_on_path()
+        if _is_append_only(target.name):
+            from event_gate import append_event  # type: ignore
+            # cr1#1005: the chokepoint's refusals for THIS append, which only
+            # this process holds, go back on the answer so a caller on a
+            # merged seat can hand them to its receipt.
+            try:
+                from atomic_write import reset_capture_once  # type: ignore
+                reset_capture_once()
+            except Exception:  # noqa: BLE001 - a missing reset never blocks an append
+                pass
+            try:
+                from atomic_write import reset_append_route  # type: ignore
+                reset_append_route()  # cr1#1005 part 4: this append's route only
+            except Exception:  # noqa: BLE001
+                pass
+            stamped = append_event(target, rows, holder=holder)
+            try:
+                from atomic_write import last_capture_once_refusal  # type: ignore
+                capture_once = last_capture_once_refusal()
+            except Exception:  # noqa: BLE001
+                capture_once = None
+        else:
+            from atomic_write import atomic_append_jsonl  # type: ignore
+            stamped = atomic_append_jsonl(target, rows, holder=holder)
+    except Exception as exc:  # the gate's refusals are the caller's answer
+        typed = getattr(exc, "cr_refusal_reason", None)
+        if typed:
+            # A typed refusal (LeaseLost -> `lease_lost` + LEASE_LOST_LINE) answers by its
+            # own reason and pinned line, the way run_helper / run_writer already do
+            # (REVIEW_T2_LEASE2 N-2). Nothing was appended when it is said.
+            # LEDGERPLACE1 (cr1#124): a ledger whose folder does not exist
+            # also carries its plain "Not saved" sentence as `line`.
+            # cr1#385: a ledger older than its own high-water mark refuses
+            # with its plain sentence too (`substrate_regressed`).
+            extra = ({"line": str(getattr(exc, "line", ""))}
+                     if str(typed) in (R_MISSING_PARENT, R_SUBSTRATE_REGRESSED,
+                                       R_LEDGER_OUTSIDE_DATA) else {})
+            return _refuse("append_jsonl", ctx, started, str(typed), rel=rel,
+                           detail=str(getattr(exc, "line", "") or f"{type(exc).__name__}: {exc}"),
+                           **extra)
+        return _refuse("append_jsonl", ctx, started, "append_refused", rel=rel,
+                       detail=f"{type(exc).__name__}: {exc}")
+    return _envelope("append_jsonl", ctx, started, ok=True, rel=rel,
+                     n=len(stamped), stamped=stamped,
+                     **({"capture_once": capture_once} if capture_once is not None else {}),
+                     **_landed_fields(target, Path(ctx["vm_path"])),
+                     **_origin_fields(env))
+
+
+def _landed_fields(target: Path, vm_path: Path) -> Dict[str, Any]:
+    """`{landed_rel}` when the rows landed in this computer's own log rather
+    than the live one, else `{}` (cr1#1005 part 4).
+
+    On a seat that knows another computer and does not own the live log, the
+    single append path writes this computer's own file
+    (`_hq/data/computers/<mark>/events.jsonl`, cr1#1061), which the merged
+    reads include. The answer used to name only the live log, so a receipt
+    that landed looked lost. The append path records the route it took
+    (`atomic_write.last_append_route`); nothing is guessed from the rows."""
+    if target.name != "events.jsonl":
+        return {}
+    try:
+        from atomic_write import last_append_route  # type: ignore
+        landed = last_append_route()
+    except Exception:  # noqa: BLE001 - a missing record leaves the answer as it was
+        return {}
+    if not landed:
+        return {}
+    try:
+        return {"landed_rel": Path(landed).resolve().relative_to(vm_path.resolve()).as_posix()}
+    except (OSError, ValueError):
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Container face — install / expect / verify / plan / discover
+# ---------------------------------------------------------------------------
+
+_REFERENCE_RE = re.compile(r"references[/\"'][\s,/]*[\"']?([A-Za-z0-9_.\-]+\.(?:md|html|json|txt))")
+
+
+#: Files no chat removes, ever — the substrate itself and the machinery that
+#: keeps it honest. A `rm` that takes the ledger is not recoverable from a
+#: `.stale.<epoch>` rename somebody has to know to look for, so this door
+#: refuses outright rather than moving them aside. The runtime cache and the
+#: writer lock are refused one fence earlier, by `fence_path`; `remove` reports
+#: those under this same reason, because from the caller's side they are the
+#: same answer: not this file, not by this door.
+PROTECTED_SUFFIXES = (".seqhw", ".source_refs.idx", ".lock")
+PROTECTED_NAMES = frozenset({"entities.json", "aliases.json",
+                             "events.jsonl", "processed-meetings.json"})
+
+
+def _is_protected(target: Path) -> bool:
+    name = target.name
+    if name in PROTECTED_NAMES or _EVENTS_SHARD_RE.match(name):
+        return True
+    if name.startswith(".writer.lock"):
+        return True
+    return any(name.endswith(suffix) for suffix in PROTECTED_SUFFIXES)
+
+
+def remove(rel: str, *, holder: str = "workspace_access",
+           ctx: Optional[Dict[str, Any]] = None,
+           env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Remove one workspace file, and SAY WHAT ACTUALLY HAPPENED.
+
+    The fifth host-face verb (FIX3 F3-12, ruling R-RW-6). Before it, a chat
+    that needed a file gone under `_hq/` had one honest option — leave it —
+    and one dishonest one: `rm` in a device shell, which on a merged seat
+    reaches a different filesystem than the one holding the workspace and
+    reports success either way. The walk left three staging files behind
+    exactly that way.
+
+    Fenced like `write`: inside the workspace, never the runtime cache, never
+    the writer lock, and a protected set (`PROTECTED_NAMES` + the year shards
+    + `.seqhw` / `.source_refs.idx` / lock files) refused outright as
+    `refused_protected`. In `container` mode there is no workspace on this
+    host at all, so the answer is `no_workspace_on_this_host` — never a
+    delete against whatever the container happens to have mounted.
+
+    THE ENVELOPE IS VERIFIED, WHICH IS THE WHOLE POINT. `removed: true` is
+    written only after `exists()` says the path is gone. A mount that refuses
+    the delete gets DEL1's refuse-then-move idiom (`.stale.<epoch>.<pid>`) and
+    the envelope says `moved_to`; a mount that refuses the rename too says
+    `left_in_place: true` and stays `ok: true`, because an honest answer IS
+    the answer — the caller then tells the CEO the file is still there. This
+    verb never raises: it is called mid-operation, and a delete that kills the
+    operation after its real work landed is the bug DEL1 exists to remove.
+    """
+    started = time.time()
+    ctx = resolve(env=env) if ctx is None else ctx
+    refusal = _preflight("remove", ctx, started)
+    if refusal is not None:
+        return refusal
+    target, reason = fence_path(Path(ctx["vm_path"]), rel)
+    if reason == R_REFUSED_PATH:
+        return _refuse("remove", ctx, started, R_REFUSED_PATH, rel=rel,
+                       **_placeholder_line("remove", rel))
+    if reason is not None:
+        # The runtime cache and the lock: refused one fence earlier, reported
+        # here under the name the caller's own rule uses.
+        return _refuse("remove", ctx, started, R_REFUSED_PROTECTED, rel=rel,
+                       detail=reason)
+    if _is_protected(target):
+        return _refuse("remove", ctx, started, R_REFUSED_PROTECTED, rel=rel)
+
+    existed = target.exists()
+    moved_to = None
+    left_in_place = False
+    detail = None
+    try:
+        os.unlink(str(target))
+    except FileNotFoundError:
+        detail = "already gone"
+    except OSError as first:
+        # DEL1's idiom, asked of the module that owns it rather than
+        # re-spelled here: try once more, then rename aside, never raise.
+        try:
+            _ensure_scripts_on_path()
+            from delete_grant import remove_or_move_aside  # type: ignore
+
+            out = remove_or_move_aside(target, "chat remove: " + str(rel))
+        except Exception as exc:  # noqa: BLE001 — never raises, by contract
+            out = {"removed": False, "moved_to": None, "left_in_place": True,
+                   "reason": "{0}: {1}".format(type(exc).__name__, exc)}
+        moved_to = out.get("moved_to")
+        left_in_place = bool(out.get("left_in_place"))
+        detail = out.get("reason") or str(first)
+
+    # VERIFIED. Not "the call returned", not "no exception": the path is gone.
+    gone = not target.exists()
+    removed = gone and not moved_to
+    if not gone and not moved_to:
+        left_in_place = True
+    return _envelope("remove", ctx, started, ok=True, rel=rel,
+                     existed=existed, removed=removed,
+                     moved_to=str(moved_to) if moved_to else None,
+                     left_in_place=bool(left_in_place and not removed),
+                     detail=detail)
+
+
+def _iter_runtime_scripts(root: Path) -> List[Path]:
+    out = []
+    for path in sorted((root / "shared" / "scripts").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        out.append(path)
+    return out
+
+
+def referenced_reference_files(root: Optional[Path] = None) -> List[str]:
+    """Every `references/**` file a shared script NAMES, as workspace-relative
+    paths — the static scan the runtime manifest ships from.
+
+    By NAME rather than by proven open: the scan is a deliberate superset, and
+    the cost of shipping a named-but-unopened plugin document is a few KB while
+    the cost of missing an opened one is a helper that dies in the VM with no
+    network to fetch it. `skills/**/references/` never ships — instructions stay
+    where the model reads them (PLUGIN_BOUNDARY:17-24).
+    """
+    root = plugin_root() if root is None else Path(root)
+    ref_dir = root / "references"
+    if not ref_dir.is_dir():
+        return []
+    available = {p.name for p in ref_dir.iterdir() if p.is_file()}
+    named = set()
+    for path in _iter_runtime_scripts(root):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for match in _REFERENCE_RE.finditer(text):
+            if match.group(1) in available:
+                named.add(match.group(1))
+    return sorted("references/" + name for name in named)
+
+
+#: A shipped script naming a directory or a file BESIDE its own package —
+#: `_HERE.parent / "templates" / "premium_brief.html"`, `_HERE.parent /
+#: "exemplars"`, `Path(__file__).resolve().parent.parent / "config" /
+#: "env_support.json"`. `.parent` off `shared/scripts/` IS `shared/`, so every
+#: quoted segment after it spells a path inside `shared/`.
+_SHARED_ASSET_RE = re.compile(
+    r"""(?:_HERE|ROOT|Path\(__file__\)\.resolve\(\)\.parent)\.parent\s*"""
+    r"""((?:/\s*["'][^"'\n]+["']\s*)+)"""
+)
+_ASSET_SEGMENT_RE = re.compile(r"""["']([^"'\n]+)["']""")
+
+#: Directories under `shared/` that the manifest already ships whole; naming
+#: one again would be harmless but noisy.
+_ALREADY_SHIPPED = ("scripts", "data-schemas")
+
+
+def referenced_shared_assets(root: Optional[Path] = None) -> List[str]:
+    """Every non-`.py` file under `shared/` that a SHIPPED script opens.
+
+    DELIV1 review F-3: the manifest shipped `shared/scripts/**` and
+    `shared/data-schemas/**` and nothing else under `shared/`, so
+    `premium_html.TEMPLATE_PATH` — `shared/templates/premium_brief.html` —
+    was absent from every installed runtime, and the `.html` composer died with
+    `FileNotFoundError` on a merged seat while its `.docx` twin worked. It is
+    not only templates: `exemplars.SEED_ROOT`, `infographic._TEMPLATE_DIR`,
+    `lexicon._LEXICON_DIR` and four `shared/config/*.json` readers were in the
+    same hole. The VM has no network, so a file that does not ship cannot be
+    fetched later — an absent asset is a dead backend, not a slow one.
+
+    DERIVED, never hand-listed: a static scan for the one spelling a shipped
+    script uses to reach out of its own package — `.parent / "<segment>" ...`
+    off the scripts directory — resolved against the tree. A named FILE ships;
+    a named DIRECTORY ships every non-`.py` file under it. Like
+    `referenced_reference_files` this is a deliberate superset: the cost of
+    shipping a named-but-unopened asset is a few KB, the cost of missing an
+    opened one is a backend that cannot run where there is no network.
+    """
+    root = plugin_root() if root is None else Path(root)
+    shared = root / "shared"
+    if not shared.is_dir():
+        return []
+    named: set = set()
+    for path in _iter_runtime_scripts(root):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for match in _SHARED_ASSET_RE.finditer(text):
+            segments = _ASSET_SEGMENT_RE.findall(match.group(1))
+            if not segments or segments[0] in _ALREADY_SHIPPED:
+                continue
+            if any("/" in seg or "\\" in seg or seg in ("..", ".")
+                   for seg in segments):
+                continue
+            candidate = shared.joinpath(*segments)
+            try:
+                inside = candidate.resolve().relative_to(shared.resolve())
+            except (OSError, ValueError):
+                continue
+            if not str(inside):
+                continue
+            if candidate.is_file():
+                if candidate.suffix != ".py":
+                    named.add(candidate.relative_to(root).as_posix())
+            elif candidate.is_dir():
+                for child in sorted(candidate.rglob("*")):
+                    if (child.is_file() and child.suffix != ".py"
+                            and "__pycache__" not in child.parts):
+                        named.add(child.relative_to(root).as_posix())
+    return sorted(named)
+
+
+def runtime_file_set(root: Optional[Path] = None) -> List[str]:
+    """Every file the runtime ships, as plugin-relative posix paths.
+
+    `shared/scripts/**`, `shared/data-schemas/**`, `shared/templates/**`, the
+    other `shared/**` assets a shipped script opens (`referenced_shared_assets`
+    — DELIV1 review F-3), the named `references/**` files, and
+    `.claude-plugin/plugin.json`. NOT `skills/` — ever.
+    """
+    root = plugin_root() if root is None else Path(root)
+    rels: List[str] = []
+    for path in _iter_runtime_scripts(root):
+        rels.append(path.relative_to(root).as_posix())
+    for sub in ("data-schemas", "templates"):
+        asset_dir = root / "shared" / sub
+        if asset_dir.is_dir():
+            for path in sorted(asset_dir.rglob("*")):
+                if path.is_file() and "__pycache__" not in path.parts:
+                    rels.append(path.relative_to(root).as_posix())
+    rels.extend(referenced_shared_assets(root))
+    rels.extend(referenced_reference_files(root))
+    plugin_json = root / ".claude-plugin" / "plugin.json"
+    if plugin_json.is_file():
+        rels.append(".claude-plugin/plugin.json")
+    return sorted(set(rels))
+
+
+def plugin_version(root: Optional[Path] = None) -> Optional[str]:
+    root = plugin_root() if root is None else Path(root)
+    try:
+        payload = json.loads((root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    version = payload.get("version")
+    return version if isinstance(version, str) else None
+
+
+def build_manifest(root: Optional[Path] = None) -> Dict[str, Any]:
+    """`{plugin_version, source_commit, built_at, files:{rel: sha256}}`."""
+    root = plugin_root() if root is None else Path(root)
+    files = {}
+    for rel in runtime_file_set(root):
+        files[rel] = _sha256_file(root / rel)
+    return {
+        "plugin_version": plugin_version(root),
+        "source_commit": _source_commit(root),
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "files": files,
+    }
+
+
+def manifest_sha(manifest: Dict[str, Any]) -> str:
+    """A stable digest of the manifest's FILE SET, not of the manifest document.
+
+    `built_at` changes on every build; the thing `expect` and `discover` compare
+    must not. So the digest is over the sorted `rel:sha256` pairs alone.
+    """
+    body = "\n".join(f"{rel}:{sha}" for rel, sha in sorted((manifest.get("files") or {}).items()))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _source_commit(root: Path) -> Optional[str]:
+    try:
+        proc = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    out = (proc.stdout or "").strip()
+    return out if proc.returncode == 0 and out else None
+
+
+def _device_join(device_path: str, *parts: str) -> str:
+    """A path under the folder as the CUSTOMER's computer spells it: a Windows
+    drive path joins with backslashes, anything else with slashes."""
+    base = str(device_path).rstrip("/\\")
+    if len(base) >= 2 and base[1] == ":":
+        return "\\".join([base.replace("/", "\\")] + [p.replace("/", "\\") for p in parts])
+    return "/".join([base] + list(parts))
+
+
+def install(out_dir: Path, root: Optional[Path] = None,
+            ws: Optional[str] = None, device_path: Optional[str] = None) -> Dict[str, Any]:
+    """Build ONE zip holding the runtime plus its manifest; return the plan.
+
+    One zip rather than N files because `device_commit_files` caps at 50 files
+    per call and the runtime is 270+; `unzip` is present in the VM.
+    """
+    root = plugin_root() if root is None else Path(root)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = build_manifest(root)
+    version = manifest.get("plugin_version") or "unknown"
+    zip_name = f"cr-runtime-{version}.zip"
+    zip_path = out_dir / zip_name
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for rel in sorted(manifest["files"]):
+            zf.write(root / rel, rel)
+        zf.writestr(MANIFEST_NAME, json.dumps(manifest, indent=2, sort_keys=True))
+    sha = manifest_sha(manifest)
+    out = {
+        "zip": str(zip_path),
+        "zip_name": zip_name,
+        "version": version,
+        "manifest_sha": sha,
+        "file_count": len(manifest["files"]),
+        "device_commit_files": [{
+            "stagedPath": str(zip_path),
+            # `install` runs in the container, which has no workspace — so the
+            # target carries the WS the model already holds from `discover`.
+            # cr1#651: the commit tool takes the folder as the customer's computer
+            # names it (the connected folder), never the sandbox path discover
+            # answers with; `device_path` is that, when the caller has it.
+            "devicePath": (_device_join(device_path, RUNTIME_CACHE_REL, zip_name) if device_path
+                           else f"{ws or '$WS'}/{RUNTIME_CACHE_REL}/{zip_name}"),
+        }],
+    }
+    if ws:
+        # RESTAGE1 (cr1#635): the verify line for THIS workspace, ready to run,
+        # so a scheduled run restages without hand-substituting a placeholder.
+        out["verify_line"] = verify_command({"vm_path": ws}, version=version,
+                                            zip_name=zip_name, manifest_sha=sha)
+    return out
+
+
+def expect(root: Optional[Path] = None) -> Dict[str, Any]:
+    manifest = build_manifest(root)
+    return {
+        "plugin_version": manifest.get("plugin_version"),
+        "manifest_sha": manifest_sha(manifest),
+        "file_count": len(manifest.get("files") or {}),
+    }
+
+
+def verify_stage(stage: Path) -> Dict[str, Any]:
+    """Recompute every sha in a staged runtime; write `current.json` on a FULL
+    match and only then.
+
+    A partial match is a modified runtime, which is a foreign write into plugin
+    code — `PLUGIN_BOUNDARY.md:140` ("Customer → Plugin: NEVER") forbids it, and
+    a half-verified runtime that runs is worse than one that refuses.
+    """
+    stage = Path(stage).resolve()
+    try:
+        manifest = json.loads((stage / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "reason": "manifest_unreadable", "detail": str(exc),
+                "stage": str(stage)}
+    mismatched: List[str] = []
+    missing: List[str] = []
+    for rel, sha in sorted((manifest.get("files") or {}).items()):
+        path = stage / rel
+        if not path.is_file():
+            missing.append(rel)
+            continue
+        if _sha256_file(path) != sha:
+            mismatched.append(rel)
+    version = manifest.get("plugin_version") or stage.name
+    sha = manifest_sha(manifest)
+    if missing or mismatched:
+        return {"ok": False, "reason": "manifest_mismatch", "stage": str(stage),
+                "version": version, "manifest_sha": sha,
+                "missing": missing[:10], "mismatched": mismatched[:10],
+                "missing_count": len(missing), "mismatched_count": len(mismatched),
+                "current_written": False}
+    pointer = stage.parent / CURRENT_POINTER
+    record: Dict[str, Any] = {"version": version, "manifest_sha": sha}
+    if stage.name != version:
+        # IDENT1 I-7: a suffixed stage (`<version>-<sha8>`) is named, so every
+        # reader follows the pointer to it; a bare stage writes today's bytes.
+        record["dir"] = stage.name
+    try:
+        pointer.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "reason": "pointer_write_failed", "detail": str(exc),
+                "stage": str(stage), "version": version, "manifest_sha": sha,
+                "current_written": False}
+    return {"ok": True, "stage": str(stage), "version": version,
+            "manifest_sha": sha, "file_count": len(manifest.get("files") or {}),
+            "current_written": True}
+
+
+def verify_command(ctx: Dict[str, Any], version: Optional[str] = None,
+                   zip_name: Optional[str] = None,
+                   manifest_sha: Optional[str] = None) -> str:
+    """The one-liner the model pastes into the device shell after committing the
+    zip. Unzips, then hands verification to the runtime's own code — no `rm`,
+    no `unlink`, nothing that a no-delete mount would refuse.
+
+    IT NEVER OVERWRITES (IDENT1 I-7, ruling R-M3-7). On 2026-09-22 `unzip -o`
+    into the existing version directory printed "cannot delete old ...
+    Operation not permitted" for every file on a mount that cannot unlink,
+    and the chat hand-copied 31 files instead. So the unzip goes into a
+    FRESH directory, and fresh means one that does not exist at all
+    (cr1#1464 P4 follow-up): `stage_dir_names` lists the names in order, the
+    bare `<version>` first, then `<version>-<manifest sha[:8]>`, then
+    `<version>-<8 hex of the digest and a count>`, and the first free one
+    is taken. A folder an unzip left cut short is never reused: `-n` would
+    skip its truncated file and `verify` would fail on it until the build
+    changed. `-n` stays (it never replaces a file).
+
+    ONE EXCEPTION, so a re-run never copies the runtime again: when
+    `current.json` already names a verified folder of THIS build (its
+    `manifest_sha` is this digest and the folder holds its manifest), the
+    line re-verifies that folder; `-n` skips every file already there.
+
+    A cut-short folder has no manifest (the zip writes it last), and the
+    weekly tidy moves only folders with one, so those stay until a later
+    tidy change retires them. Every name keeps the `<version>-<8 hex>`
+    shape that tidy reads. `verify --stage` writes `current.json` naming
+    the directory it verified, and every reader follows the pointer. Where
+    this process can see the cache the directory is decided here; where it
+    cannot (the container) the line decides in the shell, the same way.
+    With every name taken the line stops and says so."""
+    version = version or plugin_version() or "unknown"
+    zip_name = zip_name or f"cr-runtime-{version}.zip"
+    if not manifest_sha:
+        try:
+            manifest_sha = expect().get("manifest_sha")
+        except Exception:  # noqa: BLE001 - a missing digest names no suffix
+            manifest_sha = None
+    names = stage_dir_names(version, manifest_sha)
+    ws = ctx.get("vm_path")
+    tail = ('unzip -n -q "{zip}" -d "{d}" && '
+            'python3 "{d}/shared/scripts/workspace_access.py" verify --stage "{d}"')
+    if ws and Path(str(ws)).is_dir():
+        cache_dir = Path(str(ws)) / RUNTIME_CACHE_REL
+        d = _verified_stage_of(cache_dir, version, manifest_sha) or next(
+            (n for n in names if not (cache_dir / n).exists()), None)
+        if d is not None:
+            return (f'cd "{ws}/{RUNTIME_CACHE_REL}" && '
+                    + tail.format(zip=zip_name, d=d))
+    ws = ws or '$HOME/mnt/<workspace basename>'
+    cache = f'"{ws}/{RUNTIME_CACHE_REL}"'
+    listed = " ".join(f'"{n}"' for n in names)
+    # The pointer `verify --stage` writes is `json.dumps` of
+    # {version, manifest_sha[, dir]}, so its two fields read with grep and sed.
+    reuse = ""
+    if manifest_sha and re.fullmatch(r"[0-9a-f]+", str(manifest_sha)):
+        reuse = (f'if grep -q \'"manifest_sha": "{manifest_sha}"\' {CURRENT_POINTER} 2>/dev/null; then '
+                 f'r=$(sed -n \'s/.*"dir": "\\([^"]*\\)".*/\\1/p\' {CURRENT_POINTER}); '
+                 f'[ -n "$r" ] || r="{version}"; [ -e "$r/{MANIFEST_NAME}" ] || r=""; fi; ')
+    return (f'cd {cache} && {{ r=""; {reuse}if [ -n "$r" ]; then d="$r"; else '
+            f'for d in {listed}; do [ -e "$d" ] || break; done; '
+            f'if [ -e "$d" ]; then echo "{STAGE_NAMES_TAKEN_LINE}" >&2; false; fi; fi && '
+            + tail.format(zip=zip_name, d="$d") + "; }")
+
+
+def _verified_stage_of(cache_dir: Path, version: str, manifest_sha: Optional[str]) -> Optional[str]:
+    """The folder `current.json` names when it is a verified copy of THIS
+    build (same `manifest_sha`, the folder holds its manifest), else None:
+    a re-run re-verifies it instead of copying the runtime again."""
+    if not manifest_sha:
+        return None
+    try:
+        pointer = json.loads((cache_dir / CURRENT_POINTER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(pointer, dict) or pointer.get("manifest_sha") != manifest_sha:
+        return None
+    folder = pointer.get("dir") or version
+    if (not isinstance(folder, str) or not folder or Path(folder).name != folder
+            or not (cache_dir / folder / MANIFEST_NAME).exists()):
+        return None
+    return folder
+
+
+#: cr1#1464 P4 follow-up: how many names `verify_command` may try for one
+#: build before it stops. Each taken name is a folder an earlier unzip of the
+#: same build left cut short (a re-run of a verified build reuses its folder).
+STAGE_DIR_TRIES = 12
+STAGE_NAMES_TAKEN_LINE = ("Every folder name for this build is taken by an unzip that did not "
+                          "finish, so it cannot be installed again here. Say report a bug.")
+
+
+def stage_dir_names(version: str, manifest_sha: Optional[str]) -> List[str]:
+    """The folder names one build may unzip into, in order: the bare
+    `<version>`, `<version>-<sha[:8]>`, then `<version>-<8 hex>` from the
+    digest and a count. Every name after the first matches the weekly
+    tidy's stage pattern, so the tidy reads its version from the name when
+    the folder has no manifest. Pure."""
+    seed = str(manifest_sha or "stage")
+    out = [version, f"{version}-{seed[:8]}"]
+    for n in range(1, STAGE_DIR_TRIES - 1):
+        out.append(f"{version}-{hashlib.sha256(f'{seed}:{n}'.encode('utf-8')).hexdigest()[:8]}")
+    return out
+
+
+#: A forwarded value may be pasted unquoted when it is made of these. Anything
+#: else is double-quoted; anything shell-active is refused outright.
+_PLAIN_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+$")
+#: Characters that can end the quoting or start a substitution. A workspace
+#: path, a derived id, a run mode: none of them legitimately contains one, so a
+#: value that does is a mangled paste or an injection and is refused, never
+#: escaped. (Escaping is a second contract to get right; refusing is one.)
+_UNSAFE_VALUE_CHARS = ('"', "'", "`", "$", "\\", "\n", "\r", "\x00")
+
+
+class ForwardRefused(ValueError):
+    """A forwarded env value could not be rendered safely — `bad_args`."""
+
+    def __init__(self, key: str, detail: str):
+        super().__init__(f"{key}: {detail}")
+        self.key = key
+        self.detail = detail
+
+
+def _derived_writer_pair(ctx: Dict[str, Any],
+                         env: Dict[str, str]) -> Dict[str, str]:
+    """`{CR_WRITER_ID, CR_WRITER_DERIVATION}` derived HERE, or `{}`.
+
+    The container is the process that holds `CLAUDE_CODE_ACCOUNT_UUID`; the
+    helper child runs on the device host and has never seen it (breakdown §A.1
+    row 105), which is why every receipt the gate walk wrote carried a session
+    token instead of the writer id. So the derivation happens in this process
+    and only its OUTPUT crosses: the `acct-…` id and a digest of the inputs.
+    The uuid itself is never rendered into a command, a transcript or a file
+    (ruling R-FIX-5).
+
+    The basename is the workspace's, wherever this process can see it: the
+    resolved context first, then the device path the preamble exported, then
+    `CR_WORKSPACE`. It must match what `writer_id()` derives beside the data,
+    and all three name the same folder.
+    """
+    account = str(env.get("CLAUDE_CODE_ACCOUNT_UUID", "")).strip()
+    if not account:
+        return {}
+    basename = str(ctx.get("basename") or "").strip()
+    from_export = False
+    if not basename:
+        for key in ("CR_DEVICE_WORKSPACE", "CR_WORKSPACE"):
+            raw = str(env.get(key, "")).strip().rstrip("/\\")
+            if raw:
+                basename = PurePosixPath(raw.replace("\\", "/")).name
+                from_export = True
+                break
+    try:
+        _ensure_scripts_on_path()
+        import writer_identity  # type: ignore
+
+        if writer_identity.detected_mode(env) in writer_identity.LEGACY_ID_MODES:
+            # A seat that keeps today's identities byte for byte forwards
+            # nothing — the same fence `writer_id()` applies at the far end.
+            return {}
+    except Exception:  # noqa: BLE001 — identity never blocks a rendered command
+        return {}
+    # PLANID1 (cr1#518): only a seat that forwards a pair remembers or
+    # recalls the basename; a legacy seat's scratch is never touched. Only an
+    # EXPORTED folder is remembered: a resolved context's basename is this
+    # host's own workspace and needs no memory, and a caller handing a ctx
+    # (a suite) must not seed the session's scratch with its folder.
+    if basename:
+        if from_export:
+            _remember_basename(basename, env)
+    else:
+        basename = _remembered_basename(env)
+    if not basename:
+        return {}
+    try:
+        org = str(env.get("CLAUDE_CODE_ORGANIZATION_UUID", "")).strip() or None
+        return {
+            "CR_WRITER_ID": writer_identity.derive(account, basename, org),
+            "CR_WRITER_DERIVATION": writer_identity.derivation_digest(
+                account, basename, org),
+        }
+    except Exception:  # noqa: BLE001 — identity never blocks a rendered command
+        return {}
+
+
+def _computer_mark_to_forward(env: Dict[str, str]) -> Optional[str]:
+    """The computer mark this rendered command carries, or None (cr1#922).
+
+    A handed mark (`CR_COMPUTER_MARK`, already derived) crosses if it is
+    well formed; a device name (`CR_DEVICE_NAME`) is derived here and
+    remembered for the session; with neither, the session's remembered mark.
+    A seat that exports neither and never did forwards nothing, so its
+    rendered lines are byte-identical to before. Never raises."""
+    try:
+        _ensure_scripts_on_path()
+        import computer_mark  # type: ignore
+    except Exception:  # noqa: BLE001 - no module, no mark
+        return None
+    try:
+        handed = str(env.get(computer_mark.MARK_ENV, "")).strip()
+        if handed:
+            return handed if computer_mark.is_mark(handed) else None
+        derived = computer_mark.derive(
+            str(env.get(computer_mark.DEVICE_NAME_ENV, "")))
+        if derived:
+            _remember_scratch(COMPUTER_MARK_CACHE_NAME, derived, env)
+            return derived
+        recalled = _recall_scratch(COMPUTER_MARK_CACHE_NAME, env)
+        return recalled if computer_mark.is_mark(recalled) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _account_mark_to_forward(env: Dict[str, str]) -> Optional[str]:
+    """The account mark this rendered command carries, or None (cr1#1138).
+
+    A handed mark (`CR_ACCOUNT_MARK`) crosses if it is well formed and is
+    never replaced; else it is derived from the account uuid in this process.
+    A seat whose mode keeps today's identities forwards none, the fence the
+    writer pair already applies. Never raises."""
+    try:
+        _ensure_scripts_on_path()
+        import schedule_holder  # type: ignore
+        import writer_identity  # type: ignore
+    except Exception:  # noqa: BLE001 - no module, no mark
+        return None
+    try:
+        handed = str(env.get(schedule_holder.ACCOUNT_MARK_ENV, "")).strip()
+        if handed:
+            return handed if schedule_holder.is_account_mark(handed) else None
+        if not str(env.get(schedule_holder.ACCOUNT_ENV, "")).strip():
+            return None
+        if writer_identity.detected_mode(env) in writer_identity.LEGACY_ID_MODES:
+            return None
+        return schedule_holder.derive_account_mark(
+            env.get(schedule_holder.ACCOUNT_ENV))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _scratch_file(name: str, env: Dict[str, str]) -> Optional[Path]:
+    try:
+        _ensure_scripts_on_path()
+        import delete_grant  # type: ignore
+
+        path, _anchor = delete_grant.session_scratch_file(name, env)
+    except Exception:  # noqa: BLE001
+        return None
+    return path
+
+
+def _remember_scratch(name: str, value: str, env: Dict[str, str]) -> None:
+    path = _scratch_file(name, env)
+    if path is None:
+        return
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8").strip() == value:
+            return
+        path.write_text(value, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _recall_scratch(name: str, env: Dict[str, str]) -> Optional[str]:
+    path = _scratch_file(name, env)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _basename_cache(env: Dict[str, str]) -> Optional[Path]:
+    """This session's own scratch file for the basename, or None when nothing
+    names the session (no scratch, no memory). Resolved by
+    `delete_grant.session_scratch_file`: the merged container has no
+    `CLAUDE_CODE_TMPDIR`, so the session id or the container's own temp
+    directory is what anchors it there. Never a path inside the workspace."""
+    try:
+        _ensure_scripts_on_path()
+        import delete_grant  # type: ignore
+
+        path, _anchor = delete_grant.session_scratch_file(
+            BASENAME_CACHE_NAME, env)
+    except Exception:  # noqa: BLE001 - no resolver, no memory
+        return None
+    return path
+
+
+def _clean_basename(value: str) -> Optional[str]:
+    value = str(value or "").strip()
+    if (not value or len(value) > 255 or value in (".", "..")
+            or any(c in value for c in "/\\\n\r\x00")):
+        return None
+    return value
+
+
+def _remember_basename(basename: str, env: Dict[str, str]) -> None:
+    """PLANID1: best effort - a scratch that cannot be written never blocks."""
+    path = _basename_cache(env)
+    clean = _clean_basename(basename)
+    if path is None or clean is None:
+        return
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8").strip() == clean:
+            return
+        path.write_text(clean, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _remembered_basename(env: Dict[str, str]) -> Optional[str]:
+    path = _basename_cache(env)
+    if path is None:
+        return None
+    try:
+        return _clean_basename(path.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+
+
+def plan_identity_missing(verb: str, ctx: Dict[str, Any],
+                          env: Optional[Dict[str, str]] = None) -> bool:
+    """PLANID1 (cr1#518): True when `plan` is asked for a WRITE in the
+    container, which holds an account to derive from, keeps no legacy identity, and could not
+    put a writer pair in front of the line. Pasting that line can only end in
+    `writer_identity_required` at the door, so `plan` refuses it first."""
+    if verb not in PLAN_WRITE_VERBS or ctx.get("mode") != CONTAINER:
+        # Only the container: there the door can never run on this host, so
+        # the line can only go to a device that holds no account. A legacy
+        # or local seat's door derives the writer beside the data itself.
+        return False
+    env = dict(os.environ) if env is None else dict(env)
+    if not str(env.get("CLAUDE_CODE_ACCOUNT_UUID", "") or "").strip():
+        return False
+    try:
+        _ensure_scripts_on_path()
+        import writer_identity  # type: ignore
+
+        if writer_identity.detected_mode(env) in writer_identity.LEGACY_ID_MODES:
+            return False
+    except Exception:  # noqa: BLE001 - no mode read is no verdict
+        return False
+    return not forward_env(ctx, env).get("CR_WRITER_ID")
+
+
+def plan_on_device_without_identity(verb: str, ctx: Dict[str, Any],
+                                    env: Optional[Dict[str, str]] = None
+                                    ) -> bool:
+    """PLANID1 (cr1#518): True when `plan` for a WRITE runs on the DEVICE
+    (this file is the staged runtime beside the folder, VM mode) and no
+    writer can be named here. The device never holds the account uuid, so a
+    line rendered here forwards nothing, and `_device_origin_refusal` refuses
+    it on this same host; `plan` gives that verdict first, with the same
+    hint (render the plan in the container)."""
+    if verb not in PLAN_WRITE_VERBS or ctx.get("mode") != VM:
+        return False
+    if _running_from_runtime_cache() is None:
+        return False
+    env = dict(os.environ) if env is None else dict(env)
+    if forward_env(ctx, env).get("CR_WRITER_ID"):
+        return False
+    return not _identity_available(env)
+
+
+def _handed_writer_pair(env: Dict[str, str]) -> Dict[str, str]:
+    """The shape-checked pair in this environment, or `{}`."""
+    try:
+        _ensure_scripts_on_path()
+        import writer_identity  # type: ignore
+
+        if writer_identity.detected_mode(env) in writer_identity.LEGACY_ID_MODES:
+            return {}
+        pair = writer_identity.forwarded_pair(env)
+    except Exception:  # noqa: BLE001 - identity never blocks a rendered command
+        return {}
+    if not pair:
+        return {}
+    return {"CR_WRITER_ID": pair[0], "CR_WRITER_DERIVATION": pair[1]}
+
+
+def plan_origin(forward: Dict[str, str]) -> Optional[str]:
+    """`device` when this file is the staged runtime, `container` when it is a
+    plugin root and an identity crosses with the line, else None (a legacy or
+    local seat's line is exactly today's)."""
+    if _running_from_runtime_cache() is not None:
+        return PLAN_ORIGIN_DEVICE
+    if forward.get("CR_WRITER_ID"):
+        return PLAN_ORIGIN_CONTAINER
+    return None
+
+
+def _origin_fields(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """`{plan_origin, identity_forwarded}` for a door's envelope - only when
+    the line was rendered by a `plan` that stamped its origin, so a legacy
+    seat's envelope keeps today's shape."""
+    source = dict(os.environ if env is None else env)
+    origin = str(source.get(PLAN_ORIGIN_ENV, "") or "").strip()
+    if not origin:
+        return {}
+    try:
+        _ensure_scripts_on_path()
+        import writer_identity  # type: ignore
+
+        forwarded = writer_identity.forwarded_pair(source) is not None
+    except Exception:  # noqa: BLE001
+        forwarded = False
+    return {"plan_origin": origin, "identity_forwarded": forwarded}
+
+
+def _identity_available(env: Optional[Dict[str, str]] = None) -> bool:
+    """Can a writer on this host be NAMED at all? A shape-checked forwarded
+    pair (what a container-rendered line carries), or an account uuid this
+    process could derive one from. Nothing else counts: a VM seat never
+    reads its identity off the synced file (D-1)."""
+    source = dict(os.environ if env is None else env)
+    if str(source.get("CLAUDE_CODE_ACCOUNT_UUID", "") or "").strip():
+        return True
+    try:
+        _ensure_scripts_on_path()
+        import writer_identity  # type: ignore
+
+        return writer_identity.forwarded_pair(source) is not None
+    except Exception:  # noqa: BLE001 - an unreadable pair is no pair
+        return False
+
+
+def _device_origin_refusal(verb: str, ctx: Dict[str, Any], started: float,
+                           env: Optional[Dict[str, str]] = None
+                           ) -> Optional[Dict[str, Any]]:
+    """A WRITE on a VM seat with no identity, refused by name - the run log
+    then says WHY there is no writer (Probe B defect 1).
+
+    WIDENED by BRIEFDOOR1 MUST 5 (ruling R-RW3-8). It used to refuse only a
+    line stamped `CR_PLAN_ORIGIN=device`; a hand-typed line with no origin
+    stamp and no pair walked through it and wrote under whatever the child
+    could mint. Now a VM seat with NO identity available at all refuses for
+    `write`, `append_jsonl` and `run_writer`, whatever the origin stamp says.
+    Legacy and local seats are not `vm` mode: unchanged."""
+    fields = _origin_fields(env)
+    if ctx.get("mode") != VM:
+        return None
+    if fields.get("plan_origin") != PLAN_ORIGIN_DEVICE or fields.get(
+            "identity_forwarded"):
+        if _identity_available(env):
+            return None
+    try:
+        _ensure_scripts_on_path()
+        import receipts as _receipts  # type: ignore
+
+        line = _receipts.WRITER_IDENTITY_REQUIRED_LINE
+    except Exception:  # noqa: BLE001
+        line = ""
+    return _refuse(verb, ctx, started, R_WRITER_IDENTITY_REQUIRED, line=line,
+                   hint=RENDER_IN_CONTAINER_HINT, **fields)
+
+
+def forward_env(ctx: Optional[Dict[str, Any]] = None,
+                env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """The variables that cross the door with a rendered command, in order.
+
+    Two derived here (the writer pair) and two passed through when the
+    container's environment carries them: `CR_FIRED_VIA`, so the helper child
+    can tell a scheduled fire from a typed one without guessing (F2-4), and
+    `CR_DEVICE_WORKSPACE`, so a landed file can name its path on the
+    customer's own computer instead of a breadcrumb (F2-6).
+    """
+    ctx = resolve() if ctx is None else ctx
+    env = dict(os.environ) if env is None else dict(env)
+    out: Dict[str, str] = dict(_derived_writer_pair(ctx, env))
+    if not out:
+        # IDENT1 I-11 / I-9: no account here to derive from, but the fire was
+        # HANDED a pair (the one the registering seat baked into its prompt,
+        # exported in this shell). It crosses exactly as a derived one would;
+        # a seat that keeps today's identities forwards nothing.
+        out.update(_handed_writer_pair(env))
+    mark = _computer_mark_to_forward(env)
+    if mark:
+        out["CR_COMPUTER_MARK"] = mark
+    account = _account_mark_to_forward(env)
+    if account:
+        out["CR_ACCOUNT_MARK"] = account
+    for key in ("CR_FIRED_VIA", "CR_DEVICE_WORKSPACE", "CR_TRIGGERED_BY"):
+        value = str(env.get(key, "")).strip()
+        if not value:
+            continue
+        if key == DEVICE_WORKSPACE_ENV:
+            # A WINDOWS PATH IS THE ORDINARY CASE (re-verifier B-1). The
+            # preamble and the bootloader both tell the model to export this
+            # value exactly as `get_device_info` spells it, and on Windows
+            # that is `C:\\Users\\...\\<Workspace>`. The renderer below
+            # refuses a backslash outright, so without this line the first
+            # `plan` on a Windows merged seat answers `bad_args` and rule 3
+            # stops the whole seat. Forward slashes are also what both
+            # consumers want: `deliverables.device_join` forward-slashes its
+            # base anyway, and `brief_path.get_brief_artifact_url` re-spells
+            # the drive letter with backslashes when it builds the opener.
+            # The same judgement `_derived_writer_pair` already makes one
+            # function away about the basename. Quotes, newlines and shell
+            # expansions are still refused.
+            value = value.replace(chr(92), "/")
+        out[key] = value
+    return {k: out[k] for k in FORWARD_ENV_KEYS if k in out}
+
+
+def render_env_prefix(forward: Dict[str, str]) -> str:
+    """`KEY=value KEY="value with a space" ` — or `""` when nothing crosses."""
+    parts = []
+    for key in FORWARD_ENV_KEYS:
+        if key not in forward:
+            continue
+        value = str(forward[key])
+        bad = [c for c in _UNSAFE_VALUE_CHARS if c in value]
+        if bad:
+            raise ForwardRefused(key, "value carries a quote, a backslash, a "
+                                      "newline or a shell expansion")
+        parts.append(f"{key}={value}" if _PLAIN_VALUE_RE.match(value)
+                     else f'{key}="{value}"')
+    return (" ".join(parts) + " ") if parts else ""
+
+
+def plan(verb: str, args_json: str, ctx: Optional[Dict[str, Any]] = None,
+         env: Optional[Dict[str, str]] = None) -> str:
+    """The exact command string for one verb — pasted verbatim, never retyped.
+
+    It may now begin with an env prefix (`forward_env`). The preamble's rule 3
+    says "paste what it prints, verbatim — including the variables in front of
+    `python3`", because those variables ARE the identity and the run mode
+    crossing to the host that holds the data.
+    """
+    ctx = resolve() if ctx is None else ctx
+    # MF-17: in the container the ctx carries no staged root (there is no mount
+    # to resolve it from); the discovery JSON does, and the bootloader exports it
+    # as CR_STAGED_ROOT beside CR_DEVICE_WORKSPACE. `$RT` survives only for the
+    # in-shell (legacy / local) render, where Step 1 defined it.
+    staged = (ctx.get("staged_root")
+              or (env if env is not None else os.environ).get("CR_STAGED_ROOT")
+              or "$RT")
+    compact = args_json
+    try:
+        compact = json.dumps(json.loads(args_json), sort_keys=True)
+    except Exception:
+        pass
+    forward = forward_env(ctx, env)
+    prefix = render_env_prefix(forward)
+    origin = plan_origin(forward)
+    if origin:
+        prefix = f"{PLAN_ORIGIN_ENV}={origin} " + prefix
+    # The WHOLE path is inside one pair of double quotes: a workspace basename
+    # with a space in it is the ordinary case, not the exotic one.
+    # INBOXDRIVE1 review F-3: the payload rides in single quotes, and a mail
+    # body or a draft with an apostrophe ("I'll") closed them early - the
+    # pasted line answered `bad_args` or died in the shell. POSIX escape: end
+    # the quote, an escaped quote, reopen (`'\''`).
+    quoted = compact.replace("'", "'\\''")
+    return (f'{prefix}python3 "{staged}/shared/scripts/workspace_access.py" {verb} '
+            f"--json '{quoted}'")
+
+
+#: BRIDGE3 (Train 2b §5 MUST 2, F-T2-9) - the keys a runtime check adds to a
+#: `discover` answer. Never part of `DISCOVER_KEYS`: the plain answer (and
+#: the block the bootloader carries) keeps its ten keys.
+RUNTIME_CHECK_KEYS = ("plugin_manifest_sha", "runtime_lags", "lags_line")
+
+#: BRIDGE3 (Train 2b §5 MUST 2, F-T2-9) - the ONE sentence a seat whose
+#: runtime beside the folder lags this plugin says, after one restage failed
+#: to bring it current. No sha, no path; the phrase to type is the update's.
+RUNTIME_LAGS_LINE = (
+    "Command Room in your folder is older than the version your Claude app "
+    "has, so nothing was set up. Say `update command room` first, then ask "
+    "again."
+)
+
+
+def runtime_lags(answer: Optional[Dict[str, Any]], plugin_sha: Optional[str]) -> bool:
+    """True when the runtime a `discover` answer names is absent, or its
+    `manifest_sha` is not `plugin_sha` (this plugin's own `expect` value)."""
+    answer = answer if isinstance(answer, dict) else {}
+    if not answer.get("runtime_present"):
+        return True
+    if not plugin_sha or not answer.get("manifest_sha"):
+        return True  # REVIEW_T2B_BRIDGE3 N-3: nothing to compare is never current
+    return answer.get("manifest_sha") != plugin_sha
+
+
+def runtime_check(answer: Optional[Dict[str, Any]],
+                  root: Optional[Path] = None) -> Dict[str, Any]:
+    """`answer` plus `RUNTIME_CHECK_KEYS`: this plugin's own `expect`
+    manifest sha, whether the runtime `answer` names lags it, and the one
+    sentence for a seat that still lags after a restage. `answer` is a
+    `discover` answer from either face (the block's JSON or `discover(ctx)`)."""
+    out = dict(answer if isinstance(answer, dict) else {})
+    try:
+        plugin_sha = expect(root).get("manifest_sha")
+    except Exception:  # noqa: BLE001 - no digest cannot vouch for any runtime
+        plugin_sha = None
+    out["plugin_manifest_sha"] = plugin_sha
+    out["runtime_lags"] = runtime_lags(out, plugin_sha)
+    out["lags_line"] = RUNTIME_LAGS_LINE
+    return out
+
+
+def discover(ctx: Optional[Dict[str, Any]] = None, *,
+             check_runtime: bool = False) -> Dict[str, Any]:
+    """The same answer `DISCOVER_BLOCK` prints, computed in-process.
+
+    Two faces, one shape: in the container the block is printed for the device
+    shell (nothing here can see the workspace); on a host that holds the data
+    this returns the JSON directly, which is what makes the contract testable
+    without a device bridge.
+
+    BRIDGE3 (Train 2b §5 MUST 2): `check_runtime` adds `RUNTIME_CHECK_KEYS`
+    (`runtime_check`); the CLI's `discover --compare '<answer>'` adds them to
+    the block's own answer in the process that holds the plugin.
+    """
+    if check_runtime:
+        return runtime_check(discover(ctx))
+    ctx = resolve() if ctx is None else ctx
+    ws = ctx.get("vm_path")
+    out: Dict[str, Any] = {
+        "ws": ws,
+        "basename": ctx.get("basename"),
+        "runtime_present": bool(ctx.get("runtime_version")),
+        "runtime_version": ctx.get("runtime_version"),
+        "manifest_sha": ctx.get("manifest_sha"),
+        "staged_root": ctx.get("staged_root"),
+        "brain_file": ctx.get("brain_file"),
+        "device_path": ctx.get("device_path"),
+        "python": ctx.get("python"),
+        "probes": {"replace_over_existing": None, "unlink": None, "flock": None},
+        "holder": None,
+    }
+    if ws:
+        out["probes"] = _run_probes(Path(ws))
+        out["holder"] = _read_holder(Path(ws))
+    return out
+
+
+def _read_holder(ws: Path) -> Optional[Dict[str, Any]]:
+    """cr1#1138 part 2: the holder file's object, as the block reads it, or
+    None. Read only; any failure is None."""
+    try:
+        h = json.loads((ws / "_hq" / ".system" / "schedule_holder.json")
+                       .read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return h if isinstance(h, dict) else None
+
+
+def _run_probes(ws: Path) -> Dict[str, Any]:
+    """The mount facts, run exactly as the block runs them, and like the block
+    writing nothing in the book (cr1#452: the probe leaves zero files).
+
+    `replace_over_existing` and `unlink` stay None (not measured): testing a
+    delete needs a file to delete, and on a seat that cannot delete that file
+    is what stays behind. `flock` is measured on the anchor file
+    `_hq/data/entities.json`, opened read-only with a shared non-blocking lock;
+    a lock someone else holds (`BlockingIOError`) still proves flock works.
+    The merged mount's answers for the two unmeasured facts were True / False
+    (`P1_RESULT_2026-09-19.md`)."""
+    probes: Dict[str, Any] = {"replace_over_existing": None, "unlink": None, "flock": None}
+    try:
+        import fcntl  # noqa: F401 — absent on Windows, which answers the probe
+        with open(ws / "_hq" / "data" / "entities.json", "rb") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        probes["flock"] = True
+    except BlockingIOError:
+        probes["flock"] = True
+    except Exception:
+        probes["flock"] = False
+    return probes
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+_DATA_VERBS = ("read", "run_helper", "run_writer", "write", "append_jsonl",
+               "remove")
+
+
+def _flag(argv: List[str], name: str) -> Optional[str]:
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return None
+
+
+def _print(payload: Any) -> int:
+    sys.stdout.write(json.dumps(payload, default=str) + "\n")
+    return 0 if (isinstance(payload, dict) and payload.get("ok")) else 1
+
+
+# MF-19 (Night M3 merged-tree review F-1, BLOCKING). The CLI `write` verb read
+# its payload from `text` while every rendered write form in the instruction
+# layer - and this module's own verb table in WORKSPACE_ACCESS.md - passes
+# `data`. `args.get("text")` found nothing, the door wrote "" and I-6's
+# read-back verified the EMPTY payload it was handed: `ok:true, verified:true,
+# bytes_written:0`. That was the 2026-09-22 walk's 0-byte inbox page, read at
+# the time as a mount fault. ONE documented key now (`data`), `text` kept as a
+# legacy alias, `b64` decoded and then met by the text-only fence below; a
+# write that names no payload, or an empty one it did not ask for, is refused
+# with the key named - an empty page is never a landed page.
+WRITE_PAYLOAD_KEY = "data"
+WRITE_PAYLOAD_KEYS = (WRITE_PAYLOAD_KEY, "text", "b64")
+
+
+def _cli_write_payload(args: Dict[str, Any]) -> Tuple[Any, str, Optional[str]]:
+    """`(payload, key read, None)` for a well-formed CLI `write`, else
+    `(None, key, detail)` - the caller refuses `bad_args` with that detail.
+
+    An empty payload is refused unless the call says `allow_empty: true`: every
+    rendered form promises bytes (a page, a config, a list), so "" there is a
+    lost payload, not an intended empty file.
+    """
+    present = [k for k in WRITE_PAYLOAD_KEYS if k in args]
+    if not present:
+        return None, WRITE_PAYLOAD_KEY, (
+            "write needs `data` (the text to land); the call named none of "
+            + " / ".join("`" + k + "`" for k in WRITE_PAYLOAD_KEYS)
+            + ", so nothing was written")
+    if len(present) > 1:
+        return None, present[0], (
+            "write takes ONE payload key; the call named "
+            + ", ".join("`" + k + "`" for k in present))
+    key = present[0]
+    value = args[key]
+    if not isinstance(value, str):
+        return None, key, ("`" + key + "` must be a string, not "
+                           + type(value).__name__)
+    if key == "b64":
+        # MF-M2-1: decoded here, refused below. `write` is text only and
+        # `b64` is not a way round that - see its docstring. A caller that
+        # wants to land a document calls `deliverables.land`, which applies
+        # these same fences by asking this module for them.
+        try:
+            data: Any = base64.b64decode(value)
+        except ValueError as exc:
+            return None, key, "`b64` is not base64: " + str(exc)
+    else:
+        data = value
+    if len(data) == 0 and args.get("allow_empty") is not True:
+        return None, key, (
+            "`" + key + "` is empty, so there is nothing to land; a write that "
+            "means an empty file says `allow_empty: true`")
+    return data, key, None
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        sys.stderr.write("usage: workspace_access.py "
+                         "<discover|expect|install|verify|plan|read|run_helper|"
+                         "run_writer|write|append_jsonl> [--json '<args>']\n")
+        return 2
+    verb = argv[0]
+    started = time.time()
+
+    if verb == "discover":
+        if "--compare" in argv:
+            # BRIDGE3 (Train 2b §5 MUST 2): the block's answer, compared with
+            # THIS plugin's own `expect` where the plugin is.
+            raw = _flag(argv, "--compare")
+            try:
+                handed = json.loads(raw) if raw else None
+            except ValueError:
+                handed = None
+            if not isinstance(handed, dict):
+                sys.stderr.write("discover --compare needs the JSON object the "
+                                 "discover block printed\n")
+                return 2
+            return _print(dict(runtime_check(handed), ok=True))
+        ctx = resolve()
+        if "--block" in argv or (ctx["mode"] == CONTAINER and "--json" not in argv):
+            sys.stdout.write(DISCOVER_BLOCK + "\n")
+            return 0
+        return _print(dict(discover(ctx), ok=True))
+
+    if verb == "expect":
+        return _print(dict(expect(), ok=True))
+
+    if verb == "install":
+        out = _flag(argv, "--out")
+        if not out:
+            sys.stderr.write("install needs --out <dir>\n")
+            return 2
+        return _print(dict(install(Path(out), ws=_flag(argv, "--ws"),
+                                   device_path=_flag(argv, "--device-path")), ok=True))
+
+    if verb == "verify":
+        stage = _flag(argv, "--stage")
+        if stage:
+            return _print(verify_stage(Path(stage)))
+        ctx = resolve()
+        sys.stdout.write(verify_command(ctx) + "\n")
+        return 0
+
+    if verb == "plan":
+        if len(argv) < 2:
+            sys.stderr.write("plan needs a verb\n")
+            return 2
+        # DOORJSON1 (cr1#251): no RecursionError clause here on purpose.
+        # `plan` compacts its --json best-effort and forwards the raw text
+        # when it cannot, so a payload nested past the limit renders a
+        # command the data verb above refuses when it runs; and
+        # `ForwardRefused` subclasses ValueError, so a generic clause before
+        # it would swallow the forwarded-identity refusal and its `key`.
+        plan_ctx = resolve()
+        identity_hint = None
+        if plan_identity_missing(argv[1], plan_ctx):
+            identity_hint = PLAN_IDENTITY_HINT
+        elif plan_on_device_without_identity(argv[1], plan_ctx):
+            identity_hint = RENDER_IN_CONTAINER_HINT
+        if identity_hint:
+            # PLANID1 (cr1#518): a write line with no writer in front of it
+            # is refused at the door every time; stop here, where the fix
+            # (the export, or planning in the container) is one command away.
+            try:
+                _ensure_scripts_on_path()
+                import receipts as _receipts  # type: ignore
+
+                line = _receipts.WRITER_IDENTITY_REQUIRED_LINE
+            except Exception:  # noqa: BLE001
+                line = ""
+            return _print(_refuse("plan", plan_ctx, started,
+                                  R_WRITER_IDENTITY_REQUIRED,
+                                  planned_verb=argv[1], line=line,
+                                  hint=identity_hint))
+        try:
+            rendered = plan(argv[1], _flag(argv, "--json") or "{}", ctx=plan_ctx)
+        except ForwardRefused as exc:
+            # A forwarded value that cannot be rendered safely is a STOP, not a
+            # command with the value escaped or dropped: the model pastes what
+            # this prints, so a half-rendered prefix would write the ledger
+            # under the wrong identity. `ok:false` is the contract's stop.
+            return _print(_refuse("plan", resolve(), started, R_BAD_ARGS,
+                                  detail=str(exc), key=exc.key))
+        sys.stdout.write(rendered + "\n")
+        return 0
+
+    if verb not in _DATA_VERBS:
+        sys.stderr.write(f"unknown verb: {verb}\n")
+        return 2
+
+    ctx = resolve()
+    try:
+        args = json.loads(_flag(argv, "--json") or "{}")
+    except (ValueError, RecursionError) as exc:
+        # DOORJSON1 (cr1#251): a payload nested past the interpreter's limit
+        # raises RecursionError out of json.loads, not ValueError; it is the
+        # same bad argument and gets the same typed refusal, never a traceback
+        # (the args_file path already catches it: see run_writer).
+        return _print(_refuse(verb, ctx, started, R_BAD_ARGS,
+                              detail=f"--json: {type(exc).__name__}: {exc}"[:300]))
+    if not isinstance(args, dict):
+        return _print(_refuse(verb, ctx, started, R_BAD_ARGS,
+                              detail="--json must be an object"))
+
+    if verb == "read":
+        return _print(read(args.get("rel", ""), binary=bool(args.get("binary")), ctx=ctx))
+    if verb == "run_helper":
+        return _print(run_helper(args.get("name", ""), args.get("args") or {},
+                                 timeout_s=int(args.get("timeout_s") or DEFAULT_TIMEOUT_S),
+                                 ctx=ctx, args_file=args.get("args_file")))
+    if verb == "run_writer":
+        return _print(run_writer(args.get("name", ""), args.get("args") or {},
+                                 args_file=args.get("args_file"),
+                                 timeout_s=int(args.get("timeout_s") or DEFAULT_TIMEOUT_S),
+                                 ctx=ctx))
+    if verb == "write":
+        data, key, detail = _cli_write_payload(args)
+        if detail is not None:
+            return _print(_refuse(verb, ctx, started, R_BAD_ARGS,
+                                  rel=args.get("rel", ""), key=key, detail=detail))
+        landed = write(args.get("rel", ""), data, args.get("expected_mtime"),
+                       expected_rev=args.get("expected_rev"),
+                       create_parents=args.get("create_parents"),
+                       holder=args.get("holder") or "workspace_access",
+                       ctx=ctx)
+        if isinstance(landed, dict):
+            landed["payload_key"] = key
+        return _print(landed)
+    if verb == "remove":
+        return _print(remove(args.get("rel", ""),
+                             holder=args.get("holder") or "workspace_access",
+                             ctx=ctx))
+    if "rows" not in args:
+        # IDENT1 I-5. The orchestrator's connector-read form once spelled the
+        # key `pending_rows`, and this verb read `rows`, found none, and
+        # answered ok:true n:0 - a landed-looking append of nothing. A call
+        # that names no rows at all is a malformed call, said so.
+        return _print(_refuse(verb, ctx, started, R_BAD_ARGS,
+                              detail="append_jsonl needs `rows`"))
+    return _print(append_jsonl(args.get("rel", ""), args.get("rows") or [],
+                               holder=args.get("holder") or "workspace_access",
+                               ctx=ctx))
+
+
+__all__ = [
+    "CONTAINER", "COWORK_LEGACY", "LOCAL", "VM", "HOST_MODES", "MODE_FROM_ENV",
+    "DISCOVER_BLOCK", "DISCOVER_KEYS", "PROBE_KEYS", "RUNTIME_CACHE_REL",
+    "RUNTIME_CHECK_KEYS", "RUNTIME_LAGS_LINE", "runtime_check", "runtime_lags",
+    "REGISTERED_JSONL", "REV_FILES", "StaleRead",
+    "FORWARD_ENV_KEYS", "ForwardRefused", "forward_env", "render_env_prefix",
+    "append_jsonl", "build_manifest", "detect_host_mode", "discover", "expect",
+    "fence_path", "find_root_down", "find_root_up", "install", "main",
+    "manifest_modules", "manifest_sha", "plan", "plugin_root", "plugin_version",
+    "read", "referenced_reference_files", "remove", "resolve", "run_helper",
+    "RUN_WRITER_ALLOWLIST", "run_writer",
+    "runtime_cache_dir", "runtime_file_set", "verify_command", "verify_stage",
+    "write",
+]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

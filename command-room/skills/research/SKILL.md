@@ -1,0 +1,264 @@
+---
+name: research
+surfaces: both
+description: "Produce a verified, cited research brief on any company, person, market, or topic — multi-source, adversarially checked — then fold the findings into the CEO's workspace so they compound. Fires on: 'research [company/person/topic]', 'deep dive on [topic]', 'what's the story on [company]', 'look into [topic]', 'recent sentiment on [topic]' / 'last 30 days on [topic]' (recency mode). Owns ALL research intents — including any ask the generic built-in deep-research skill could take. It is workspace-blind: no entity framing, no Tavily/Vibe Prospecting enrichment, findings not saved. Any 'research', 'deep dive on', 'look into', 'background on' phrasing routes HERE. Output: cited brief saved to the project folder, key facts folded into workspace records. Does NOT fire on 'prep me for [meeting]' (call-prep), 'who is [name]' (people-crm), or 'break down this article' (intel-intake — the CEO already has the source)."
+---
+
+## Entity-resolve + canonical-helper enforcement (mandatory, v3.13.8+)
+
+If the skill is invoked with a name-bearing trigger ("research [company]", "background on [person]", "look into [client]"), you MUST call `shared/scripts/entity_resolve.py::resolve_all(workspace_root, query)` FIRST to resolve the named scope to an existing person / org / project before any web search or substrate query. This is what lets the brief say "Acme Co — the prospect from your Northstar intro, last touched 12d ago" instead of treating it as a cold name. See `shared/ENTITY_RESOLVE_PROTOCOL.md` for the full contract. If `resolve_all` returns no match, proceed with research and stub the entity only at save-time via the canonical writers (never hand-edit entities.json).
+
+## Skill Boundary (v2.1)
+
+- **Use research for:** when the CEO needs to learn something that is NOT already in the workspace or their meetings — go find it on the public web (plus optional enrichment), verify it, brief it, and save what matters.
+- **Use `intel-intake` for:** when the CEO already HAS the source — a link, a YouTube URL, a pasted article — and wants it structured. research delegates its save step to intel-intake; intel-intake is the one-way "source → intel" flow, research is the "no source yet → go find one" flow that precedes it.
+- **"what do we know about [X]" routes HERE (research), not intel-intake.** intel-intake carries an internal handler by the same name, but that handler searches ONLY the already-accumulated intel base from inside an intel flow. As a standalone chat trigger the phrase fires research — whose Step 1 reads the same accumulated workspace intel FIRST and goes to the web only for what's missing, so nothing is lost by this routing. A quick-lookup that the workspace fully answers stops there (no web pass needed).
+- **Use `transcript-search` for:** finding what was said inside the CEO's own meeting transcripts. research never searches the meeting corpus; it searches the world.
+- **Use `people-crm` for:** "who is [person]" / "tell me about [person]" lookups scoped to the existing workspace. research delegates to people-crm to RECORD newly-discovered decision-makers, but does not field the lookup intent itself.
+- **Use `call-prep` for:** assembling a pre-meeting brief from existing workspace context. If the CEO says "research [company] before my call", research runs (web + enrichment) and can hand its findings forward; "prep me for my meeting" with no research ask stays with call-prep.
+
+## Writer Contract
+
+research does NOT write substrate directly. It READS and DELEGATES every write to a canonical owner:
+
+- **Reads:** `entities.json` (people / orgs / projects / threads, via `resolve_all`) and `events.jsonl` (recent interactions, prior `intel_logged`, meetings) to frame the question. Defensive reads only — `entities.threads` is the one canonical collection (SPEC DUALKEY1 retired the `projects` spelling; read via `entities_io.entities_collection`), flat and nested shapes both.
+- **Saves findings via `intel-intake`:** verified brief content is handed to intel-intake, which writes the `intel_logged` event and the `_hq/intel/` artifact with entity cross-references. research adds no new event type.
+- **Records decision-makers via `people-crm`:** any person discovered through enrichment is passed to `people_writer` (dedup-first: `find_existing_person` → `update_person` or `create_person`). This is the ONLY place enriched contact PII lands — never loose notes.
+
+**Atomic-write enforcement:** research itself emits no raw writes. All persistence flows through `intel-intake` and `people_writer.py`, which use the atomic helpers (`atomic_append_jsonl`, `atomic_write_json`) per `shared/WORKSPACE_API.md` → Append Protocol. No `open(...).write()` anywhere in this skill.
+
+**Source-of-truth honesty:** every claim in the brief carries its origin — `web`, `enrichment` (Vibe Prospecting), or `workspace`. The brief states which sources were available so the CEO can weigh confidence. Never present an unverified web claim as fact.
+
+## What It Doesn't Do
+
+- Does NOT require any paid MCP. Built-in web search is the always-available, zero-setup floor and the full skill works on it alone. Tavily and Firecrawl (deeper web, Firecrawl also for research papers) and Vibe Prospecting (structured enrichment) are independent detected upgrade branches — each lights up only if the client connected it, and the skill runs clean and labels its depth honestly when either or both are absent.
+- Does NOT bulk-pull enrichment. When Vibe Prospecting is present it enriches only the specific company / people in the question, and surfaces estimated credit cost before any large or multi-entity pull. It never spends the CEO's credits silently.
+- Does NOT save anything without showing it first. The brief is produced and shown; saving to the workspace (intel + contacts) is offered as a confirm-choice, not done automatically.
+- Does NOT draft emails, memos, or replies in the CEO's voice — it produces a research brief (a report). Composition stays with email-writer / memo-writer / one-pager-composer.
+- Does NOT invent sources or fill gaps with plausible guesses. If the web is thin, it says so and flags low confidence rather than padding.
+
+## How to Use
+
+```
+research Acme Co
+look into Acme Co before my call Thursday
+background on Sam Sample
+what do we know about Northstar Partners
+dig into the freight-brokerage market
+pull together research on AI pricing in logistics
+do some research on Acme Co's main competitors
+research brief on warehouse automation vendors
+```
+
+## How It Works
+
+Four steps. Built-in web search is the floor, but it is NOT the default when better tools are connected — actively reach for Tavily and Firecrawl (deeper web) and Vibe Prospecting (structured enrichment) whenever those connectors are present. Settling for built-in web when an upgrade connector is available is the one failure mode this skill must avoid.
+
+### Step 1 — Frame from the workspace (always)
+
+Before searching, resolve the subject against the CEO's own world so the research is aimed, not generic.
+
+1. If the trigger is name-bearing, call `resolve_all(workspace_root, query)`.
+2. If it resolves to a known entity, pull the relevant context — what thread it sits in, last contact, open commitments, prior intel — and let that shape the question. "Research pricing for Acme Co" becomes "research pricing for Acme Co, given they are a mid-stage prospect in the Northstar thread and the last call flagged budget."
+3. If it does not resolve, treat it as a new subject and continue — you may stub the entity at save-time.
+
+### Step 2.0 — Surface the connector tools (mandatory, before any search)
+
+Connector tools are lazy-loaded: **absence from your current tool list is NOT absence from the workspace.** The host loads connector tools on demand, so a tool you don't see in your immediate set may still be connected — and it stays invisible until you explicitly search for it. Inspecting your loaded tools and concluding "Tavily isn't connected" is the exact failure this step exists to prevent: "I didn't reach for it" is not the same as "it isn't connected." So, before choosing any search tier:
+
+1. **Run the host's tool-discovery mechanism now.** In Claude Code, call `ToolSearch` with the queries `tavily`, `firecrawl` (with `max_results` 15, because the default of 5 can leave out the tools below), `firecrawl research papers` and `prospect enrich`; in Cowork, check the full connector tool listing. This is a mechanical action, not a judgment call — run it on every research fire, even when you are sure nothing is connected.
+2. **Record which connectors resolved** — Tavily, Firecrawl, Vibe Prospecting, any combination, or none. Only after this check may you choose a tier.
+3. **The tier you claim must match what this step found.** The source badge (Step 3) and the one-line tier statement in the chat reply both report the tier this step actually resolved — never an assumption.
+
+Skipping this step and defaulting to built-in `WebSearch` is the #1 defect of this skill.
+
+### Step 2 — Search and verify
+
+Use the fan-out research pattern: decompose the question into several angles, search each, **fetch the actual pages** (don't synthesize from snippets), **cross-check every material claim across at least two independent sources**, cite each claim, and tag low-confidence items explicitly. The verify discipline is the same no matter which engine runs underneath.
+
+**Reach for the strongest tools BY DEFAULT — this is the most important rule in this step.** Built-in `WebSearch` / `WebFetch` is the *fallback floor*, not the default. When Step 2.0 resolved an upgrade connector, you MUST use it; do not quietly settle for built-in web just because it is always sitting there and can answer. The whole value of this skill over a plain web search is that it actively reaches for the better tools. One rule follows:
+
+**If you genuinely fall back to built-in web** because Step 2.0 confirmed an upgrade connector really isn't connected, say so in one line of the chat reply (not just the HTML badge): e.g., "Ran on built-in web search — connect Tavily or Firecrawl for deeper results." The CEO should never have to wonder which tier ran.
+
+**Tavily (deeper web) — use whenever the connector is present.** For *any* web research, prefer `tavily_search` (agent-tuned recall, relevance scoring) over built-in `WebSearch`, and `tavily_extract` to pull clean full-page content — it beats `WebFetch` on messy or JS-heavy pages, strengthening the fetch-the-real-page step. For a deep company dive, `tavily_crawl` / `tavily_map` pull a whole site (about, pricing, docs). Tavily's free tier is generous and search is cheap — use it freely; only surface cost intent before a large multi-page `tavily_crawl`. (`tavily_research`, the agentic deep-research endpoint, is an opt-in "deep mode" for big market questions — still hold the cite-everything and cross-check discipline yourself when you use it.) Tavily improves *how well you search the web*; it does not replace the verify discipline or the workspace framing.
+
+**Firecrawl (deeper web and research papers) — use whenever the connector is present** (cr1 #735). Use `firecrawl_search` for discovery and `firecrawl_scrape` to pull a clean full page, the same job as `tavily_extract` and a better one on JavaScript-heavy sites. For a claim that needs a primary study or survey, use the paper tools (`firecrawl_research_search_papers`, then `firecrawl_research_read_paper`) and cite the paper itself by its full URL, not a bare id and not a blog post about it. When Tavily is present too, use both: fan the search out across them and keep the verify discipline, since two engines are not two independent sources. Surface cost intent before any large multi-page crawl. The tool names above are the ones the Firecrawl connector listed on 2026-11-04; take the exact names from the tools `ToolSearch` returns.
+
+**Vibe Prospecting (structured enrichment) — use whenever the connector is present AND the subject is a company or a person.** Don't skip it just because built-in web already produced an answer — structured data is what *verifies* and *corrects* the web (it's how you catch a stale headcount or an unconfirmed title). Resolve the subject with `match-business` / `match-prospects`, then use `enrich-business` / `enrich-prospects` to verify the scraped claims against structured data (headcount, revenue band, industry, location) and `fetch-businesses-events` / `fetch-prospects-events` to surface trigger events (funding, hiring, leadership change) that web search misses or serves stale.
+
+- **Cost guard:** Vibe is metered. For anything beyond a single-entity lookup, call `estimate-cost` and surface the estimated credit spend before pulling. Enrich surgically — only the entities in the question, never a speculative bulk pull. (This is a spend guard, NOT a reason to skip enrichment on a normal single-company/person research task — those should enrich by default.)
+- For a pure market/topic question with no specific company or person, enrichment usually doesn't apply — skip it and lean on Tavily, Firecrawl or web.
+
+**If a connector truly isn't connected:** skip that branch cleanly, run on the next tier down, and label honestly. No dead tool references, no error.
+
+### Step 3 — Render the branded brief, then offer to save
+
+The default output is a **self-contained, branded premium HTML brief** (SPEC OUT5 — the shared premium format, `shared/EXECUTIVE_OUTPUT_STANDARD.md` § "The premium HTML format"), **saved to `[WORKSPACE_ROOT]/_hq/intel/Research_Brief_[subject-slug]_[YYYY-MM-DD].html`** (the intel folder — same home the saved findings land in), then surfaced in the preview panel with an H2 link via `brief_path.get_brief_artifact_url()` — never a raw path.
+
+**The render is a MECHANICAL call — no exceptions, no hand-fill.** Call `shared/scripts/premium_html.py` `make_premium_brief(...)` (or pipe a JSON payload to it on the CLI) with the assembled `sections` (bullets may be `{text, url, low_confidence}` dicts for cited findings; `people` / `events` / `sources` section keys carry the decision-makers, signals, and source list), `exec_header={"verdict": ...}`, `badges={"source": ..., "confidence": ...}`, `source_summary`, and `workspace_root`. That single call runs the full gate stack (output-contract → voice-tell → exec-header → post-save leak scan — the same gates every .docx deliverable passes, parity-pinned by G16) and resolves the brand per render. The old contract — "replace the `{{TOKENS}}` in the template by hand" — is RETIRED: hand renders got skipped at the end of long research turns and live fires shipped NO artifact at all (field report 2026-07-16, the #104 prose-instructed class). Never fill the template yourself; if `make_premium_brief` raises, fix the flagged payload and re-call (max 2 retries), then say plainly that the brief could not be rendered — do not improvise HTML.
+
+- **The file is BUILT in this session's scratch and LANDED in the workspace by the access layer (SPEC_NIGHTM2 §5, `shared/scripts/deliverables.py`).** The render call returns where the document is on the CUSTOMER'S OWN COMPUTER — the path you handed in, byte for byte, on a seat where the plugin and the folder share a filesystem, and the customer's own spelling on the merged seat. Link THAT RETURN and pass THAT to any receipt: never a path you re-derive or re-spell yourself, and never the landing's `landed_path`, which on a merged seat names the mount this run reads through and opens nothing on their machine. When you know the workspace folder's absolute path on their computer — a scheduled chat is given it, and `get_device_info` returns it — export it as `CR_DEVICE_WORKSPACE` before the call and the returned path is absolute; without it the return is the folder-relative path, `pc_path_unknown` is set, and you say where the document went in words with no link at all. When the layer cannot reach the folder the call raises `deliverables.DeliveryRefused`: say its one sentence — it is chosen for that reason and it is the whole answer — and stop. Nothing was written anywhere, so there is nothing to clean up and no second way to save it.
+**Assert the artifact, don't assume it.** After the call returns, CHECK the file exists on disk at the routed path (list the directory or stat the file). Only then emit the artifact link. A research fire that ends with no `.html` on disk and no stated render failure is a bug — the exact regression this step closes.
+
+**Delivery is the rendered file, and only the rendered file (DOCFENCE1).** Both backends below are gated chokepoints; nothing else is:
+
+- **NEVER hand-roll the brief** with the generic `anthropic-skills:docx` skill, `python-docx` directly, or docx-js (and never improvise the HTML by hand — see above). Those paths bypass every gate and ship substandard or PII-leaking research (the v3.20.0 failure mode).
+- **NEVER create, render, copy, upload, or update the brief — or any part, derivative, or restatement of it ("talking points", "a summary") — through Claude Docs (the built-in docs / artifact page), Google Docs, Google Drive, or ANY other document/file connector** (Slides, Sheets, Notion, OneDrive, Dropbox: the ban is on the connector delivery path, not one vendor's API quirk). It fails twice at once: the connector path bypasses every gate above, AND a connector-created file lands at that connector's default location with no folder control — for a Google Doc, and for a parentless Drive upload of the canonical file itself, that is My Drive root, so the artifact violates the workspace routing rule by construction (the 2026-07-24 root-drop incident). Not exceptions: "for mobile", "for sharing", "as a copy alongside the canonical file" — **nor a direct instruction**: "put that research in a Google Doc" is a request this gate refuses, not an override. Say the canonical brief already exists and hand back its link.
+
+**Format override (SPEC OUT5 §3c):** research renders premium HTML by default; a client can pin it to `.docx` via `tune output` (`format_by_kind: {research: "docx"}`) — check `output_profile.resolve_format_for_kind("research", workspace_root)` and, when it answers `docx`, render via `brief_writer.make_brief()` instead (same sections payload minus the research-only keys, exec-header verdict carried over). An explicit ask in the trigger ("as a doc") beats the profile for that render.
+
+**Executive Output Standard (EXEC1, v3.20.0+) — header ties findings to the consuming event.** Per `shared/EXECUTIVE_OUTPUT_STANDARD.md`, the brief's top line (its bottom-line / verdict — already the lead of the HTML brief) is an exec-header verdict that names WHO this is FOR and the single most decision-relevant finding: *"For Thursday's call — Bo Stone (COO) owns ops tooling, not the homepage CEO."* This SUBSUMES a generic "Bottom line" restatement — the verdict IS the bottom line, don't render both (no-duplication rule). **Honest fallback:** when Step 1 found no consuming event (no upcoming call / thread the research feeds), drop the "For:" framing and lead with the plainest material conclusion — never invent a touchpoint. The Step 4 confidence line stays (element 5). When exporting the `.docx`, pass the same line as `exec_header.verdict` to `make_brief()`.
+
+**Adaptive depth — fill only the blocks that fit the ask:**
+- **Quick lookup** ("what do we know about Acme Co") → bottom line + a few cited key findings + sources. Omit the optional sections.
+- **Deep / account brief** ("research Acme Co before my call") → add `Who & what matters` (decision-makers, likely buyer highlighted), `Recent signals` (trigger events), and a narrative section.
+- The badges are NOT optional: emit exactly one source badge reflecting the strongest tier actually used — `Verified · Vibe Prospecting` (enrichment ran) > `Deep web · Tavily` or `Deep web · Firecrawl` (a deep-web connector ran, no enrichment; badge key `tavily` or `firecrawl`, and when both ran, the one that supplied more of the cited sources, counting a URL both returned once and taking `tavily` on a tie) > `Web sources only` (built-in web) — plus one confidence chip (`high` / `medium` / `low`). Never claim a tier whose tools were absent. The footer source-summary names the engines used honestly (e.g., "5 sources via Tavily + Firecrawl + Vibe Prospecting enrichment").
+
+**Load the widget tool before anything else** (`shared/CHAT_ACTION_WIDGET.md` § Finding the widget tool first): on the merged and half-merged seats it is deferred, and a listed deferred tool counts as present; ToolSearch loads it, its setup tool runs first, then the relay.
+
+Then offer to fold the findings into the workspace as a confirm-choice surface (rendered via `render_chat_output_widget`, posted via `widget_transport.render_and_persist` → `show_widget` (`transport["html"]` as `widget_code`) per `shared/CHAT_ACTION_WIDGET.md` § Transport — never markdown numbered actions):
+
+- **Save the brief** → hand verified content to `intel-intake` (writes `intel_logged` + `_hq/intel/` artifact, cross-referenced to the resolved thread).
+- **Add decision-makers** → pass any enrichment-discovered people to `people-crm` (`people_writer`, dedup-first). Enriched contact PII lands here and nowhere else.
+- **Skip** → discard; nothing is written.
+
+If the CEO wants a portable copy, also export the brief as a `.docx` via `brief_writer.make_brief()` and surface it as a second H2 link — same content, document form.
+
+**File card first (CONTRACT Rule 3, owner ruling 2026-11-03).** Every file this turn made, this document included, comes back in the chat as a file card before the summary and before any link: call `SendUserFile` with the file and `display: "render"` (load it through the host's tool search when it is not in the tool list yet; a tool that has to be loaded is present, not absent). On a merged seat the card tool runs in this chat and cannot read the customer's computer, so stage the landed file into this session's own scratch first (the device staging tool, or the staged copy `plan_delivery` makes) and card that copy; never hand the card tool a path on the customer's computer, and never paste the file's bytes as text. Only where this chat has no file-card tool at all does the link or the saved-to line stand in for the card, and then `deliverables.card_absent_line()` is said once, in plain words, under it. A path in words is not delivery.
+
+### Step 4 — Confidence and honesty
+
+Apply the Universal writing standards in `shared/VOICE_CALIBRATION.md` (structure, specificity, floors).
+
+**Tag major claims inline, not just in the footer:**
+- **HIGH** = 2+ independent sources, or enrichment-verified, or stated by the company officially.
+- **MEDIUM** = one reputable source, or web-sourced and >3 months old.
+- **LOW** = single mention or inferred ("likely expanding — bilingual CS job posts").
+
+Close with a one-line confidence read tied to source coverage. Web-only firmographics are medium-confidence by default; enrichment-verified firmographics are high. **Always name the lowest-confidence major claim explicitly and what the CEO should confirm** — never bury it.
+
+### Worked example — "research Acme Co before my call Thursday"
+
+(Acme Co already a prospect thread, so Step 1 pulls that context either way.)
+
+- **Web-only path:** "Freight brokerage, Midwest. ~200 employees (LinkedIn, may be stale). CEO Rio Sample. No funding info found. Confidence medium on the company, low on size and on who the buyer is — confirm headcount and decision-maker on the call." Decent, but it evaporates unless saved.
+- **Vibe Prospecting present:** corrects the stale headcount (~200 → 312 verified, i.e. growing faster than the public footprint shows), catches a growth round of an amount that web search missed, surfaces 7 open ops roles incl. a VP RevOps hire, and names the real buyer (Bo Stone, COO, owns ops tooling), not the homepage CEO, alongside Skyler Sample, VP Finance (budget). Sources line: `web (3) + Vibe Prospecting enrichment`. Reports `~3 credits` spent. On save: brief → intel-intake, the three decision-makers → people-crm. Next week's call-prep and brief inherit all of it.
+
+Same skill, same request. The branch simply turns on when the tools are there.
+
+## Output
+
+- **Branded HTML brief (default):** a self-contained branded artifact rendered MECHANICALLY via `shared/scripts/premium_html.py` `make_premium_brief(brief_kind="research", ...)` (SPEC OUT5 — the shared premium format; never hand-filled), saved to `[WORKSPACE_ROOT]/_hq/intel/Research_Brief_[subject-slug]_[YYYY-MM-DD].html`, existence ASSERTED on disk before linking, adaptive in depth, surfaced in the preview panel + an H2 link via `get_brief_artifact_url()`. Source badge + confidence chip always present (`badges=`); enrichment-only sections appear only when there's enrichment to show.
+- **Confirm-choice widget:** save-the-brief / add-decision-makers / skip, via `render_chat_output_widget`.
+- **Substrate (on save, delegated):** `intel_logged` + `_hq/intel/` artifact via intel-intake; `person_*` records via people-crm.
+- **Portable copy (on request):** a `.docx` via `brief_writer.make_brief()`, surfaced as a second H2 link.
+
+## Narration leak scan (CUT-C item 8 — MANDATORY on every composed line)
+
+Widget bodies are scanned inside `widget_transport.render_and_persist`; the PROSE this skill composes around them is not, unless this step runs. Before posting any sentence you composed — an ack, a header, a summary, a pointer, a "why" line — run `validate_chat_output(<the text>)` from `chat_output_renderer.py` (`shared/scripts/`). It raises `LeakDetectedError` on a raw id (`person_NNN`, `project_NNN`, `org_NNN`, a `cmt_` / `bp_` / `pcand:` wire id), an event or field name, a file name or path, or a score. ABORT the post and rewrite the sentence with the entity's name (`narration_names.humanize(text, narration_names.name_index(<WORKSPACE>))` is the one substitution). NEVER catch the error and post anyway. Text relayed byte-exact from a driver or the transport is already scanned and is not re-composed.
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> Produce a verified, cited research brief on any company, person, market, or topic — then fold the findings into the CEO's workspace so they compound instead of evaporating. Reads entities.json + events.jsonl FIRST to frame the question through the CEO's own projects, people, and threads, then runs fan-out web search with source verification. Uses Tavily for deeper web search and clean page extraction when that connector is present, and the Vibe Prospecting enrichment tools to verify firmographics, surface funding / hiring / leadership trigger events, and identify real decision-makers when that connector is present; both are optional upgrades over built-in web search, and the brief honestly labels which sources were used. Hands verified findings to intel-intake to save and to people-crm to record any decision-makers. Use when the CEO says 'research [company]', 'look into [company]', 'dig into [company]', 'background on [person]', 'what do we know about [company]', 'pull together research on [topic]', 'do some research on [topic]', 'research brief on [topic]', 'research [person] before my call'. DOES NOT fire when the CEO already has the source in hand and says break this down or parse this — that is intel-intake; research is for when there is no source yet. DOES NOT fire on what did anyone say about [topic] or transcript search — that is transcript-search, which searches the CEO's own meetings, not the web. DOES NOT fire on prep me for my meeting (call-prep) or one-pager on [topic] (one-pager-composer).
+
+**Built-in deep-research fence (RSR1):** research owns ALL research intents in this workspace — including any ask the generic built-in deep-research skill could plausibly take. That skill is workspace-blind: no entity framing, no Tavily / Vibe Prospecting enrichment, and its findings evaporate instead of being saved where call-prep and briefings can reuse them. Any 'research', 'deep dive on', 'dig into', 'look into', 'background on', 'what's the story on', 'what do we know about', 'pull together research on', 'do some research on', 'research brief on' phrasing routes HERE, never to the built-in skill. (The unbracketed stems in this paragraph are deliberate — they are the mechanical trigger family `tests/run_trigger_test.py` asserts against; the client-workspace CLAUDE.md session rule is the lever that decides live routing ties.)
+
+## The Access preamble this file refers to
+
+Propagated by `scripts/dev/propagate_access_preamble.py`; the canonical copy is in `shared/WORKSPACE_ACCESS.md`.
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+```

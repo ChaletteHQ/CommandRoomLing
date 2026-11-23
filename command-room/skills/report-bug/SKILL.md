@@ -1,0 +1,306 @@
+---
+name: report-bug
+surfaces: both
+description: "Diagnose a Command Room misfire end-to-end and either self-fix it or draft a fully-diagnosed support email to the maintainer. Fires on: 'report bug', 'report a bug', 'this isn't working', 'something's wrong', 'it broke', 'something is off', 'this is broken', 'why isn't this working', 'report this', 'send this to support'. Auto-collects version, last skill fired, workspace state, and active connectors; pattern-matches known issues (about half of reports self-fix in-session); otherwise drafts the pre-diagnosed Gmail to the support address for your review and send — never auto-sent. Does NOT fire on conversational frustration without report-it intent, or how-does-this-work questions (the relevant skill answers those)."
+---
+
+# report-bug
+
+Self-diagnose-then-draft skill. Customer hits a Command Room misfire; this skill either tells them how to fix it themselves OR drafts a pre-diagnosed email to the maintainer so he can verify-and-fix instead of investigate-from-scratch.
+
+## What this is and is not
+
+**Is:** a structured triage flow that captures one user sentence, auto-collects context, pattern-matches against known fixes, and produces either (a) a one-line self-fix or (b) a Gmail draft to the maintainer that includes the full diagnosis.
+
+**Is not:** a generic "feedback" surface. Not for feature requests ("I wish it could…"), not for praise, not for billing questions. Pattern-strict on the trigger phrases.
+
+## Why it exists
+
+Without this skill, customer support flow is: user emails the maintainer → the maintainer asks 4 diagnostic questions → user answers across multiple round-trips → the maintainer finally has enough context to verify the bug. Three days, four threads.
+
+With this skill: user hits the failure, says "report this," answers ONE question, the skill assembles the diagnostic payload, and the email that lands in the maintainer's inbox already contains the verification surface. The maintainer opens it, reads it, confirms or rejects in one pass.
+
+Half the bugs fixed in v3.x have been one-keypress user-side fixes (fully quit and reopen the Claude app, rerun update, retry). Those should never reach the maintainer. The known-issue-patterns reference file catches them before escalation.
+
+## Behavior
+
+### Step 0: the Hub's Ask, Something is wrong message (cr1#1315)
+
+When the message starts `Something's wrong on my Command Room Hub:`, the Hub's Ask, Something is wrong opened this chat (cr1#1288; the top bar's one Ask since cr1#1591, "Something wrong?" before it): the owner's words, then what the Hub was showing, then the page's own ask. The prefix is unchanged. Any other message starts at Step 1.
+
+1. **Plan.** One helper call reads the message:
+
+```bash
+python3 "$RT/shared/scripts/workspace_access.py" run_helper --json '{"args": {"now_iso": "<now ISO>", "text": "<the whole message, as it came>", "workspace_root": "<WS>"}, "name": "cockpit_helpers:miss_chat_plan"}'
+```
+
+Render it with `plan run_helper` and paste what it prints: the message carries apostrophes and line breaks. Its `route`:
+   - `bug` (a light that did not finish, an error): go to Step 1 with the owner's words (`said`) as `WHAT_HAPPENED` and "Using the Command Room Hub, which was showing `showing`" as `WHAT_TRYING`. Step 1's question is already answered; do not ask it.
+   - `ask`: say its `line` and wait. Plan again with `route` set to `miss` when the answer says something is missing, or `bug` when something did not work; when the answer names the item, `text` is `Something's wrong on my Command Room Hub: ` followed by the owner's words.
+   - `miss`: the steps below.
+
+2. **Personal sources, before the first connector read (cr1#1179).** Render `cd "$PLUGIN_ROOT" && python3 shared/scripts/workspace_access.py plan run_helper --json '{"name": "connector_reads:chat_wall", "args": {"workspace_root": "<WS>"}}'`, paste what it prints and run that, once, before any connector is read here, and follow `shared/CHAT_WALL.md`: call no tool on a server in `connectors`, show no message from a mailbox in `mailboxes` unless its sender is in that entry's `except_senders`, write nothing from either, and say nothing about what was left out.
+
+3. **Search.** For the one entry in the plan's `searches`, search with its `query`, at most `limit` results per source, from the last `days`, and only the kinds in the plan's `sources` (the wall leaves those open):
+   - **Mail:** the business mailbox only, with the declared mail backend's thread search (`tool_discovery.discover_mail_search_tool`, the declared backend first). Never a server in the wall's `connectors`; on a server that also carries a mailbox in the wall's `mailboxes`, search the business mailbox only. Each thread found is one hit `{"source": "mail", "server_id": ..., "mailbox": <the address it is in>, "thread_id": ..., "subject": ..., "sender": ..., "ts": ..., "url": ...}`: the subject and sender only, never the mail's text.
+   - **Meetings:** the meetings connector's search, unless that connector is in the wall's `connectors`. Each meeting found is one hit `{"source": "meeting", "server_id": ..., "meeting_id": ..., "title": ..., "ts": ..., "url": ..., "snippet": <at most one sentence>}`.
+   - A source not connected, one the wall names, or a search that fails is not listed in `searched`.
+   - **The Hub's Inbox feed:** `run_helper` `morning_message:hub_address` (`{"workspace_root": "<WS>"}`). When `found` is true, load the page's database tool as `cockpit-shared.md` shared step 0 does and `get` `feed/inbox` at that `url`. No Hub, no tool, or a failed read: `inbox` is null.
+
+4. **Answer, before anything is filed.** One helper call, with the plan's `choice` as it came:
+
+```bash
+python3 "$RT/shared/scripts/workspace_access.py" run_helper --json '{"args": {"choice": <the plan's choice>, "inbox": <feed/inbox as read, or null>, "live": {"<the choice id>": {"hits": [<hits>], "searched": [<sources searched>]}}, "now_iso": "<now ISO>", "workspace_root": "<WS>"}, "name": "cockpit_helpers:miss_chat_answer"}'
+```
+
+Say its `line`: it says where the item was found and why the Hub missed it, or that nothing was found (and, when the owner has personal sources, that they are never searched). Give `source` as a link when it is there (it is handed back only when it is a web address). When `would_file` is true, ask its `ask` and wait. Nothing else is said about what the search left out.
+
+5. **File only on the owner's yes.** A clear yes to that question, and only that, sends the same choice, `live` and `inbox` to the writer the Hub's Apply uses, `resolved_by` left empty:
+
+```bash
+python3 "$RT/shared/scripts/workspace_access.py" run_writer --json '{"args": {"choices": [<the plan's choice>], "inbox": <feed/inbox as read, or null>, "live": {"<the choice id>": {"hits": [<hits>], "searched": [<sources searched>]}}, "now_iso": "<now ISO>", "resolved_by": "", "workspace_root": "<WS>"}, "name": "cockpit_helpers:apply_hub_choices"}'
+```
+
+Render it with `plan run_writer` and paste what it prints. Say the result's `line`. Anything other than a clear yes writes nothing: say "Nothing was added." and stop. Never file without the yes, never file on a guess, and never write a `bug_reported` row on this route. When the owner also wants something that failed reported, go to Step 1.
+
+### Step 1 — Acknowledge + one diagnostic question
+
+Open with one line, no preamble:
+
+> *"On it. Quick — what were you trying to do, and what happened instead? One sentence each is fine."*
+
+Wait for the user's response. Accept any shape; don't reformat. The two answers fill `WHAT_TRYING` and `WHAT_HAPPENED` in the diagnosis payload. **An empty answer is never filed blank (EMPTYREPORT1, cr1#135):** when the user gives nothing for a field (a next message that describes neither field: "not sure", "just send it", a shrug), that field is `(no description provided)`, spelled exactly so, and the report still goes out, because the auto-diagnosis below carries what the user could not say. Never invent a description to fill it.
+
+### Step 2 — Auto-collect context (no user action)
+
+In parallel, while the user is typing Step 1's answer (or immediately after if they answered fast):
+
+1. **Plugin version** — read `.claude-plugin/plugin.json` from the plugin root. Capture `version` field.
+2. **Workspace shape** — read `_hq/data/entities.json`. Capture: org count, person count, project count, last `tz_set_at` value. Used to confirm workspace isn't empty.
+3. **Last 5 events** — read tail of `_hq/data/events.jsonl`. Capture: type, source_skill, ts for each — EXCEPT personal-lane rows: any row where `personal_leak.is_personal(row)` is true (reminder-family personal rows, the balance lane, `tie: personal`) is captured as `(personal-lane event) · (masked) · [ts]`, never its real type or source_skill. This table lands in an OUTBOUND email (Step 4b) and the Step-5 chat fallback — a personal event-type token in it is a firewall fingerprint leaving the workspace. This is the skill that most likely fired right before the failure.
+4. **Active connectors** — list the MCP connectors present in this session (gmail, calendar, granola, drive, slack, github — whatever is mounted). Don't include token counts, just names.
+5. **User's email** — from `entities.json` workspace block, or fall back to `_hq/CLAUDE.md` "Identity" section. Used as the `From` address on the draft.
+
+Surface NOTHING to the user during this step. The context collection is silent — they answered one question, the email gets drafted, that's the user-facing surface.
+
+### Step 3 — Pattern-match against known issues
+
+Load `{SKILL_DIR}/references/known-issue-patterns.md` (skill-local — it lives inside this skill's folder in the plugin, not in the workspace). Each entry has:
+- **Signature** — keywords / phrases / skill names that match the user's complaint + auto-collected context
+- **Likely cause** — one-line technical summary
+- **User-side fix** — what the user can try first (if any), in plain English
+- **Escalate?** — `yes` (always email the maintainer), `no` (one-keypress fix, don't email), or `try-first` (suggest user-fix, escalate if it doesn't work)
+
+Apply the match in this order:
+1. Exact skill-name match — if user says `meeting-notes is broken` and the last fired skill was `meeting-notes`, prefer the meeting-notes patterns.
+2. Keyword match against user's `WHAT_HAPPENED` sentence.
+3. Symptom match against auto-collected context (e.g., 0 commitments + 5+ meetings = likely commitment-pipeline gap).
+4. No match → default to `escalate: yes` with `pattern_match: "no known pattern"`.
+
+### Step 4a — Self-fix path (escalate=no, or escalate=try-first)
+
+If the matched pattern's `User-side fix` is non-empty AND `escalate ∈ {no, try-first}`:
+
+Surface the fix verbatim with a one-line explanation:
+
+> *"Here's what's probably going on: [Likely cause — rephrased in plain English; no skill names, file paths, or internal tokens].*
+>
+> *Try this first: [User-side fix].*
+>
+> *If that doesn't work, say `still broken` and I'll draft the email to support."*
+
+If the user replies `still broken` (or any equivalent — "didn't work", "same issue", "still doing it"), proceed to Step 4b. If the user replies positively ("fixed it", "thanks", "worked"), append a `bug_self_fixed` event to `events.jsonl` with the matched pattern's signature + `ts` and respond with one line:
+
+> *"Glad. Logged it. The team already knows about this one."*
+
+### Step 4b — Draft path (escalate=yes, or try-first didn't work)
+
+Draft to the maintainer via the **declared mail backend** (connector-agnostic-v1 parity, N9) — resolve it in ONE call with `tool_discovery.discover_mail_draft_tool(tools, declared=connector_config.declared_backend("email"))` — the seam resolves the declared backend first and refuses to substitute another product's tool, and falls back to fingerprint discovery when nothing is declared (Gmail/Outlook/Superhuman all work; empty map = today's behavior). Do NOT name a provider tool directly. The draft must be saved as a draft — never sent. The user reviews and sends manually. If the backend is read-only (can't draft — e.g. a read-only Outlook, per the capability manifest), skip straight to the paste-text fallback below.
+
+**Subject:** `[Command Room bug] [last_skill or "unknown"] — [first 8 words of WHAT_HAPPENED]`; when `WHAT_HAPPENED` is `(no description provided)`, the subject ends `— no description, see auto-diagnosis` so the maintainer can read it in the inbox list.
+
+**Body:** verbatim template below (section order per the rule that follows), filled with real values. No invented details. If a field is unknown, write `"(not detected)"` — never fabricate. **When `WHAT_HAPPENED` is `(no description provided)`, the AUTO-DIAGNOSIS block moves to the top of the body**, directly under the opening line "Command Room hit something unexpected…" and before WHAT I WAS DOING, so the one thing the report has to say is the first thing the maintainer reads. Same trigger as the subject rule above, so subject and body agree.
+
+```
+Hi,
+
+Command Room hit something unexpected. Auto-diagnosis below — review and let me know.
+
+WHAT I WAS DOING
+[WHAT_TRYING from user, verbatim; "(no description provided)" when empty]
+
+WHAT HAPPENED INSTEAD
+[WHAT_HAPPENED from user, verbatim; "(no description provided)" when empty]
+
+AUTO-DIAGNOSIS
+• Plugin version: [version from plugin.json]
+• Last skill fired: [source_skill from tail of events.jsonl] at [ts]
+• Workspace shape: [N orgs, N people, N projects]
+• Active connectors: [comma-separated list]
+• Timezone: [user_timezone or "(not set)"]
+• Pattern match: [matched pattern signature, or "no known pattern"]
+• Suggested user-side fix (already tried): [User-side fix from pattern, or "(none — needs investigation)"]
+
+LAST 5 EVENTS
+1. [type] · [source_skill] · [ts]
+2. ...
+3. ...
+4. ...
+5. ...
+
+— [User's first name], via Command Room (plugin v[version from plugin.json — the Step 2 auto-collected value, read at runtime; never hardcode])
+```
+
+After the draft is created, surface ONE line to the user:
+
+> *"Drafted in your mail — review and send when ready. Subject line: `[subject from above]`. Support has everything they need to verify."*
+
+**Output guard:** no internal tokens, paths, event names, or version numbers in anything the CEO sees in CHAT (the email body's AUTO-DIAGNOSIS block is the one sanctioned diagnostic surface — versions and skill names live there, not in chat lines) — vocabulary per `shared/VOICE_CALIBRATION.md` § Plain-language glossary.
+- Bad: "This matches a known pattern: stale orchestrator taskId cache."
+- Good: "Here's what's probably going on: my schedule needed a refresh."
+
+Then append a `bug_reported` event to `events.jsonl`:
+```json
+{"type":"bug_reported","ts":"<ISO-now>","data":{"pattern_match":"<signature>","last_skill":"<skill>","plugin_version":"<version>"}}
+```
+
+**Append through the locked writer (SPEC GATE1 / A1):** write this event — and the `bug_self_fixed` event in Step 4a — via `atomic_append_jsonl(events_path, [event], holder="report-bug")` (omit `seq`; it is auto-stamped inside the lock), NOT a hand-rolled `next_seq`+`open('a')` or a raw `>>`. See `shared/WORKSPACE_API.md` → Append Protocol §3.
+
+### Step 5 — If anything in the pipeline itself fails
+
+If the resolved draft call fails (no mail connector mounted, auth expired, read-only backend, etc.), fall back to surfacing the full email body as a code block in chat with one line:
+
+> *"Couldn't draft to your mail directly — copy this and send to matthew@chaletteholdings.com:"*
+
+Then paste the full email body. Don't lose the diagnosis just because the connector path failed.
+
+## Marking a logged bug resolved (cr1#852)
+
+Every report this skill drafts leaves a `bug_reported` row, and the maintainer's tooling leaves `bug_received` rows; nothing closed them until now, so every logged bug stayed open forever. On `mark bug <number> resolved` (also `bug <number> is fixed`, `resolve bug <number>`, `close bug <number>`), the number being the one the health check lists beside each open bug, write ONE row through the write door and say its `line`, verbatim:
+
+```bash
+python3 "$RT/shared/scripts/workspace_access.py" run_writer --json '{"args": {"ref": "<the number the owner said>", "note": "<the owner's words about the fix, if any, else omitted>", "workspace_root": "<WS>"}, "name": "bug_log:resolve_bug"}'
+```
+
+`bug_log.resolve_bug` writes one `bug_resolved` row pointing at the bug's seq and answers `resolved` with the count still open; `already_resolved`, `unknown` and `no_ref` write nothing, and their `line` is the whole answer. Never hand-append the row, never edit or remove the bug row itself, and never guess a number the owner did not say. The health check (`system-health` Step 3b) lists the open ones with their numbers through `bug_log:open_bug_count`.
+
+## Rules
+
+1. **One question, never two.** The user already hit a frustrating bug — don't make them answer a quiz. One sentence each for trying / happened is the whole user-input surface.
+   - On the Hub's Ask, Something is wrong message (Step 0) the owner's words already answer it; that route's one question is whether to add the item.
+2. **Never invent fields.** If `plugin.json` isn't readable, write `(not detected)`. If `events.jsonl` is empty, write `(no events captured)`. Fabricated diagnoses are worse than honest gaps.
+3. **Pre-fill, don't pre-send.** The user reviews the draft in Gmail before it goes. The maintainer respects them; never auto-send.
+4. **Pattern file is the moat.** Every bug the maintainer fixes from real customer feedback should be added to `{SKILL_DIR}/references/known-issue-patterns.md` so the next customer hits a one-line self-fix instead of an email.
+5. **Silent context collection.** Don't narrate "I'm reading your plugin.json…" — the user answered one question, the draft appears, that's the surface. Internal steps stay internal.
+
+## The activity log is append-only (MANDATORY — CONTRACT Rule 31)
+
+This skill touches `_hq/data`. **The activity log is never rewritten by hand.**
+`events.jsonl` and its yearly shards are only ever ADDED to, through the
+writers (`event_gate.append_event` / `atomic_write.atomic_append_jsonl`). No
+step here, and no turn this skill runs in, may edit, truncate, reorder, delete
+lines from, back up and rewrite, or restore that file — and may never instruct
+anyone else to.
+
+- A duplicate or malformed line is **quarantined through the cleanup skill's
+  existing path**, never deleted (`recover_corruption.py` for malformed lines,
+  `seq_health.py --mark` for a duplicate entry number).
+- Correcting writes this skill made means **appending a reversal through
+  `brain_undo.undo_batch`** with the batch ref the run advertised — a receipt
+  and a real `undo`. `undo` after a re-run means exactly that batch, or the
+  words "nothing to reverse"; never an improvised drop, an invented supersede,
+  or a hand-edited file.
+- If you believe the file itself must change, **STOP and say so in plain
+  words.** Do not do it, and do not offer to.
+
+## What it doesn't do
+
+- Does not fire on praise, feature requests, or billing questions.
+- Does not send the email — only drafts.
+- Does not invoke other skills (no `meeting-notes`, no `workspace-manager`). Single-purpose surface.
+- Does not log to telemetry or external systems. The `bug_reported` event in events.jsonl is the only side effect outside the Gmail draft. The one exception is Step 0's missing item, added to the list through `cockpit_helpers:apply_hub_choices` only on the owner's yes.
+- Does not run if no Gmail connector is mounted AND `_hq/data/events.jsonl` is empty (no useful diagnosis possible — tell the user to email the maintainer directly with a one-liner).
+
+## Routing (full trigger corpus)
+
+The complete trigger family and fences for this skill, relocated verbatim from the pre-v4.5.1 description (the routing metadata is budget-capped by the platform; routing correctness is enforced mechanically by tests/triggers.yaml). Everything below remains binding at fire time.
+
+> Diagnose a Command Room misfire end-to-end and either self-fix it or draft a fully-diagnosed support email to the maintainer. Auto-collects plugin version, last skill that fired, workspace state, and active connectors. Pattern-matches against known issues ({SKILL_DIR}/references/known-issue-patterns.md — skill-local, ships with the plugin) — half of reports never need to leave the user because the fix is a one-liner. Use when the user says: 'report bug', 'report a bug', 'this isn't working', 'something's wrong', 'it broke', 'report this', 'send this to support', 'tell the team about this', 'something is off', 'this is broken', 'why isn't this working'. Also marks a logged bug resolved (cr1#852): 'mark bug [number] resolved', 'resolve bug [number]', 'bug [number] is fixed', 'close bug [number]': one row through the write door, one line back; machine-matchable stems for the mechanical matcher: 'mark bug', 'resolve bug', 'close bug'. Output is a Gmail draft pre-filled to matthew@chaletteholdings.com (the maintainer's public support address) with the full diagnosis — user reviews and sends. DOES NOT fire on conversational frustration ('this is annoying' / 'ugh') without an explicit report-it intent. DOES NOT fire on questions about how something works (that's the relevant skill, not a bug).
+
+## The Access preamble this file refers to
+
+Propagated by `scripts/dev/propagate_access_preamble.py`; the canonical copy is in `shared/WORKSPACE_ACCESS.md`.
+
+```bash
+# >>> CR ACCESS PREAMBLE v6 (CONTRACT Rule 22; shared/WORKSPACE_ACCESS.md) >>>
+# The substrate is on the customer's machine; this process may not be. Every
+# read, helper and write goes through workspace_access ON the host that holds
+# the data. Never open, copy or tar a workspace file into this session, and
+# never write one from here.
+#  1 RESOLVE, once per call. The four lines below name the plugin root, the
+#    environment, and -- on a seat whose files are local -- the workspace. On a
+#    merged seat resolve instead with `workspace_access.py discover`, hand the
+#    block it prints to the device shell, and keep its answer: WS, RT, BRAIN,
+#    MODE; and DEVICE = the entry in get_device_info's connectedFolders whose
+#    last path segment is WS's basename -- export CR_DEVICE_WORKSPACE="$DEVICE"
+#    before the first plan, so a saved document can name the folder the
+#    customer opens. Put CR_DEVICE_NAME="<the device name get_device_info
+#    reports, spelled as it reports it>" in front of that first plan, in the
+#    same command, so each write names the computer it came from (plan keeps
+#    it for the session). Then hand that answer to `workspace_access.py
+#    discover --compare '<its JSON>'` in this shell: `runtime_lags: true` (the
+#    runtime is absent, or its manifest_sha is not this plugin's -- the version
+#    alone no longer changes between builds) is a STOP: run the update-bridge
+#    install step once, resolve and compare again, and if it still lags say
+#    `lags_line` and stop. There is no container fallback.
+#  2 BRAIN. When BRAIN is not null, `plan read` it first -- one call.
+#    CONTEXT, always, one call: `plan run_helper` with name
+#    `context_loader:load_context` and args {"workspace_root": "<WS>",
+#    "skill": "<this skill's folder name>"}. Follow every rule in its
+#    `rules`; an answer a rule shaped says so in the rule's own plain words.
+#    Asked about the owner's own records and nothing on file answers, say
+#    "I do not have that." The owner's rules are read through this loader
+#    only.
+#  3 HELPERS. One verb is one call (150 s budget). Render the command ONLY with
+#    `workspace_access.py plan run_helper --json '{"name":"<module:function>",
+#    "args":{...}}'` and paste what it prints, verbatim -- INCLUDING the
+#    variables in front of python3, which carry the writer identity and the
+#    run mode to the host that holds the data. The reply is one JSON
+#    envelope; ok:false is a stop, never a hand retry.
+#  4 WRITES. Only `plan write` and `plan append_jsonl` -- never an append
+#    redirect, an in-place edit, a heredoc into the workspace, or a python body
+#    that opens a substrate file.
+#  5 LEGACY / LOCAL. When this seat's files are on this filesystem -- an older
+#    sandbox seat, or a Code session on the customer's own machine -- the same
+#    verbs run in this shell, and the four lines below resolve it for them.
+#  6 THE SURFACE IS THE WHOLE ANSWER. A step that could not run gets ONE
+#    sentence with no file, script, path, variable, shell text or mechanism
+#    in it -- "One step could not run here; what is below is complete." or
+#    "... is partial." Never narrate a workaround, never say what you tried.
+#  7 STAGING. A file this chat needs for itself -- a widget copy, a scratch
+#    render -- lives in this session's own scratch, never under the
+#    workspace. Nothing under `_hq/` is created, copied or removed by a
+#    redirect, `cp`, `tee` or `rm`: a file is written by `plan write` and
+#    removed by `plan remove`, and a removal is reported in the envelope's
+#    own words -- removed, moved aside, or still there -- never as done.
+#  8 WRITERS. A document, a receipt, a close or a re-pin is written by
+#    `plan run_writer` naming a writer on its list -- never by importing a
+#    writer in a shell. The door forwards who you are; a writer with no
+#    identity on this seat refuses in one sentence, and that sentence is the
+#    whole answer.
+#  9 FOLDER. Three tiers, one wording here and in the block the customer
+#    pastes into the account's Claude instructions (claude_instructions.py,
+#    TIER_LINES). If the owner's computer is connected, work in the Command
+#    Room folder; if it is not attached, ask for it by name before doing any
+#    work. If the owner's computer is not connected, ask for the Command Room
+#    folder to be attached from OneDrive or Google Drive before doing any
+#    work. If neither is possible, answer as plain Claude and do not go
+#    through Command Room. A scheduled chat asks nothing: it works in the
+#    folder it was registered with, or stops in one sentence.
+SESSION_DIR=$(echo "${CLAUDE_CODE_TMPDIR:-}" | sed "s|/tmp$||")
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(ls -d "$SESSION_DIR"/mnt/.remote-plugins/plugin_*/shared/scripts/chat_output_renderer.py /root/.claude/plugins/synced/*/*/shared/scripts/chat_output_renderer.py 2>/dev/null | head -1 | sed 's|/shared/scripts/chat_output_renderer.py$||')}"
+eval "$([ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" 2>/dev/null && python3 shared/scripts/env_detect.py --shell || echo CR_ENV=unknown)"; export CR_ENV CR_PLUGIN_ROOT CR_BRAIN_FILE CR_LOCAL_FS CR_CLOCK_TRUST
+WORKSPACE=$(find "$SESSION_DIR/mnt" -maxdepth 5 \( -name "_archive" -o -name "_demo-framework" \) -prune -o -type d -name "_hq" -print 2>/dev/null | awk -F/ -v z=0 '{print NF, $z}' | sort -n | head -1 | cut -d" " -f2- | sed 's|/_hq$||'); [ "${CR_LOCAL_FS:-1}" = "1" ] && [ "${CR_ENV:-}" != "merged_cloud" ] || WORKSPACE=""
+[ -n "$PLUGIN_ROOT" ] && cd "$PLUGIN_ROOT" || true
+# <<< CR ACCESS PREAMBLE v6 <<<
+```

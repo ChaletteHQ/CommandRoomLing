@@ -1,0 +1,2144 @@
+#!/usr/bin/env python3
+"""
+THE receipt contract — one schema, one writer, one reader (v4.5.2 R1).
+
+WHY
+---
+
+The 2026-07-07/08 dogfood (FINDINGS_M_v451) proved receipt anarchy is a
+single root cause wearing five findings:
+
+  F-10b  — health check flagged Inbox "didn't record" because its matcher
+           keyed on `data.task_id` while inbox's receipt carried only
+           `data.kind`.
+  F-43   — the matcher half: same disease, one day later.
+  F-47 P2a — ONE skill, TWO receipt shapes in ONE day: the morning scheduled
+           fire wrote `{task_id: 'cr-commitments', fired_at, outcome, ...}`;
+           the afternoon manual fire wrote `{kind, date, status, late_tier,
+           surfaced, header_counts}`.
+  F-49   — usage-report undercounted 4 of 7 task rows and missed two task
+           families entirely (reconcile-sent ×6, session-sweep ×4) because
+           it read only `pack_run` events and only canonical id spellings.
+  F-50 P2c — the SAME skill wrote `late_tier` in the morning and
+           `lateness_tier` in the evening — the field name was never
+           specified anywhere, so each fire improvised it.
+
+The drift source: the prose orchestrators hand-rolled their receipt JSON
+(each file specced a different field set) instead of calling a helper. This
+module is the consolidation: every writer calls `log_receipt()` (or the
+back-compat `log_pack_run` wrapper that now delegates here); every reader
+goes through `iter_receipts()` / `last_receipt_times()` / `count_runs()`.
+
+CONTRACT DECISIONS (settled here, once)
+---------------------------------------
+
+- **Canonical task_id spelling** is the hyphenated registry id (the
+  DEFAULT_SCHEDULES key): `commitments`, `past-meetings`, `upcoming-meetings`,
+  ... — never `cr-` prefixed, never underscored. `normalize_task_id()` maps
+  every spelling observed in live substrates to the canonical form.
+- **The lateness field is `late_tier`.** `lateness_tier` (and bare `tier`
+  on pack_runs) are legacy spellings — parsed forever, never written again.
+- **`fired_via` is one of `scheduled | manual | catchup`** (R2 wires the
+  detection; the field ships in the schema now). Legacy values
+  (`user-trigger`, `scheduled_late_refire`) are normalized read-side.
+- **Receipts carry `machine`** (hostname) — F-38: schedules are per-machine
+  and readers couldn't tell two machines from a double-registration bug.
+- **Receipts carry `model` WHEN THE ENVIRONMENT NAMES ONE** (TZ1, M's ruling
+  §0.6 2026-09-19). Additive and optional: present when the harness states
+  the serving model, ABSENT otherwise, never derived and never guessed —
+  events.jsonl is permanent history and a guessed value would answer "which
+  model served this fire?" wrong forever. Ledger vocabulary only; it never
+  reaches a customer sentence.
+- **Readers parse ALL legacy shapes FOREVER.** events.jsonl is append-only
+  history; back-compat lives read-side, never as a history rewrite.
+
+CANONICAL RECEIPT SHAPE (what log_receipt writes)
+-------------------------------------------------
+
+    {"type": "<receipt type>", "source_skill": "<canonical task_id>",
+     "ts": "<auto-stamped UTC inside the writer lock>",
+     "data": {"task_id": "<canonical>", "kind": "<canonical>",
+              "status": "complete", "fired_via": "scheduled|manual|catchup",
+              "surfaced": <int?>, "duration_ms": <int?>,
+              "late_tier": "<note|degrade>"?, "machine": "<hostname>",
+              "model": "<serving model id>"?,
+              ...task-specific counts...}}
+
+`kind` duplicates `task_id` deliberately: legacy readers key on `kind`,
+and dropping it would orphan them. New readers use `task_id`.
+
+USAGE
+-----
+
+Writer (one line from any orchestrator's final phase):
+
+    from receipts import log_receipt
+    log_receipt(WORKSPACE, "past-meetings", fired_via="scheduled",
+                surfaced=3, duration_ms=elapsed_ms,
+                extra_data={"meetings_processed": 3})
+
+Reader:
+
+    from receipts import count_runs, last_receipt_times
+    counts = count_runs(WORKSPACE, since=window_start)   # usage-report
+    latest = last_receipt_times(WORKSPACE)               # watchdog freshness
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import re
+import sys
+from pathlib import Path
+from typing import Iterable, List, Optional
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from event_time import event_dt, parse_ts  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Canonical vocabulary
+# ---------------------------------------------------------------------------
+
+# The scheduled-task registry ids (DEFAULT_SCHEDULES keys) plus the on-demand
+# scanners that R1 gives receipts. Hyphenated, bare (no cr- prefix) — final.
+CANONICAL_TASK_IDS = frozenset({
+    "morning-brief",
+    "upcoming-meetings",
+    "inbox",
+    "cockpit",       # COCKPIT1 (cr1#608) - the cockpit page's task; one pack_run per run
+    "cockpit-prep",  # COCKPIT1 four-task shape (cr1#619)
+    "cockpit-inbox",  # COCKPIT1 four-task shape (cr1#619)
+    "cockpit-apply",  # COCKPIT1 four-task shape (cr1#619)
+    "cockpit-refresh",  # COCKPIT1 four-task shape (cr1#619)
+    "commitments",   # CTS1 — retired taskId; kept forever so pre-split receipts stay readable (append-only history)
+    "waiting-on",    # CTS1 Surface 1 — the re-scoped daily chat (successor of `commitments`; new receipts land here)
+    "my-plate",      # CTS1 Surface 2 — the owner-me act-list chat
+    # LIFECYCLE1 — the Pulse CHAT is retired (M's ruling 2026-08-02) and its
+    # taskId is out of DEFAULT_SCHEDULES, but the id stays here FOREVER: three
+    # receipt shapes sit on disk under it (see RECEIPT_TYPES below) and history
+    # is append-only. `pulse` parses forever; it is simply never written again.
+    "pulse",
+    "lifecycle",     # LIFECYCLE1 — the project lifecycle pass job inside `maintenance` (the fold that replaced Pulse's Phase 4)
+    "review-expiry",  # REVSCHED1 — the weekly unconfirmed-pile drain job inside `maintenance` (never a task of its own; see maintenance_dispatcher.MAINTENANCE_JOBS)
+    "chat-pointer-sweep",  # cr1#164: the weekly check that every saved chat-evidenced close still carries its pointer, a job inside `maintenance` (never a task of its own)
+    "question-expiry",  # TTL1 (SPEC_FLOW1 Lane G) — the daily question-expiry engine job inside `maintenance` (never a task of its own; the third silence-drain, sitting between review-expiry's two-day bar and age-out's thirty)
+    "sync-conflicts",  # cr1#724: the sync conflict-copy merge inside every `maintenance` fire (never a task of its own, not a registry row; one writer, sync_conflict_copies.run)
+    "age-out",       # SWEEPSCHED1 — the weekly CONFIRMED-pile drain job inside `maintenance` (never a task of its own; sibling of review-expiry, different pile, different bar)
+    "calendar-close",  # POLICY1-B DD-7 — the daily calendar closer for scheduling rows inside `maintenance` (never a task of its own; confirm-first for three fires)
+    "exit-doors",    # EXIT1 (SPEC_FLOW1 Lane B) — the daily exit-doors job inside `maintenance` (never a task of its own): the paid-or-signed close and the silence drain
+    # EOD2 — the 5 PM chat's taskId was RENAMED to `end-of-day`, but the
+    # RECEIPT id deliberately did NOT move: `end_of_day.TASK_ID` still writes
+    # `past-meetings`, so the day-close series is ONE continuous history
+    # across the rename instead of two half-series either side of whenever a
+    # given customer took the offer. `past-meetings` therefore stays the
+    # WRITTEN id; `end-of-day` is registered below so the watchdog can ask
+    # about the successor by name and TASK_PREDECESSORS bridges the read.
+    "past-meetings",
+    "end-of-day",
+    "friday-wrap",
+    "cleanup",
+    "reconcile-sent",
+    # CHATSCAN1 — the chat closure leg. A SIBLING job inside the same
+    # `maintenance` task as `reconcile-sent`, not a new scheduled task: M's
+    # ruling is that closing from chat is wired into the maintenance cadence
+    # exactly like closing from mail, so it needs its own job id, its own
+    # receipt and its own due-ness — and NO registration of its own.
+    "reconcile-chat",
+    # cr1#664 - the inbound-mail job inside `maintenance` (never a task of its own): it opens commitments from inbound mail and closes them from inbound replies; its pack_run is the dueness signal, the next window's start and the list the Inbox chat's Phase 4b yields to
+    "inbound-mail",
+    "monthly-report",
+    "weekly-insights",
+    "session-sweep",
+    "relationship-moves",
+    "commitment-triage",
+    "dormant-scan",
+    "stalled-projects",
+    "pipeline-tracker",  # RCPT1 — the deal-pipeline report's SKILL.md-mandated scan receipt (on-demand, like stalled-projects)
+    "objectives",    # OBJ1 (draft) — the on-demand objectives readout (same shape as stalled-projects: what was surfaced + drifting_thread_ids, so drift-flag value counts read from receipts)
+    "maintenance",   # MAINT1 — the single silent dispatcher task (the five silent ids above live on as its JOBS and keep their receipt vocabularies forever)
+    "staff-meeting",  # LB1 R3 — the weekly Staff Meeting chat (opt-in later-add)
+    "balance",        # BAL1 — the personal white-space surface (m_facing only; receipt carries counts, never personal content). TASKRET1 READINESS-retired the Sunday CHAT; this row stays forever so pre-retirement receipts keep parsing, and the on-demand `balance check` fire still writes it.
+    "pipeline-digest",  # PIPE1 Part 2 — the Tuesday deal-review chat. TASKRET1 READINESS-retired it; the row stays forever so pre-retirement receipts keep parsing (and its since-window marker stays readable), but nothing writes it any more — the on-demand report is `pipeline-tracker` above.
+    "deal-signals",   # LB1 D7 — the deal-signal detector job inside `maintenance`
+    "identity-reconcile",  # PID1 D7 — the Sunday identity reconciler job inside `maintenance` (also the M-fired one-time backfill)
+    "meeting-capture",  # EODSPEED1 — the incremental capture pass job inside `maintenance` (never a task of its own; its pack_run is the dispatcher's dueness signal and catchup_window's resume point — NEVER written under past-meetings, which would arm skip_render against the real close)
+    "monthly-scorecard",  # SPEC OUT7 — the OPT-IN monthly KPI scorecard job inside `maintenance` (never auto-fires; its pack_run receipt self-limits it to monthly once opted in)
+    "daily-measure",  # MEASURE1 (SPEC_FLOW1 Lane D) — the daily flow measure job inside `maintenance` (never a task of its own; its pack_run is the dueness signal, written only on a fire that measured at least one new complete day — a fire with nothing to measure leaves no trace and stays due, the binding-gauge posture)
+    "learning",      # SPEC_LEARN1 D6 — the weekly learning job inside `maintenance` (never a task of its own; its pack_run is the dispatcher's dueness signal, and a dry run deliberately writes none so the job stays due)
+    "dedup-apply",   # SCHEDVIEW1 5.2 — the daily duplicate-merge apply job inside `maintenance` (never a task of its own; its pack_run is the dueness signal, written only on a run that merged, skipped or errored on something — a fire with nothing stamped leaves no trace and stays due, the binding-gauge posture)
+    "schedule-realign",  # BOOT3 (2026-09-19) — the daily daylight-saving re-projection job inside `maintenance` (never a task of its own; its pack_run is the dueness signal, written only on a fire that found a drifted offset — a day with nothing to re-project leaves no trace, the same quiet-run posture binding-gauge takes)
+    "tasks-capture",  # cr1#668 (lane 6 of cr1#609) - the tasks leg's capture half inside `maintenance` (never a task of its own): items from a declared tasks connector; its pack_run is the dueness signal and the window's resume point, written on every run, a skip too
+    "tasks-close",  # cr1#668 - the tasks leg's close half inside `maintenance` (never a task of its own): done items close on a tracking board and propose elsewhere; its pack_run is the dueness signal and the window's resume point
+    "connector-proposals",  # cr1#668 - the documents / deals / contracts leg inside `maintenance` (never a task of its own): proposes closes only and reads people and projects; its pack_run is the dueness signal and the window's resume point
+    "binding-gauge",  # GAUGEJOB1 — the daily binding-gauge refresh job inside `maintenance` (never a task of its own; its pack_run is the dueness signal, written on CHANGE runs only — a quiet run leaves no trace, see binding_gauge.run_gauge_refresh_job's QUIET-RUN SEMANTICS)
+    "people-update",  # cr1#665 (lane 3 of cr1#609) - the DAILY people update job inside `maintenance` (never a task of its own): identity_reconcile.py --daily over the one maintenance window; its pack_run is the dueness signal and the window's resume point, written on every applying run, and never an identity_reconcile_run (that type implies the Sunday identity-reconcile task)
+    "number-ledgers",  # cr1#1018 (train 9) - the sessions and pipeline ledgers rebuilt daily inside `maintenance` (never a task of its own; ledgers.py rebuild --apply); its pack_run is the dueness signal and never makes the ledger stale
+    "decision-list",  # cr1#1073 - the decision list rebuilt daily inside `maintenance` (never a task of its own)
+    "open-list",  # cr1#1012 (train 2) - the open list rebuilt each run inside `maintenance` (never a task of its own)
+    "project-update",  # cr1#665 (lane 3 of cr1#609) - the DAILY project update job inside `maintenance` (never a task of its own): lifecycle_pass.py --daily, the revive leg over the one maintenance window; its pack_run is the dueness signal and the window's resume point, written on every applying run, and never a lifecycle_run (the Sunday lifecycle task's own type)
+})
+
+# cr1#615: the receipts a skill's own step writes, the only ones the write door
+# takes (`receipts:log_receipt`). Every other id is a job's or a driver's, and a
+# chat writing one would say that job ran. `monthly-report`, `weekly-insights`
+# and `cleanup` are jobs too, so these receipts move their due-ness honestly.
+CHAT_RECEIPT_TASKS = frozenset({
+    "objectives",
+    "dormant-scan",
+    "stalled-projects",
+    "pipeline-tracker",
+    "monthly-report",
+    "weekly-insights",
+    "cleanup",
+})
+
+# Renames where the canonical form is NOT just a cr-strip + underscore fix.
+# Sources: source_skill_compat (cr-dont-forget → pulse), live-substrate
+# spellings observed in the v4.5.1 dogfood, and skill-name/task-id splits.
+_TASK_ALIASES = {
+    "dont-forget": "pulse",
+    "dont-forget-run": "pulse",
+    "inbox-pulse": "pulse",           # legacy cr-inbox-pulse was the pulse forerunner
+    "inbox-triage": "inbox",          # customer-facing skill name for the inbox task
+    "morning-briefing": "morning-brief",
+    "weekly-recap": "friday-wrap",    # the skill the friday-wrap task wraps
+    "dormant-customer-scan": "dormant-scan",
+    "sent-reconcile": "reconcile-sent",
+    "session-sweep-run": "session-sweep",
+}
+
+# CTS1 — split-task predecessors: receipts of a RETIRED task also vouch for
+# its successors' served slots (late_fire reads this). The morning after the
+# commitments → waiting-on + my-plate split, the 8:30 slot WAS served — by a
+# receipt written under the old id; without this bridge the first post-split
+# fire would fabricate lateness for a slot that ran. Successor ids stay their
+# own canonical ids (new receipts land under them); this map is read-side
+# only and never rewrites history.
+TASK_PREDECESSORS: dict[str, tuple] = {
+    "waiting-on": ("commitments",),
+    "my-plate": ("commitments",),
+    # EOD2 — the RENAME direction. Stronger than the CTS1 split above: the
+    # successor is the same chat under a new id, reading the same orchestrator
+    # file, and the fire still WRITES `past-meetings`. So every `end-of-day`
+    # read resolves through here, on both sides of the rename and forever —
+    # a workspace that took the offer must not read as never-fired, and one
+    # that never takes it must not read as never-registered.
+    "end-of-day": ("past-meetings",),
+}
+
+# The one lateness field name written from v4.5.2 on. Legacy spellings are
+# read forever via get_late_tier() — never written again.
+LATENESS_FIELD = "late_tier"
+_LEGACY_LATENESS_FIELDS = ("late_tier", "lateness_tier", "tier")
+
+FIRED_VIA = frozenset({"scheduled", "manual", "catchup"})
+
+# Legacy / improvised fired_via values observed in live data → canonical.
+_FIRED_VIA_ALIASES = {
+    "user-trigger": "manual",         # log_pack_run's pre-R1 vocabulary
+    "user_trigger": "manual",
+    "run-now": "manual",
+    "run_now": "manual",
+    "scheduled_late_refire": "catchup",  # F-51's phantom re-fire spelling
+    "scheduled-late-refire": "catchup",
+    "catch-up": "catchup",
+    "catch_up": "catchup",
+}
+
+# Receipt event types per task. `types` = every event type that counts as
+# "this task fired" (the watchdog freshness signal). `count_types`, when
+# present, narrows which types are RUN-COUNTED — monthly-report's fire also
+# emits value_receipt_generated (2-3 per fire: month + quarter + the F-36
+# dupes), so counting those as runs would fabricate fires.
+#: SPEC SURFACES2_11c Lane 3 item 6 — A FIRE THAT COULD NOT RENDER HAS A TYPE
+#: OF ITS OWN. `surface_drivers.log_surface_failed` records a failed fire, and
+#: SURFACEFIX1 had to record it as a `pack_run` carrying `status:
+#: "surface_failed"` because this file belonged to no lane on that train and a
+#: new type here would have been an edit across an ownership line. The word
+#: belongs in the vocabulary, not in a free-form field, so the two surfaces
+#: that HAVE a failure path — the morning brief and the day-close, whose
+#: receipts are written under `past-meetings` — accept it by name below.
+#:
+#: Counting is deliberately unchanged: neither row names `count_types`, so a
+#: `surface_failed` receipt counts as a run exactly as the `pack_run` spelling
+#: does today, and the watchdog's arithmetic does not move. Both spellings are
+#: pinned for one release (`run_eod2_test` [6]) because every receipt already
+#: on disk carries the old one.
+RECEIPT_TYPES: dict[str, dict] = {
+    "morning-brief":      {"types": frozenset({"pack_run", "surface_failed"})},
+    "upcoming-meetings":  {"types": frozenset({"pack_run"})},
+    "inbox":              {"types": frozenset({"pack_run"})},
+    "cockpit":            {"types": frozenset({"pack_run"})},  # COCKPIT1 (cr1#608)
+    "cockpit-prep":  {"types": frozenset({"pack_run"})},  # COCKPIT1 (cr1#619)
+    "cockpit-inbox": {"types": frozenset({"pack_run"})},  # COCKPIT1 (cr1#619)
+    "cockpit-apply": {"types": frozenset({"pack_run"})},  # COCKPIT1 (cr1#619)
+    "cockpit-refresh":{"types": frozenset({"pack_run"})},  # COCKPIT1 (cr1#619)
+    "commitments":        {"types": frozenset({"pack_run"})},
+    # CTS1 — the two split surfaces. `commitments` keeps its row above so
+    # pre-split receipts read forever; the waiting-on window computation
+    # takes max(last_receipt_times(ws, ["waiting-on", "commitments"])) so
+    # the first post-split fire doesn't re-scan a week of mail.
+    "waiting-on":         {"types": frozenset({"pack_run"})},
+    "my-plate":           {"types": frozenset({"pack_run"})},
+    # Pulse fires have left three shapes on disk: pack_run, pulse_run, and
+    # dont_forget_run (F-49's exact miss). All three are pulse receipts.
+    "pulse":              {"types": frozenset({"pack_run", "pulse_run", "dont_forget_run"})},
+    # LIFECYCLE1 — the fold that replaced Pulse's Phase 4. Its own job receipt
+    # (the dispatcher's due-ness rule reads it; written by
+    # lifecycle_pass.run_lifecycle_pass, and ONLY on an --apply run).
+    "lifecycle":          {"types": frozenset({"lifecycle_run"})},
+    "past-meetings":      {"types": frozenset({"pack_run", "surface_failed"})},
+    # EOD2 — the successor id. Same type, and in practice the receipts it
+    # reads are written under `past-meetings` (TASK_PREDECESSORS bridges
+    # them): the row exists so the watchdog / usage-report can ASK about
+    # `end-of-day` by name without a KeyError, and so a receipt ever written
+    # under the new id parses rather than being dropped as unknown.
+    # FIX ROUND 1 (REVIEW_EOD2 M-2, found by measuring the reader side). The
+    # day-close's receipts are WRITTEN under `past-meetings` and COUNTED under
+    # the bucket their `data.surface` names, which is this row — so a
+    # `surface_failed` registered on the write task but not on the bucket
+    # counts as a run under one name and not the other, for one event. Today a
+    # failed fire writes a `pack_run` and counts; the day the writer switches
+    # spelling that number would silently drop. The two rows agree instead.
+    "end-of-day":         {"types": frozenset({"pack_run", "surface_failed"})},
+    # REVIEW_NIGHT11C H-4 (2026-09-15) — the wrap has a failure path
+    # too, and it grew a new way to die the night the coaching blocks
+    # landed (a seat with no timezone). Without the type there is no
+    # `surface_failed` to write and the watchdog reads a dead wrap as a
+    # job that never fired.
+    "friday-wrap":        {"types": frozenset({"pack_run",
+                                               "surface_failed"})},
+    "relationship-moves": {"types": frozenset({"pack_run"})},
+    # TASKRET1 READINESS-retired the Friday CHAT; this row stays forever so
+    # pre-retirement receipts keep parsing. The on-demand `triage my
+    # commitments` fire is unchanged and does not write a pack_run (only the
+    # scheduled fire ever did).
+    "commitment-triage":  {"types": frozenset({"pack_run"})},
+    "cleanup":            {"types": frozenset({"cleanup_run", "audit_run"})},
+    "reconcile-sent":     {"types": frozenset({"sent_reconcile"})},
+    # CHATSCAN1 — the chat leg's own receipt. Deliberately a DIFFERENT type
+    # from `sent_reconcile`: the two legs run in the same fire, and
+    # `validate_reconcile_ran` reads "the latest sent_reconcile event". Had
+    # the chat leg written that type, a chat run would have satisfied the mail
+    # leg's validator and a mail leg that never fired would have read as
+    # healthy — the two would have vouched for each other. Same shape, same
+    # cadence, separate proof.
+    "reconcile-chat":     {"types": frozenset({"chat_reconcile"})},
+    # cr1#664 - the inbound-mail job's receipt. `pack_run`, the standard
+    # scheduled-job shape (the meeting-capture precedent): written on every
+    # terminal state (skipped, blocked, complete), and carrying the thread id
+    # plus message id of every capture so the Inbox chat can yield to it.
+    "inbound-mail":       {"types": frozenset({"pack_run"})},
+    # SPEC EODSPEED1 — the incremental capture pass's job receipt (the
+    # `meeting-capture` maintenance job). `pack_run`, the standard
+    # scheduled-job shape: the dispatcher's due-ness rule reads it and
+    # `catchup_window("meeting-capture", ...)` resumes from its window
+    # fields. Deliberately its OWN task id, never `past-meetings`: a
+    # pack_run on the day-close series would arm skip_render against the
+    # real 5 PM close and split the series EOD2 keeps whole.
+    "meeting-capture":    {"types": frozenset({"pack_run"})},
+    # cr1#668 - the tasks leg's two halves and the propose-only kinds, each
+    # a `pack_run` under its own id on every run (a skip too), so the
+    # uniform due rule and the one maintenance window read it.
+    "tasks-capture":      {"types": frozenset({"pack_run"})},
+    "tasks-close":        {"types": frozenset({"pack_run"})},
+    "connector-proposals": {"types": frozenset({"pack_run"})},
+    "monthly-report":     {"types": frozenset({"operator_report_generated", "value_receipt_generated"}),
+                           "count_types": frozenset({"operator_report_generated"})},
+    # weekly-insights writes a pack_run receipt from v4.5.2 (it was the one
+    # task with NO substrate receipt — the watchdog fell back to view-file
+    # mtimes, which can't be run-counted).
+    "weekly-insights":    {"types": frozenset({"pack_run"})},
+    "session-sweep":      {"types": frozenset({"session_sweep_run"})},
+    "dormant-scan":       {"types": frozenset({"pack_run"})},
+    # stalled-projects scan receipt (v4.5.2 C3 — closes the F-57-noted gap
+    # for the project-side scan: what was surfaced, so the next scan can
+    # dedup its own nags and value receipts can count the work).
+    "stalled-projects":   {"types": frozenset({"pack_run"})},
+    # RCPT1 — pipeline-tracker's report-fire receipt. Its SKILL.md has
+    # mandated this log_receipt since PIPE1 Part 1, but the id was never
+    # registered here, so every mandated call raised ValueError at runtime
+    # (stalled-projects got registered in v4.5.2 C3; pipeline didn't).
+    "pipeline-tracker":   {"types": frozenset({"pack_run"})},
+    # objectives readout receipt (SPEC OBJ1, DRAFT — same C3 shape): what was
+    # surfaced + data.drifting_thread_ids, so the next fire dedups its nags
+    # and the monthly value receipt can count drift flags from receipts.
+    "objectives":         {"types": frozenset({"pack_run"})},
+    # MAINT1 — the dispatcher task's own per-fire audit event. The five job
+    # ids above (cleanup / reconcile-sent / monthly-report / weekly-insights /
+    # session-sweep) keep their own receipt types: those are the JOB success
+    # signals the dispatcher's due-ness rule reads; maintenance_run only says
+    # the dispatcher itself fired and what was due/completed/failed.
+    "maintenance":        {"types": frozenset({"maintenance_run"})},
+    # LB1 R3 — the Staff Meeting chat's per-fire receipt (scheduled or the
+    # on-demand `staff meeting` fire, fired_via distinguishes).
+    "staff-meeting":      {"types": frozenset({"pack_run"})},
+    # BAL1 — the Sunday Balance chat's per-fire receipt (scheduled or the
+    # on-demand `balance check` fire). The receipt is the standard pack_run
+    # shape and carries NO personal content — surfaced count only.
+    "balance":            {"types": frozenset({"pack_run"})},
+    # PIPE1 Part 2 — the Tuesday Pipeline Digest chat's per-fire receipt
+    # (standard pack_run; ALSO the marker the next digest's since-last-digest
+    # window keys on, so it writes even on a degrade fire with surfaced=0).
+    "pipeline-digest":    {"types": frozenset({"pack_run"})},
+    # LB1 D7 — the deal-signal detector's job receipt (the dispatcher's
+    # due-ness rule reads it; written by deal_signal_detector.run_deal_signal_job).
+    "deal-signals":       {"types": frozenset({"pack_run"})},
+    # SPEC_LEARN1 A7 — the standard scheduled-job shape, like deal-signals.
+    "learning":           {"types": frozenset({"pack_run"})},
+    # PID1 D7 — the identity reconciler's per-run receipt: ALSO the D6
+    # CHANGED-narration source (change_feed reads n_auto_added / n_linked)
+    # and the honesty artifact (counts from what was WRITTEN, never the
+    # plan). The dispatcher's due-ness rule reads it, so an M-fired backfill
+    # also serves that week's Sunday slot.
+    "identity-reconcile": {"types": frozenset({"identity_reconcile_run"})},
+    # REVSCHED1 §3-2 — the weekly unconfirmed-pile drain job's receipt.
+    # `pack_run`, the standard scheduled-job shape (like deal-signals): the
+    # dispatcher's dueness rule reads it, so it self-limits to weekly. Written
+    # on an EMPTY plan too — the no-op is silent to the CEO but never silent to
+    # the ledger, because a job that only receipts when it finds work
+    # re-derives the whole pile at every one of the task's three daily slots
+    # forever. Its extra_data carries the §3-4 honesty trio (n_applied /
+    # n_shielded_by_reopen / n_held_back), every number off the writer's own
+    # per-row results.
+    "review-expiry":      {"types": frozenset({"pack_run"})},
+    # cr1#164: the chat pointer sweep's one receipt per run, a clean book
+    # included (a silent green receipt is the proof the sweep ran).
+    "chat-pointer-sweep": {"types": frozenset({"pack_run"})},
+    # TTL1 (SPEC_FLOW1 Lane G, 2026-09-07) — the daily question-expiry
+    # engine's own run receipt. NOT a `pack_run`: the engine writes
+    # `question_expiry_run`, the one row `question_ttl.decided_for_you_lines`
+    # and `brain_undo.recent_auto_batches` already read, and registering a
+    # SECOND receipt shape for the same run would give the wrap two rows to
+    # fold and the ledger two spellings of one fire. `identity_reconcile_run`
+    # is the same choice for the same reason.
+    #
+    # QUIET-RUN SEMANTICS, the GAUGEJOB1 posture deliberately: the receipt is
+    # written ONLY on a run that actually settled something (`apply` AND
+    # n_expired-or-n_tracked). A run that found no question old enough leaves
+    # NO trace, so the job stays due and re-derives at the next fire - cheap,
+    # and the honest answer to "when did this pass last do work". A
+    # receipt-every-fire rule here would buy dueness self-limiting with a
+    # ledger row saying a run happened on a day nothing expired, which is the
+    # fake "ran" this contract exists to refuse. Before this registration the
+    # job had no receipt spec at all, so the uniform due rule saw no receipt
+    # ever and re-derived the whole pile at all three of the task's daily
+    # slots forever.
+    "question-expiry":    {"types": frozenset({"question_expiry_run"})},
+    # cr1#724: the sync conflict-copy merge's receipt: one row per sweep
+    # that FOUND a copy (merged, archived or held); a quiet sweep writes
+    # none. The sweep rides every Maintenance fire's start marker
+    # (`maintenance_dispatcher._sync_conflict_sweep`), not a registry row.
+    "sync-conflicts":     {"types": frozenset({"sync_conflicts_run"})},
+    # SWEEPSCHED1 — the weekly confirmed-pile drain job's receipt. `pack_run`,
+    # the same scheduled-job shape its review-tier sibling uses, so the
+    # dispatcher's dueness rule self-limits it to weekly. Written on an EMPTY
+    # plan and on a PROPOSING fire too, and the second one is load-bearing
+    # twice over: it is the dueness signal, and `data.mode` on these receipts
+    # IS the confirm-first counter — the job counts its own prior fires here
+    # rather than in config, so there is no second piece of state to disagree
+    # with the ledger. `mode` is "proposed" (showed its hand, closed nothing)
+    # or "applied"; a refusal that never reached a plan carries neither and is
+    # therefore not counted.
+    "age-out":            {"types": frozenset({"pack_run"})},
+    # POLICY1-B DD-7 — the calendar closer's receipt, the same scheduled-job
+    # shape; written on a proposing fire and an applying fire alike (the
+    # `mode` on it IS the confirm-first counter, like age-out's).
+    "calendar-close":     {"types": frozenset({"pack_run"})},
+    # EXIT1 (SPEC_FLOW1 Lane B) — the exit doors' receipt, the same
+    # scheduled-job shape. Written on EVERY applying fire, whether or not it
+    # found anything: the receipt is the dueness signal, so a job that only
+    # receipts when it acts re-derives the whole open set at every slot.
+    "exit-doors":         {"types": frozenset({"pack_run"})},
+    # GAUGEJOB1 — the daily binding-gauge refresh job's receipt. `pack_run`,
+    # the standard scheduled-job shape: the dispatcher's dueness rule reads it
+    # and self-limits the refresh to daily on any day with substrate
+    # movement. Written on CHANGE runs ONLY, and BEFORE the artifact — a
+    # deliberate departure from review-expiry's receipt-every-fire rule: the
+    # receipt is itself a ledger event, so a quiet-run receipt (or one
+    # written after the artifact) would advance the events high-water mark
+    # past the artifact's own stamp and flag every reader stale over the
+    # job's bookkeeping forever. A quiet run leaves no trace and simply
+    # re-runs at the next fire (~2s, the accepted trade — see
+    # binding_gauge's QUIET-RUN SEMANTICS note).
+    # MEASURE1 — the daily flow measure job's receipt. `pack_run`, the
+    # standard scheduled-job shape, so the dispatcher's uniform due rule
+    # self-limits the measure to once a day. Written ONLY on a fire that
+    # actually wrote a day's row: FOLD1-A fires the maintenance run three
+    # to four times a day, and every fire after the first finds every
+    # complete day already measured, writes nothing, and receipts nothing —
+    # so the job stays due and exits in milliseconds, exactly the
+    # binding-gauge quiet-run trade.
+    "daily-measure":      {"types": frozenset({"pack_run"})},
+    # SCHEDVIEW1 5.2 — the duplicate-merge apply job's receipt. `pack_run`,
+    # the standard scheduled-job shape, so the dispatcher's uniform due rule
+    # self-limits it to once a day. Written ONLY on a fire that actually
+    # applied, deferred or errored on a stamped merge: a fire with nothing
+    # stamped writes nothing, stays due and exits in milliseconds — the
+    # binding-gauge quiet-run trade.
+    "dedup-apply":        {"types": frozenset({"pack_run"})},
+    "binding-gauge":      {"types": frozenset({"pack_run"})},
+    "schedule-realign":   {"types": frozenset({"pack_run"})},
+    # SPEC OUT7 — the opt-in monthly KPI scorecard job's receipt. pack_run, the
+    # standard scheduled-pack shape (like deal-signals / staff-meeting): the
+    # dispatcher's due-ness rule reads it so a fired scorecard self-limits to
+    # monthly. Only ever written when the workspace opted the job in.
+    "monthly-scorecard":  {"types": frozenset({"pack_run"})},
+    # cr1#665 - the two daily update jobs' receipts. `pack_run`, the standard
+    # scheduled-job shape, so the uniform due rule self-limits each to once a
+    # day; written on EVERY applying run (the receipt is also where the next
+    # run's window starts), on a run that changed nothing too.
+    "people-update":      {"types": frozenset({"pack_run"})},
+    "project-update":     {"types": frozenset({"pack_run"})},
+    # cr1#1018 (train 9): the number ledgers, rebuilt daily inside
+    # maintenance; one pack_run per applying run.
+    "number-ledgers":     {"types": frozenset({"pack_run"})},
+    "decision-list":      {"types": frozenset({"pack_run"})},
+    "open-list":          {"types": frozenset({"pack_run"})},
+}
+
+# Types that identify their task by TYPE alone (exactly one writer each).
+_TYPE_IMPLIES_TASK = {
+    "sent_reconcile": "reconcile-sent",
+    "chat_reconcile": "reconcile-chat",
+    "session_sweep_run": "session-sweep",
+    "cleanup_run": "cleanup",
+    "audit_run": "cleanup",
+    "operator_report_generated": "monthly-report",
+    "value_receipt_generated": "monthly-report",
+    "pulse_run": "pulse",
+    "dont_forget_run": "pulse",
+    "maintenance_run": "maintenance",
+    "identity_reconcile_run": "identity-reconcile",
+    "question_expiry_run": "question-expiry",  # TTL1 - one writer, question_ttl.run_question_expiry
+    "sync_conflicts_run": "sync-conflicts",  # cr1#724 - one writer, sync_conflict_copies.run
+}
+
+ALL_RECEIPT_TYPES = frozenset().union(*(spec["types"] for spec in RECEIPT_TYPES.values()))
+
+#: LEDGER3 (F-T2-6, D-T2B-4) - the audit rows that are receipts by contract
+#: but are not registered in `RECEIPT_TYPES` above (they name no task, or
+#: their task is counted by another row). The 2026-09-27 walk found four of
+#: these on the book with no `data.machine`: a `plugin_update` typed into the
+#: bridge SKILL, a `gate_ran` from the brief writer, a `question_expiry_run`
+#: and a `flow_measure`. Every name here is an event type some writer in this
+#: plugin appends today; none was dropped from the spec's list.
+_AUDIT_RECEIPT_TYPES = frozenset({
+    "gate_ran",
+    "plugin_update",
+    "plugin_update_remediation",
+    "flow_measure",
+    "maintenance_run",
+    "late_fire",
+    "schedule_config_changed",
+    "schedule_refreshed",
+    "scheduled_writer_declared",
+})
+
+#: Every row type the ledger appender stamps with `machine_fields()` when the
+#: writer did not (`atomic_write.stamp_receipt_machine`). DERIVED at import
+#: from every spec's `types` in `RECEIPT_TYPES`, so a receipt type registered
+#: there tomorrow is stamped with no new row here; the audit set above is the
+#: only hand-kept part. Rows of any other type are never touched.
+MACHINE_STAMPED_TYPES = frozenset().union(
+    *(spec["types"] for spec in RECEIPT_TYPES.values())) | _AUDIT_RECEIPT_TYPES
+
+# Two receipts of DIFFERENT types this close together are one fire (a task
+# emitting its primary receipt plus a secondary one, e.g. monthly-report's
+# operator report + value receipts ~20s apart). Same-type receipts NEVER
+# merge — two pack_runs 4 minutes apart are two real runs (M's back-to-back
+# manual sweeps, F-08).
+RUN_DEDUP_WINDOW = _dt.timedelta(minutes=15)
+
+
+# ---------------------------------------------------------------------------
+# Normalizers
+# ---------------------------------------------------------------------------
+
+def normalize_task_id(value):
+    """Canonicalize any task-id / kind / source_skill spelling observed in
+    live substrates: lowercase, `cr-` prefix stripped, underscores → hyphens,
+    known renames via the alias table.
+
+    Non-strings pass through unchanged (defensive readers feed raw data).
+    Unknown-but-clean ids (e.g. `list`, `historical-backfill`) return in
+    normalized form without being forced into CANONICAL_TASK_IDS — the
+    caller decides whether unknowns matter.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return value
+    v = value.strip().lower().replace("_", "-")
+    if v.startswith("cr-"):
+        v = v[3:]
+    return _TASK_ALIASES.get(v, v)
+
+
+def normalize_fired_via(value) -> Optional[str]:
+    """Canonicalize a fired_via value; None when absent/unrecognizable.
+    Unknown strings return normalized-lowercase (never dropped — the raw
+    value is still evidence)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    v = value.strip().lower()
+    return _FIRED_VIA_ALIASES.get(v, v)
+
+
+#: The environment variable that says HOW this process was started. Set by
+#: the bootloader's container shell step (it IS the scheduled fire) and
+#: forwarded onto the rendered command by `workspace_access.plan`, so a helper
+#: child running beside the customer's data can read the run mode instead of
+#: being told it by a model.
+FIRED_VIA_ENV = "CR_FIRED_VIA"
+
+
+def resolve_fired_via(explicit=None, env=None) -> str:
+    """The run mode for a writer whose caller did not state one.
+
+    Order: an explicit argument wins, then `CR_FIRED_VIA`, then `manual`.
+
+    WHY `manual` IS THE FLOOR. Mislabelling a manual fire as scheduled
+    FABRICATES history — it claims a slot was delivered when a person asked
+    for the surface — while mislabelling a scheduled fire as manual costs a
+    missing note (RECEIPT_CONTRACT, run-mode detection; F-47 P1a). The gate
+    walk landed a hand-typed brief in the ledger as `scheduled`, which is the
+    expensive direction of that error, and it landed there because nothing in
+    the environment could say otherwise and the default said `scheduled`.
+
+    WHY AN ENVIRONMENT VARIABLE AND NOT A GUESS. There is no signal in the
+    merged environment that distinguishes a scheduled fire from a typed one
+    (gap analysis D-1 is explicit that inventing one is the thing not to do).
+    But the bootloader KNOWS: it is the body a scheduled fire runs. So the one
+    process that knows states it, and everything downstream reads it.
+    """
+    if explicit is not None:
+        via = normalize_fired_via(explicit)
+        if via:
+            return via
+    try:
+        import os as _os
+
+        environ = dict(_os.environ) if env is None else dict(env)
+    except (TypeError, ValueError):
+        environ = {}
+    via = normalize_fired_via(environ.get(FIRED_VIA_ENV))
+    if via in FIRED_VIA:
+        return via
+    return "manual"
+
+
+#: The field, and the variable a surface exports so a job it runs in a
+#: separate process can stamp it (FIX3 F3-6).
+TRIGGERED_BY_FIELD = "triggered_by"
+TRIGGERED_BY_ENV = "CR_TRIGGERED_BY"
+
+
+def _triggered_by_env(env=None) -> str:
+    """`CR_TRIGGERED_BY`, or "" — never raises, never guesses."""
+    try:
+        import os as _os
+
+        environ = dict(_os.environ) if env is None else dict(env)
+    except (TypeError, ValueError):
+        return ""
+    return str(environ.get(TRIGGERED_BY_ENV, "") or "").strip()
+
+
+def effective_fired_via(explicit=None, env=None) -> str:
+    """The run mode for a composer whose parameter DEFAULTS to `scheduled`.
+
+    `resolve_fired_via` is the rule for a composer whose default is "say
+    nothing"; this is the rule for the eight or so whose default is a claim.
+    Flipping those defaults outright would change what every legacy seat
+    writes, so the seat decides:
+
+      * an explicit argument always wins;
+      * on a MERGED seat (`CR_HOST_MODE=vm` or `CR_ENV=merged_cloud`) the
+        environment answers, and `manual` is the floor - that is the seat the
+        2026-09-20 walk ran on, where a typed brief recorded itself as a
+        scheduled fire and nothing in the process could say otherwise;
+      * anywhere else, today's `scheduled`, byte for byte. Every legacy and
+        local caller states the value in prose today, so nothing there moves.
+
+    The re-verifier's M-3: the round recorded the census of these defaults and
+    swept three of them. This is the rest of the mechanism, applied at the
+    composers a merged chat actually reaches.
+    """
+    if explicit is not None:
+        via = normalize_fired_via(explicit)
+        if via:
+            return via
+    if not _is_vm_seat(env):
+        return "scheduled"
+    return resolve_fired_via(None, env)
+
+
+def get_late_tier(data) -> Optional[str]:
+    """The receipt's lateness tier under any legacy spelling
+    (`late_tier` → `lateness_tier` → `tier`, first present wins)."""
+    if not isinstance(data, dict):
+        return None
+    for field in _LEGACY_LATENESS_FIELDS:
+        v = data.get(field)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def receipt_task_id(ev) -> Optional[str]:
+    """The canonical task a receipt event belongs to, or None when the event
+    is not a receipt (wrong type) or names no known task.
+
+    Matching order:
+      1. event type implies the task (sent_reconcile → reconcile-sent, ...)
+      2. identity fields, first canonical match wins:
+         data.task_id → data.taskId → data.kind → source_skill →
+         data.source_skill — each run through normalize_task_id, so
+         `cr-commitments`, `past_meetings`, `upcoming_meetings`,
+         `dont_forget`, and `morning-briefing` all land correctly.
+    """
+    if not isinstance(ev, dict):
+        return None
+    etype = ev.get("type")
+    if etype not in ALL_RECEIPT_TYPES:
+        return None
+    implied = _TYPE_IMPLIES_TASK.get(etype)
+    if implied:
+        return implied
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    for candidate in (
+        data.get("task_id"),
+        data.get("taskId"),
+        data.get("kind"),
+        ev.get("source_skill"),
+        data.get("source_skill"),
+    ):
+        norm = normalize_task_id(candidate)
+        if isinstance(norm, str) and norm in CANONICAL_TASK_IDS:
+            return norm
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Writer
+# ---------------------------------------------------------------------------
+
+def _machine_name() -> Optional[str]:
+    """The machine token for this computer (SPEC SCHED1 §0-3), or None.
+
+    THE FINDING (2026-08-17). This was `platform.node()`, and rule 4 of
+    `RECEIPT_CONTRACT.md` says the field exists so "readers can't tell two
+    machines from a double-registration bug". Inside the legacy Cowork sandbox
+    `platform.node()` returns the SAME string on every physical machine — 840
+    receipts written from two different computers all carry one value — so the
+    field answered the question it exists for with a constant. Swapping it for
+    another sandbox-visible name fixes nothing: they are all properties of the
+    sandbox, not of the computer under it.
+
+    `machine_identity` resolves a machine-local marker instead. Kept as the ONE
+    chokepoint rather than editing each stamp site to import the new module: a
+    prose-free single point of change is how the `fired_via` vocabulary stopped
+    drifting, and every existing caller migrates without touching its file.
+    Falls back to the pre-SCHED1 behaviour if the module is unavailable.
+    """
+    try:
+        from machine_identity import machine_id
+
+        return machine_id()
+    except Exception:
+        try:
+            import platform
+            name = platform.node()
+            return name[:64] if name else None
+        except Exception:
+            return None
+
+
+#: The two env signals that say this process runs in the sandbox VM on a merged
+#: seat. Its HOME is per-session (`/sessions/rcw-<id>`, wiped at the end), so
+#: the marker `machine_identity()` would mint there is a SESSION id wearing a
+#: machine's name — which is exactly what the gate walk found in the ledger
+#: (`claude-53b1`, `claude-7cc6`, and the container hostname `claude` on the
+#: fire). Ruling R-FIX-4: on that seat, with no writer id, a receipt carries NO
+#: machine token at all and says so with the fallback flag.
+VM_HOST_MODE_ENV = "CR_HOST_MODE"
+VM_HOST_MODE_VALUE = "vm"
+MERGED_ENV_KEY = "CR_ENV"
+MERGED_ENV_VALUE = "merged_cloud"
+
+#: The fallback flag's name, restated here only for the import-failure path —
+#: `machine_identity.FALLBACK_FIELD` is the definition.
+_FALLBACK_FIELD_FALLBACK = "machine_id_fallback"
+
+
+def _is_vm_seat(env=None) -> bool:
+    """True on a merged seat's sandbox VM, where a minted marker is a session."""
+    try:
+        import os as _os
+
+        environ = dict(_os.environ) if env is None else dict(env)
+    except (TypeError, ValueError):
+        return False
+    if str(environ.get(VM_HOST_MODE_ENV, "")).strip().lower() == VM_HOST_MODE_VALUE:
+        return True
+    if str(environ.get(MERGED_ENV_KEY, "")).strip().lower() == MERGED_ENV_VALUE:
+        return True
+    # IDENT1 I-0 — the one fact a bare shell cannot lose. The walk's direct
+    # import ran with none of the door's variables, so the two tests above
+    # said "not a VM" and the marker leg minted `claude-a90f`. This file's
+    # own location said otherwise: a copy installed inside a workspace runs
+    # on a merged seat's sandbox VM. The SAME rule `workspace_access.
+    # detect_host_mode` applies — the staged runtime is a VM unless ENV1
+    # positively names a legacy or local seat (a legacy-shape fire renders
+    # its helpers from the same installed copy and must keep today's stamp).
+    if _runs_from_runtime_cache():
+        try:
+            from writer_identity import detected_mode
+
+            mode = detected_mode(environ)
+        except Exception:  # noqa: BLE001
+            mode = None
+        # ENV1's four modes: only a merged or an unreadable seat is a VM here;
+        # the two legacy/local modes keep today's stamp.
+        return mode in (None, "unknown", "merged_cloud")
+    return False
+
+
+def machine_fields(env=None) -> dict:
+    """`{"machine": <token>}` for a receipt's `data`, `{}` when unknowable.
+
+    THE PUBLIC stamp helper — every writer outside this module uses it rather
+    than reaching for the private `_machine_name`, so the fallback flag lands
+    uniformly instead of at whichever site remembered it.
+
+    THREE ANSWERS, IN ORDER (fix round 2, from the M1+M2 gate walk).
+
+    1. The SHARED WRITER ID, asked first — the same order `machine_id()` uses.
+       This module used to call `machine_identity()` directly and so bypassed
+       the ACCESS1 identity on every receipt ever written on a merged seat: the
+       walk's ledger carries a session token on five rows and a container
+       hostname on the fire, while the id one frame away was correct. A writer
+       id is durable by derivation, so it never carries the fallback flag.
+    2. NOTHING, on a VM seat with no writer id (R-FIX-4). The marker would be
+       minted in a home that dies with the session, so `machine` is ABSENT and
+       `machine_id_fallback` says the run could not name a writer. A field that
+       is absent is honest; a session id spelled like a machine is not, and
+       append-only history keeps whichever one is written.
+    3. The machine marker, exactly as today, on every legacy and local seat —
+       byte-identical, which is what holds the un-merged fleet.
+
+    Carries `machine_id_fallback: true` when the token could not be persisted
+    to the machine-local marker (a read-only or absent home) or when case 2
+    applies: "this run could not name a durable writer". Present only when
+    true, so the ordinary receipt's shape is unchanged.
+    """
+    try:
+        from machine_identity import shared_writer_id
+
+        writer = shared_writer_id(env)
+    except Exception:  # noqa: BLE001 — identity never blocks a receipt
+        writer = None
+    if writer:
+        return {"machine": writer}
+    try:
+        from machine_identity import FALLBACK_FIELD
+    except Exception:  # noqa: BLE001
+        FALLBACK_FIELD = _FALLBACK_FIELD_FALLBACK
+    if _is_vm_seat(env):
+        return {FALLBACK_FIELD: True}
+    try:
+        from machine_identity import machine_identity
+
+        ident = machine_identity()
+        token = ident.get("machine")
+        if not token:
+            return {}
+        out = {"machine": token}
+        if ident.get("fallback"):
+            out[FALLBACK_FIELD] = True
+        return out
+    except Exception:  # noqa: BLE001 — identity never blocks a receipt
+        name = _machine_name()
+        return {"machine": name} if name else {}
+
+
+# ---------------------------------------------------------------------------
+# IDENT1 I-0 — the receipt-writer fence (R-RW2-3 second half; D-2)
+# ---------------------------------------------------------------------------
+
+#: The ONE sentence a receipt writer says when it refuses for want of an
+#: identity. Plain words, no mechanism: the customer did nothing wrong and
+#: there is nothing for them to type. Validated by the lane suite through
+#: `validate_chat_output`, never assumed clean.
+WRITER_IDENTITY_REQUIRED_LINE = (
+    "Nothing was saved, because this chat could not confirm which account "
+    "it is writing for.")
+
+#: The two causes the refusal can carry. The envelope's `reason` is always
+#: `writer_identity_required`; the cause says which leg refused.
+CAUSE_NO_WRITER_ID = "no_writer_id"
+CAUSE_FOREIGN_SCHEDULED_WRITER = "foreign_scheduled_writer"
+
+
+class WriterIdentityRequired(RuntimeError):
+    """A receipt write refused because the writer cannot be named.
+
+    THE WALK (2026-09-22, re-walk 2, HOLD driver 2). The prep chat could not
+    reach the prep's path helper through the door, so it imported
+    `brief_writer` and `receipts` straight into a shell on the customer's
+    machine. Nothing forwarded the writer id into that shell, and the receipt
+    went into append-only history as `data.machine: claude-a90f` — a session
+    token spelled like a computer. M ruled (R-RW2-3, "BOTH"): the receipt
+    writers REFUSE any write with no forwarded writer identity on a merged
+    seat, loudly and in one plain sentence, and never stamp a session token.
+
+    `line` is that sentence; `cause` is which leg refused.
+    """
+
+    #: The reason the access layer's doors refuse with when a child raises
+    #: this - read off the class, so the door needs no import of it.
+    cr_refusal_reason = "writer_identity_required"
+
+    def __init__(self, line: str = WRITER_IDENTITY_REQUIRED_LINE, *,
+                 cause: str = CAUSE_NO_WRITER_ID):
+        super().__init__(line)
+        self.line = line
+        self.cause = cause
+
+
+def _runs_from_runtime_cache() -> bool:
+    """True when THIS module is the copy installed inside a workspace.
+
+    `<ws>/_hq/.cache/cr-runtime/<version>/shared/scripts/receipts.py` exists
+    only on a merged seat's sandbox VM — the one host the runtime is installed
+    for. It is the one signal a bare shell cannot lose: the walk's direct
+    import ran with none of the door's variables in its environment
+    (`CR_HOST_MODE`, `CR_ENV`), so the environment half of `_is_vm_seat` said
+    "legacy" and the marker leg minted `claude-a90f`. The file's own location
+    said "sandbox VM" the whole time.
+    """
+    try:
+        parts = Path(__file__).resolve().parts
+    except Exception:  # noqa: BLE001
+        return False
+    for i in range(len(parts) - 2):
+        if (parts[i] == "_hq" and parts[i + 1] == ".cache"
+                and parts[i + 2] == "cr-runtime"):
+            return True
+    return False
+
+
+def _declared_scheduled_writer(workspace_root) -> Optional[str]:
+    """The workspace's declared scheduled writer id, or None.
+
+    RETIRE1's R0 reader (`schedule_config.scheduled_writer`, SAFETY0). Until
+    that commit is on the tree the import fails and the answer is "no
+    declaration" — the conservative result, which is today's behaviour.
+    Every other failure answers None too: a reader that cannot read a
+    declaration must not invent a refusal.
+    """
+    try:
+        from schedule_config import scheduled_writer  # type: ignore
+    except ImportError:
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        declared = scheduled_writer(workspace_root)
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(declared, dict):
+        declared = declared.get("writer_id")
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip()
+    return None
+
+
+def _foreign_writer_line() -> str:
+    """RETIRE1's foreign-writer sentence when its module carries one, else
+    this module's own. The sentence is RETIRE1's to word (spec §7); this is
+    only a reader of it."""
+    try:
+        from schedule_config import SCHEDULED_WRITER_LINES  # type: ignore
+    except Exception:  # noqa: BLE001
+        return WRITER_IDENTITY_REQUIRED_LINE
+    line = None
+    if isinstance(SCHEDULED_WRITER_LINES, dict):
+        line = SCHEDULED_WRITER_LINES.get("foreign")
+    elif isinstance(SCHEDULED_WRITER_LINES, (list, tuple)) and len(SCHEDULED_WRITER_LINES) > 1:
+        line = SCHEDULED_WRITER_LINES[1]
+    return line if isinstance(line, str) and line.strip() else WRITER_IDENTITY_REQUIRED_LINE
+
+
+def _declared_scheduled_writer_row(workspace_root) -> Optional[dict]:
+    """The whole declaration (`{writer_id, device_digest?, ...}`), or None;
+    the same reader and the same silence as `_declared_scheduled_writer`."""
+    try:
+        from schedule_config import scheduled_writer  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        declared = scheduled_writer(workspace_root)
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(declared, dict) and str(declared.get("writer_id") or "").strip():
+        return declared
+    return None
+
+
+def foreign_scheduled_fire(environ: dict, workspace_root=None) -> Optional[str]:
+    """Why a scheduled fire in `environ` is foreign to the workspace's declared
+    scheduled writer, or None when it is not (or nothing is declared).
+
+    READS ONLY what the fire was HANDED (the forwarded pair and the forwarded
+    folder path) and the declaration; never the identity file, and it never
+    writes one (cr1#605). The answers:
+      `writer`  the forwarded id is absent or is not the declared one;
+      `device`  the ids match but the declaration carries a `device_digest`
+                and this fire's `CR_DEVICE_WORKSPACE` digests differently:
+                the same account on another computer (HYGIENE3 / D-4), the
+                verdict `fire_guards.scheduled_writer` already gives and the
+                write door now gives with the same line.
+    A legacy or local seat, a manual run, a workspace with no declaration:
+    None, today's behaviour."""
+    if normalize_fired_via(environ.get(FIRED_VIA_ENV)) != "scheduled":
+        return None
+    decl = _declared_scheduled_writer_row(
+        workspace_root if workspace_root is not None
+        else (environ.get("CR_WORKSPACE") or None))
+    if not decl:
+        return None
+    # cr1#1138: the holder is compared by its account and computer marks
+    # when both sides carry them (a renamed folder and another organisation
+    # keep the holder; a second computer on the same folder path does not),
+    # and a pending hand-over is honoured. Asked on EVERY write through the
+    # door, so a run that started before a hand-over stops at its next write.
+    try:
+        import schedule_holder as _sh
+
+        why = _sh.fire_verdict(decl, environ)
+    except Exception:  # noqa: BLE001 - fall back to the comparison below
+        _sh, why = None, False
+    if _sh is not None:
+        if why in (_sh.FOREIGN_ACCOUNT, _sh.FOREIGN_WRITER):
+            return "writer"
+        if why in (_sh.FOREIGN_COMPUTER, _sh.FOREIGN_DEVICE):
+            return "device"
+        return None
+    declared = str(decl.get("writer_id") or "").strip()
+    try:
+        from writer_identity import forwarded_pair
+
+        pair = forwarded_pair(environ)
+    except Exception:  # noqa: BLE001
+        pair = None
+    forwarded = pair[0] if pair else None
+    if forwarded != declared:
+        return "writer"
+    want = decl.get("device_digest")
+    if want:
+        try:
+            from schedule_config import DEVICE_WORKSPACE_ENV, device_digest
+
+            here = device_digest(environ.get(DEVICE_WORKSPACE_ENV))
+        except Exception:  # noqa: BLE001
+            here = None
+        if here and here != want:
+            return "device"
+    return None
+
+
+def require_writer_identity(env=None, *, workspace_root=None,
+                            allow_foreign: bool = False) -> Optional[str]:
+    """The writer id this receipt will carry — or a refusal, in one sentence.
+
+    Asked FIRST by every receipt writer in this module and by the write door
+    (`workspace_access.run_writer`) before it dispatches. Two legs refuse:
+
+    (a) a merged seat's sandbox VM (`_is_vm_seat`) with no shared writer id.
+        The marker `machine_fields` would otherwise fall back to is minted in
+        a home that dies with the session; R-FIX-4 made that leg stamp
+        nothing, and R-RW2-3 makes the WRITE itself refuse, so a bypass is
+        loud instead of quietly anonymous.
+    (b) a scheduled fire (`CR_FIRED_VIA=scheduled`) on a workspace that
+        DECLARES its one scheduled writer (SAFETY0, RETIRE1's R0) when the
+        forwarded id is absent or is not the declared one, or (cr1#605) when
+        the declaration names a folder digest this fire's forwarded folder
+        does not match. Identity by HANDING, never by reading (D-1): the
+        fire's id is what the registering seat baked into it, so a chat
+        registered from another computer carries that computer's id and
+        stops here.
+
+    THE ORDER IS THE FIX (cr1#605). Leg (b) is asked BEFORE the shared writer
+    id is read, because reading it (`writer_identity.writer_id`) caches the
+    forwarded pair into `_hq/.system/writer_identity.json`: a refused foreign
+    fire used to rewrite the workspace's identity file to the refused id on
+    its way to the refusal. A refused write now changes nothing.
+
+    `allow_foreign` is for the ONE writer that records a foreign fire's own
+    stop (`log_fire_stopped`, cr1#603): leg (b) is skipped for it and only
+    for it; leg (a) still refuses.
+
+    Otherwise it returns the shared writer id, or None — every legacy and
+    local seat, byte for byte today's behaviour (the caller's
+    `machine_fields` then stamps exactly what it always has).
+    """
+    try:
+        import os as _os
+
+        environ = dict(_os.environ) if env is None else dict(env)
+    except (TypeError, ValueError):
+        environ = {}
+    if foreign_scheduled_fire(environ, workspace_root):
+        if not allow_foreign:
+            raise WriterIdentityRequired(
+                _foreign_writer_line(), cause=CAUSE_FOREIGN_SCHEDULED_WRITER)
+        # The foreign fire's own stop record: it is named by what it was
+        # HANDED, and nothing is cached into the workspace for it (reading
+        # the shared id would write the forwarded pair into the identity
+        # file, cr1#605's rewrite through another door).
+        try:
+            from writer_identity import forwarded_pair
+
+            pair = forwarded_pair(environ)
+        except Exception:  # noqa: BLE001
+            pair = None
+        if pair:
+            return pair[0]
+        if _is_vm_seat(environ):
+            raise WriterIdentityRequired(cause=CAUSE_NO_WRITER_ID)
+        return None
+    try:
+        from machine_identity import shared_writer_id
+
+        writer = shared_writer_id(environ if env is not None else None)
+    except Exception:  # noqa: BLE001
+        writer = None
+    if not writer and _is_vm_seat(environ):
+        raise WriterIdentityRequired(cause=CAUSE_NO_WRITER_ID)
+    return writer or None
+
+
+#: cr1#603 — the one row a scheduled fire that STOPPED before its surface
+#: leaves behind. Not a receipt type of any task (the watchdog must still read
+#: the chat as late); the health check reads the newest one for the reason.
+FIRE_STOPPED_TYPE = "fire_stopped"
+
+#: The abort codes the bootloader's stop paths name, each with the plain
+#: words the health check says for it. A code outside this table is still
+#: recorded (the table is for the sentence, never a gate).
+FIRE_STOP_REASONS: dict = {
+    "folder_not_granted": "your computer had not yet allowed it the folder",
+    "plugin_not_found": "it could not find Command Room in that run",
+    "orchestrator_not_found": "it found Command Room but not its own instructions",
+    "env_unknown": "it could not tell which environment it was running in",
+    "workspace_not_found": "it could not find your Command Room folder",
+    "runtime_missing": "the Command Room runtime in your folder could not be brought current",
+    "root_blocked": "your folder no longer matches the one it was registered with",
+    "retired": "it is retired",
+    "foreign_scheduled_writer": ("it was set up from a computer that no longer "
+                                 "runs your scheduled chats"),
+    "contract_marker": "its instructions failed their integrity check",
+    "migration_gate": "its chain has not moved onto the workspace access layer yet",
+    # cr1#1464: the Hub inbox run read the mail but could not build its page.
+    "inbox_page_not_built": "it could not build your inbox page",
+}
+
+_ABORT_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+
+
+def fire_stop_reason_words(abort_code) -> str:
+    """The plain words for an abort code; an unknown code reads as itself
+    with its underscores as spaces."""
+    code = str(abort_code or "").strip().lower()
+    return FIRE_STOP_REASONS.get(code) or (
+        f"it stopped before it started ({code.replace('_', ' ')})" if code
+        else "it stopped before it started")
+
+
+def log_fire_stopped(workspace_root, task_id, abort_code, *, fired_via=None,
+                     detail=None, env=None) -> dict:
+    """Record that a scheduled fire STOPPED before its surface (cr1#603).
+
+    The bootloader calls this through the write door before it posts any
+    STOP line once the workspace is reachable. One `fire_stopped` row:
+    `{task_id, kind: fire_stopped, abort_code, fired_via, forwarded_writer,
+    declared_writer, foreign, detail?, machine?}`. `detail` is at most 160
+    plain characters (no path lands here; the health check renders it).
+
+    A FOREIGN fire may write this one row and nothing else: it is how the
+    owner learns, from the workspace, that a chat set up elsewhere is still
+    stopping here. The forwarded and declared ids are stamped so the mismatch
+    is visible on the book; a merged seat with no writer id at all still
+    refuses (leg (a) of `require_writer_identity`)."""
+    import os as _os
+
+    environ = dict(_os.environ) if env is None else dict(env)
+    writer = require_writer_identity(environ, workspace_root=workspace_root,
+                                     allow_foreign=True)
+    code = str(abort_code or "").strip().lower()
+    if not _ABORT_CODE_RE.match(code):
+        raise ValueError(f"abort_code must be a short lowercase slug; got {abort_code!r}")
+    canonical = normalize_task_id(task_id) or str(task_id or "").strip()
+    if not canonical:
+        raise ValueError("task_id is required")
+    try:
+        from writer_identity import forwarded_pair
+
+        pair = forwarded_pair(environ)
+    except Exception:  # noqa: BLE001
+        pair = None
+    foreign = foreign_scheduled_fire(environ, workspace_root)
+    # One row per stop: the same code for the same task inside ten minutes is
+    # the same stop (a re-run step, a retried paste), not a second record.
+    previous = last_fire_stop(workspace_root, canonical)
+    if previous and previous.get("abort_code") == code and previous.get("at"):
+        try:
+            from event_time import parse_ts
+
+            then = parse_ts(previous["at"])
+            if then is not None and (_dt.datetime.now(_dt.timezone.utc) - then).total_seconds() < 600:
+                return {"type": FIRE_STOPPED_TYPE, "deduped": True, "data": dict(previous)}
+        except Exception:  # noqa: BLE001
+            pass
+    data: dict = {
+        "task_id": canonical,
+        "kind": FIRE_STOPPED_TYPE,
+        "abort_code": code,
+        "fired_via": effective_fired_via(fired_via, environ),
+        "forwarded_writer": pair[0] if pair else None,
+        "declared_writer": _declared_scheduled_writer(workspace_root),
+        "foreign": foreign,
+    }
+    if detail:
+        data["detail"] = str(detail).strip()[:160]
+    from event_gate import append_event
+
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    # A foreign fire's stop record caches nothing: the machine stamp and the
+    # ledger lock's own sidecar both ask the writer id, and that read would
+    # write the refused pair into `_hq/.system/writer_identity.json`
+    # (cr1#605). The flag covers the stamp AND the append.
+    no_cache = None
+    if foreign:
+        try:
+            from writer_identity import NO_CACHE_ENV
+        except Exception:  # noqa: BLE001
+            NO_CACHE_ENV = "CR_IDENTITY_NO_CACHE"
+        no_cache = NO_CACHE_ENV
+        _os.environ[no_cache] = "1"
+    try:
+        # the one stamp helper, like every other writer (the census pins it)
+        data.update(machine_fields(environ))
+        event = {"type": FIRE_STOPPED_TYPE, "source_skill": "scheduled-task-bootloader",
+                 "data": data}
+        stamped = append_event(events_path, [event], holder="receipts.log_fire_stopped")
+    finally:
+        if no_cache:
+            _os.environ.pop(no_cache, None)
+    return stamped[0] if stamped else event
+
+
+def last_fire_stop(workspace_root, task_id) -> Optional[dict]:
+    """The newest `fire_stopped` row for `task_id`, as `{abort_code, at,
+    fired_via, foreign, detail}`, or None. Read-only; never raises."""
+    want = normalize_task_id(task_id) or str(task_id or "").strip()
+    newest = None
+    try:
+        import events_io
+
+        rows = events_io.iter_events(workspace_root)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        for ev in rows:
+            if not isinstance(ev, dict) or ev.get("type") != FIRE_STOPPED_TYPE:
+                continue
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            tid = normalize_task_id(data.get("task_id")) or data.get("task_id")
+            if tid != want:
+                continue
+            at = ev.get("ts")
+            if newest is None or str(at or "") >= str(newest.get("at") or ""):
+                newest = {"abort_code": data.get("abort_code"), "at": at,
+                          "fired_via": data.get("fired_via"),
+                          "foreign": data.get("foreign"),
+                          "detail": data.get("detail")}
+    except Exception:  # noqa: BLE001
+        return newest
+    return newest
+
+
+def require_writer_on_vm_seat(env=None) -> None:
+    """THE CHOKEPOINT QUESTION (BRIEFDOOR1 MUST 5, ruling R-RW3-8).
+
+    Asked by the writers every other writer reaches — the one append path
+    (`atomic_write.atomic_append_jsonl`, which `event_gate.append_event`
+    delegates to), the locked whole-file path (`atomic_write.
+    acquire_write_lock`, under every `entities.json` / `aliases.json`
+    rewrite) and the ledger's own lock (`writer_lock.events_writer_lock`,
+    `writer_lock.machine_id`) — so a writer IMPORTED into a shell on a
+    merged seat (pipeline-tracker's deal writers, workspace-manager's org /
+    engagement / thread writers in a `python3 -c` body) refuses with the one
+    sentence and writes nothing, instead of landing rows and lock stamps
+    under a raw 32-hex token minted in a home that dies with the session
+    (the 2026-09-23 walk, seq 18998-19004).
+
+    It is leg (a) of `require_writer_identity` and only leg (a): a VM seat
+    with no writer id refuses. Leg (b), the declared-scheduled-writer
+    compare, reads the declaration off `entities.json`; the doors ask it once
+    per call (`workspace_access.run_writer` gate 5, the receipt writers), and
+    asking it again per appended row would re-read the anchor file on every
+    write of a fire. Every legacy and local seat is not a VM seat
+    (`_is_vm_seat` false): nothing is read beyond the environment and
+    nothing changes, byte for byte.
+    """
+    if not _is_vm_seat(env):
+        return
+    try:
+        from machine_identity import shared_writer_id
+
+        writer = shared_writer_id(env)
+    except Exception:  # noqa: BLE001 — an unreadable identity is no identity
+        writer = None
+    if not writer:
+        raise WriterIdentityRequired(cause=CAUSE_NO_WRITER_ID)
+
+
+def _to_user_local_naive(value, workspace_root=None):
+    """Aware -> naive on this seat's user-local clock. Degrades to the host
+    zone (today's behaviour) when `clock_policy` cannot be imported."""
+    try:
+        from clock_policy import to_user_local_naive
+
+        return to_user_local_naive(value, workspace_root)
+    except Exception:  # noqa: BLE001 — a stamp never blocks a receipt
+        return value.astimezone().replace(tzinfo=None)
+
+
+#: The env vars a harness uses to name the serving model, in preference order.
+#: Nothing derives or guesses a model name — the field is ABSENT when the
+#: environment does not state one (§0.6: record it so the question becomes
+#: answerable from the ledger, never so the ledger can be wrong about it).
+MODEL_ENV_KEYS = ("CLAUDE_MODEL", "CR_MODEL", "ANTHROPIC_MODEL")
+
+#: Ledger vocabulary, not a customer sentence — same posture as `machine`.
+MODEL_FIELD = "model"
+
+
+def model_fields(env=None) -> dict:
+    """`{"model": "<id>"}` when the environment names the serving model,
+    `{}` otherwise (M's ruling §0.6, 2026-09-19).
+
+    WHY IT IS ADDITIVE AND NEVER INVENTED. "Which model served this fire?"
+    is not a plugin decision, but it becomes answerable from the ledger the
+    moment the receipts carry it. A guessed value would answer it WRONG and
+    permanently — events.jsonl is append-only history. So: present when the
+    harness states it, absent when it does not, and never on a customer
+    surface (`surface_leak_patterns` carries the fence).
+    """
+    try:
+        import os as _os
+
+        environ = dict(_os.environ) if env is None else dict(env)
+    except (TypeError, ValueError):
+        return {}
+    for key in MODEL_ENV_KEYS:
+        value = str(environ.get(key) or "").strip()
+        if value:
+            return {MODEL_FIELD: value[:128]}
+    return {}
+
+
+#: The key the telemetry producer wraps its block in, and the key the block
+#: lands under on a receipt. One name, two roles — which is exactly how the
+#: wrapper came to be written as the value.
+TELEMETRY_FIELD = "telemetry"
+
+
+def telemetry_block(value):
+    """The telemetry BLOCK, whether a caller handed the block or the wrapper.
+
+    `telemetry.build_pack_run_telemetry` returns `{"telemetry": {...}}` for a
+    caller to MERGE into `data`; several callers passed it as the VALUE of
+    `data["telemetry"]` instead, and the gate walk's fire receipt carried
+    `data.telemetry.telemetry` with the usage report reading zeroes off it.
+    One unwrap, one level, only when the wrapper is the whole of it — a real
+    block never has a lone `telemetry` key, so this cannot eat a measurement.
+    """
+    if (isinstance(value, dict) and set(value) == {TELEMETRY_FIELD}
+            and isinstance(value.get(TELEMETRY_FIELD), dict)):
+        return dict(value[TELEMETRY_FIELD])
+    return value
+
+
+def log_receipt(
+    workspace_root,
+    task_id: str,
+    *,
+    receipt_type: str = "pack_run",
+    status: str = "complete",
+    fired_via: str = "scheduled",
+    triggered_by: Optional[str] = None,
+    surfaced: Optional[int] = None,
+    duration_ms: Optional[int] = None,
+    late_tier: Optional[str] = None,
+    extra_data: Optional[dict] = None,
+    now=None,
+) -> dict:
+    """THE receipt writer. Every scheduled/manual task fire ends with one
+    call here (directly or via the log_pack_run back-compat wrapper).
+
+    Validates the canonical vocabulary at write time (drift is a defect the
+    moment it's written, not when a reader trips on it months later), routes
+    through event_gate.append_event (enum check + locked writer + UTC
+    auto-stamp), and returns the event dict as appended (minus seq/ts, which
+    the writer lock stamps).
+
+    `now` (SPEC FLAKEFIX2) is the instant the SLOT PROVENANCE below is measured
+    against — machine-local naive, the clock cron evaluates in, or an ISO
+    string this function parses for you. Omitted, provenance reads the real
+    clock exactly as it always has and no caller sees any difference.
+
+    IT EXISTS BECAUSE `slot_provenance` STAMPS A MINUTE-GRANULAR WALL-CLOCK
+    READING (`slot_delta_minutes`) INTO EVERY RECEIPT'S `data`. Two receipts
+    written back to back therefore carry different payloads whenever the pair
+    straddles a wall-clock MINUTE — and a different `scheduled_for` whenever it
+    straddles the task's own daily slot. A fixture comparing two payloads for
+    equality must pin the instant here rather than race it; `slot_provenance`
+    has always taken a `now`, this threads it the one hop that was missing.
+
+    IDENT1 I-0: the writer is named FIRST (`require_writer_identity`). A
+    merged seat's VM with no writer id, or a scheduled fire that is not the
+    workspace's declared writer, raises `WriterIdentityRequired` and appends
+    nothing at all.
+    """
+    require_writer_identity(workspace_root=workspace_root)
+    canonical = normalize_task_id(task_id)
+    if canonical not in CANONICAL_TASK_IDS:
+        raise ValueError(
+            f"unknown task_id {task_id!r} (normalized {canonical!r}); "
+            f"canonical ids: {sorted(CANONICAL_TASK_IDS)}"
+        )
+    if receipt_type not in ALL_RECEIPT_TYPES:
+        raise ValueError(
+            f"{receipt_type!r} is not a registered receipt type "
+            f"({sorted(ALL_RECEIPT_TYPES)})"
+        )
+    if receipt_type not in RECEIPT_TYPES[canonical]["types"]:
+        raise ValueError(
+            f"receipt type {receipt_type!r} does not belong to task "
+            f"{canonical!r} (expected one of "
+            f"{sorted(RECEIPT_TYPES[canonical]['types'])})"
+        )
+    via = normalize_fired_via(fired_via)
+    if via not in FIRED_VIA:
+        raise ValueError(
+            f"fired_via must be one of {sorted(FIRED_VIA)}; got {fired_via!r}"
+        )
+    if late_tier is not None and not isinstance(late_tier, str):
+        raise ValueError(f"late_tier must be a string tier name; got {late_tier!r}")
+    if surfaced is not None and (not isinstance(surfaced, int) or surfaced < 0):
+        raise ValueError(f"surfaced must be a non-negative int; got {surfaced!r}")
+    if duration_ms is not None and (not isinstance(duration_ms, int) or duration_ms < 0):
+        raise ValueError(f"duration_ms must be a non-negative int; got {duration_ms!r}")
+
+    data: dict = {
+        "task_id": canonical,
+        "kind": canonical,  # legacy readers key on kind; new readers use task_id
+        "status": status,
+        "fired_via": via,
+    }
+    if surfaced is not None:
+        data["surfaced"] = surfaced
+    if duration_ms is not None:
+        data["duration_ms"] = duration_ms
+    if late_tier is not None:
+        data[LATENESS_FIELD] = late_tier
+    # FIX3 F3-6 (ruling R-RW-5). WHICH surface asked for this run,
+    # when one did. The argument wins; otherwise the environment
+    # answers, because a job executed by its own CLI in front of a
+    # typed brief is a separate process and the brief has no other
+    # way to tell it. Written only when present, so an ordinary
+    # scheduled receipt keeps the shape it has always had — the
+    # same additive posture `maintenance_run` already uses.
+    asked_by = triggered_by if triggered_by else _triggered_by_env()
+    if asked_by:
+        data[TRIGGERED_BY_FIELD] = asked_by
+    data.update(machine_fields())
+    data.update(model_fields())
+    if extra_data:
+        # extra_data never overrides the contract fields — task-specific
+        # counts ride along; identity/vocabulary stays canonical.
+        for k, v in extra_data.items():
+            if k not in data:
+                data[k] = v
+    # FIX3 F3-11 — the count is DERIVED from the list it names, never taken on
+    # trust. A caller carrying its own `n_errors` from somewhere else (the
+    # capture's, in the inbox fire) used to hand both through `extra_data`, and
+    # the 2026-09-21 fire wrote `n_errors: 0` beside a one-element `errors`.
+    # The same derivation lives in `inbox_helpers.plan_fire_receipt`, so the
+    # row a merged seat composes and the row this writer writes stay one row.
+    # A capture's own figure travels as `n_capture_errors`
+    # (`reconcile_sent_commitments` has used that name for releases).
+    #
+    # SCOPED, FIX PASS 1 (review L-1). This writer is the WHOLE fleet's, not
+    # the merged path's: `learning_pass` and `lifecycle_pass` hand it an
+    # `errors` list and no count, and an unconditional recount MINTED a key
+    # on those receipts on an un-merged seat - a shape change on machines
+    # this round is not allowed to move (standing fence 8; the legacy
+    # byte-identity control covers it as of this pass). The defect F3-11
+    # names is a count that CONTRADICTS its own list, which only a caller
+    # passing both can have, and that is exactly the case still recounted.
+    # A receipt that carries the list alone keeps the shape it has always
+    # had; nothing is silently wrong, there is simply no second number to be
+    # wrong with. The merged composer (`inbox_helpers.plan_fire_receipt`)
+    # derives unconditionally - no legacy fleet composes through it.
+    if isinstance(data.get("errors"), list) and "n_errors" in data:
+        data["n_errors"] = len(data["errors"])
+
+    # cr1#1602 — the run's per-phase timings, measured by CODE: the door
+    # (`workspace_access._timed_door`) timed every step into the runtime
+    # cache, and `task_timings` groups this run's steps into the task's
+    # phases. Only the timed tasks' own run receipts carry it, and a
+    # `timings` a caller handed in is replaced, never kept (#1276: a typed
+    # run wrote timings the model chose). Additive: nothing else changes.
+    try:
+        import task_timings
+
+        if canonical in task_timings.TASKS and receipt_type in task_timings.TIMED_RECEIPT_TYPES:
+            data["timings"] = task_timings.timings_for(
+                workspace_root, canonical, now=task_timings.receipt_now(workspace_root, canonical, now))
+    except Exception:  # noqa: BLE001 - a receipt is never refused for its timings
+        pass
+
+    # WALKFIX1 Item H — where this fire landed relative to its own slot, so the
+    # ledger explains itself. Stamped HERE rather than asked of each
+    # orchestrator: a prose mandate across a dozen orchestrators is presumed
+    # skipped (Bug #98 class), and every scheduled fire already ends at this
+    # one call. Import is local — `late_fire` imports this module.
+    # A caller that computed the fields itself keeps its own values.
+    try:
+        from late_fire import slot_provenance
+
+        at = now
+        if isinstance(at, str):
+            at = _dt.datetime.fromisoformat(at.replace("Z", "+00:00"))
+            if at.tzinfo is not None:
+                # The slot this fire is scored against is expressed in the
+                # seat's own clock — the machine's on a legacy desktop, the
+                # WORKSPACE zone on a merged seat where the container and the
+                # sandbox VM disagree with each other and with the customer
+                # (TZ1, gap analysis §0.18). One resolver decides; this stamp
+                # never reads the host clock directly.
+                at = _to_user_local_naive(at, workspace_root)
+        for k, v in slot_provenance(workspace_root, canonical,
+                                    now=at, fired_via=via).items():
+            data.setdefault(k, v)
+    except Exception:  # noqa: BLE001 — provenance never blocks a receipt
+        pass
+
+    event = {
+        "type": receipt_type,
+        "source_skill": canonical,
+        "data": data,
+    }
+    from event_gate import append_event
+
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    append_event(events_path, event, holder=f"receipt:{canonical}")
+    return event
+
+
+# ---------------------------------------------------------------------------
+# WALKFIX1 Item J — receipt errors reach the chat, in one line
+# ---------------------------------------------------------------------------
+
+def receipt_errors_notice(receipt) -> Optional[str]:
+    """ONE chat line when a fire's own receipt carries `data.errors`, else None.
+
+    THE FINDING (2026-08-10). A past-meetings fire wrote an `errors[]` entry
+    naming a real correctness defect in its own run, and the chat presented a
+    clean two-brief recap with no mention of it. The operator learned about it
+    only by reading the ledger. The product's own closing-silently-is-worse
+    principle says a system that noticed something and said nothing has spent
+    trust it did not have to.
+
+    WHAT THIS DELIBERATELY IS NOT: an error dump, an alarm, or a phase-internals
+    tour. One sentence, a count, and a pointer. The CEO is not being asked to
+    do anything; they are being told the run is not claiming to be perfect.
+
+    VOCABULARY NOTE — the wording differs from the spec's draft in one word,
+    because the draft's own spelling is forbidden output. `seq N` is an
+    "event seq leak" in the renderer's Gate 2 pattern table and `(seq N)` is a
+    `telemetry_narration` violation in `chat_output_validator`; a line that
+    trips the product's own gates cannot ship as product output. "entry" says
+    the same thing to a reader and passes both, and the suite pins that it
+    does rather than asserting it.
+
+    Returns None for an empty / absent / malformed `errors` — a notice about
+    nothing is worse than silence.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    data = receipt.get("data") if isinstance(receipt.get("data"), dict) else {}
+    errors = data.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return None
+    n = len(errors)
+    noun = "correction" if n == 1 else "corrections"
+    seq = receipt.get("seq")
+    where = (f" (entry {seq})" if isinstance(seq, int)
+             and not isinstance(seq, bool) else "")
+    return f"{n} internal {noun} noted — details in the run receipt{where}."
+
+
+# ---------------------------------------------------------------------------
+# Per-brief prep receipts (v4.5.2 S1 — F-29 / F-29b)
+# ---------------------------------------------------------------------------
+#
+# A `prep_brief` event is written ONCE PER BRIEF (not per fire — the task's
+# pack_run stays the per-fire receipt) and carries the MEETING ID. It is THE
+# signal the morning brief's prep-detection reads: the "no prep" flag may
+# only render for a meeting with NO prep_brief receipt (F-29's fix — the
+# detector and the writer finally share one signal). It is deliberately NOT
+# in RECEIPT_TYPES: five briefs in one upcoming-meetings fire are five
+# prep_brief events and ONE run, so counting them as task runs would
+# fabricate fires (the F-49 disease in reverse).
+
+PREP_RECEIPT_TYPE = "prep_brief"
+
+#: How long two calls describing the SAME brief are read as one prep.
+#:
+#: The gate walk wrote `prep_brief` twice for one document (seq 18605 and
+#: 18607) because call-prep's prose names the same call in two places - step 10
+#: in the narrative and step 4 in the code block - and the writer had no
+#: opinion about being called twice. The prose is now one instruction, and this
+#: is the mechanical half: a receipt is a record of a brief, and one brief is
+#: one record no matter how many times the step is read.
+#:
+#: Ten minutes, not "ever": a brief REGENERATED an hour later is a second,
+#: real event and the ledger should say so. The window is the span of one prep,
+#: comfortably.
+PREP_RECEIPT_DEDUP_WINDOW = _dt.timedelta(minutes=10)
+
+#: cr1#1304: at most this many attendee ids travel on one prep receipt.
+PREP_RECEIPT_ATTENDEE_CAP = 25
+
+
+def _recent_prep_receipt(workspace_root, *, meeting_id: str,
+                         meeting_start: str, artifact: str, generator: str,
+                         now=None):
+    """The `prep_brief` row already written for THIS brief, or None.
+
+    The key is the four things that make two calls the same prep: the meeting,
+    the OCCURRENCE (a recurring series shares one calendar id, so the start
+    time is what separates Monday's standup from Tuesday's), the document, and
+    the generator. Anything else appends as it always did.
+
+    The document is compared by the row's own spelling of it - `artifact`, the
+    basename - because that is what the receipt carries; every prep brief lands
+    in the one meetings folder, so the basename and the workspace-relative path
+    name the same file.
+    """
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    since = now - PREP_RECEIPT_DEDUP_WINDOW
+    for row in reversed(prep_receipts(workspace_root, meeting_ids=[meeting_id],
+                                      since=since)):
+        raw = row.get("raw") if isinstance(row, dict) else None
+        data = (raw or {}).get("data") if isinstance(raw, dict) else None
+        if not isinstance(data, dict):
+            continue
+        if str(data.get("artifact") or "") != artifact:
+            continue
+        if str(data.get("generated_by") or "") != generator:
+            continue
+        if str(data.get("meeting_start") or "") != str(meeting_start or ""):
+            continue
+        return raw
+    return None
+
+
+def log_prep_receipt(
+    workspace_root,
+    *,
+    meeting_id: str,
+    slug: str,
+    brief_path: str,
+    generated_by: str = "upcoming-meetings",
+    fired_via: Optional[str] = None,
+    refreshed: bool = False,
+    meeting_start: Optional[str] = None,
+    attendee_person_ids: Optional[List[str]] = None,
+    extra_data: Optional[dict] = None,
+) -> dict:
+    """THE per-brief receipt writer. Both prep paths (scheduled auto-prep and
+    on-demand 'prep me') call this after a successful make_brief save.
+
+    `meeting_id` is the calendar event id — the same identity `prep_slug`
+    derives the filename from, so detector and file share one key.
+    `refreshed` records that an existing brief was updated in place rather
+    than a new one written (the F-29b contract made auditable).
+
+    `meeting_start` is the INSTANCE discriminator (BRIEFFIX1 Item B, added
+    2026-08-09 after the second-eyes review). A calendar id is stable across a
+    recurring series, so the id alone cannot say WHICH standup a document was
+    written for — and a reuse rule keyed on the id plus a clock window handed
+    the CEO yesterday's brief for today's meeting, reproduced at 14h and 23.9h.
+    The start time is the one field that differs between two instances, so it
+    is what the reuse test compares.
+
+    Optional, and its absence is meaningful rather than tolerated: every
+    pre-BRIEFFIX1 receipt lacks it (history is append-only and nothing here
+    rewrites it), and `prep_leg` treats a receipt with no `meeting_start` as
+    unprovable and REGENERATES. Callers that have the value must pass it; the
+    cost of omitting it is a duplicate document, never a stale one.
+
+    `attendee_person_ids` (SPEC THREADBIND1 §0 ruling 3 — "prep_brief binds
+    going forward"). Optional evidence for `thread_resolve.resolve_thread_binding`:
+    a caller that already resolved the meeting's attendees for the brief's
+    own content can pass them here at no extra lookup cost. Bound: the
+    receipt's `data` gains `thread_id` next to `meeting_id`, plus
+    `thread_basis`. Below the floor with an askable candidate set: ONE
+    capped queue row fires through the standing adjudication queue,
+    exactly as it would for any other canonical writer — the receipt itself
+    still lands (fail-open; a resolver misfire never blocks the receipt).
+    Omitting `attendee_person_ids` still lets the MEETING'S OWN prior
+    binding resolve (evidence order step 1 needs only `meeting_id`, which
+    this function always has) — the attendee fallback is the one extra
+    resolution the caller's evidence unlocks. Since cr1#1304 the ids are also
+    KEPT on the receipt as `data.attendee_person_ids` (unique, blanks
+    dropped, capped), so the Hub's month dashboard can file the prep under
+    its people. Omitted or empty, the field is not written. The ten-minute
+    duplicate check does not compare attendees: a second call for the same
+    brief returns the first receipt as it was (one prep, one receipt).
+
+    IDENT1 I-0: the writer is named FIRST (`require_writer_identity`). The
+    2026-09-22 prep receipt went into history as a session token because a
+    chat imported this writer into a bare shell; on a merged seat that call
+    now refuses in one sentence and appends nothing.
+    """
+    require_writer_identity(workspace_root=workspace_root)
+    if not isinstance(meeting_id, str) or not meeting_id.strip():
+        raise ValueError("meeting_id is required (the calendar event id)")
+    if not isinstance(slug, str) or not slug.strip():
+        raise ValueError("slug is required")
+    if not isinstance(brief_path, str) or not brief_path.strip():
+        raise ValueError("brief_path is required")
+    # A caller that knows still wins; one that says nothing reads the run mode
+    # off the environment rather than claiming the scheduled slot (F2-4).
+    via = resolve_fired_via(fired_via)
+    if via not in FIRED_VIA:
+        raise ValueError(
+            f"fired_via must be one of {sorted(FIRED_VIA)}; got {fired_via!r}"
+        )
+    generator = normalize_task_id(generated_by)
+
+    from os.path import basename
+
+    data: dict = {
+        "meeting_id": meeting_id.strip(),
+        "slug": slug.strip(),
+        "artifact": basename(brief_path.strip().replace("\\", "/")),
+        "generated_by": generator,
+        "fired_via": via,
+        "refreshed": bool(refreshed),
+    }
+    if isinstance(meeting_start, str) and meeting_start.strip():
+        data["meeting_start"] = meeting_start.strip()
+    # cr1#1304: the attendees stay on the receipt, so the Hub's month
+    # dashboard can file a prep under its people. Additive: a receipt
+    # written before this, or with no attendees given, carries no field.
+    people: List[str] = []
+    for pid in attendee_person_ids or []:
+        pid = pid.strip() if isinstance(pid, str) else ""
+        if pid and pid not in people:
+            people.append(pid)
+    if people:
+        data["attendee_person_ids"] = people[:PREP_RECEIPT_ATTENDEE_CAP]
+    data.update(machine_fields())
+    if extra_data:
+        for k, v in extra_data.items():
+            # cr1#1304: the attendees come only from the checked argument.
+            if k not in data and k != "attendee_person_ids":
+                data[k] = v
+
+    # SPEC THREADBIND1 §0 ruling 3 — "prep_brief binds going forward". Only
+    # when the caller (or extra_data) did not already supply one — an
+    # explicit id always wins (evidence order step 0) and this never
+    # overwrites it. Fail-open: a resolver misfire must never block the
+    # brief's own receipt from landing (the floor is never below today).
+    # ONE PREP, ONE RECEIPT (F2-5). Checked BEFORE the thread-binding block
+    # below, which can append a proposal row of its own: a call that writes
+    # nothing must write nothing at all, not "nothing except a side effect".
+    existing = _recent_prep_receipt(
+        workspace_root, meeting_id=data["meeting_id"],
+        meeting_start=data.get("meeting_start") or "",
+        artifact=data["artifact"], generator=generator)
+    if existing is not None:
+        return dict(existing, deduped=True)
+
+    if not data.get("thread_id"):
+        try:
+            from thread_resolve import (
+                BIND_CONFIDENCE_FLOOR,
+                PROPOSABLE_BASES,
+                propose_binding_row,
+                resolve_thread_binding,
+            )
+
+            evidence = {"meeting_id": data["meeting_id"],
+                       "attendee_person_ids": list(people)}
+            result = resolve_thread_binding(evidence, workspace_root=workspace_root)
+            if result["thread_id"] and result["confidence"] >= BIND_CONFIDENCE_FLOOR:
+                data["thread_id"] = result["thread_id"]
+                data["thread_basis"] = result["basis"]
+            elif result["basis"] in PROPOSABLE_BASES:
+                propose_binding_row(workspace_root, evidence, result,
+                                    detector="prep-brief-thread-resolve",
+                                    title=data["slug"])
+        except Exception:
+            pass
+
+    event = {
+        "type": PREP_RECEIPT_TYPE,
+        "source_skill": generator,
+        "data": data,
+    }
+    from event_gate import append_event
+
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    append_event(events_path, event, holder=f"prep_receipt:{data['slug']}")
+    return event
+
+
+def ledger_events(workspace_root) -> list[dict]:
+    """The log, read once by the same defensive path as the receipt readers,
+    for a caller that also reads other rows from it (cr1#1632: the Today feed's
+    receipts and its saved meeting pages, one read, HUBONECALL1)."""
+    return list(_iter_events(workspace_root))
+
+
+def prep_receipts(
+    workspace_root,
+    *,
+    meeting_ids: Optional[Iterable[str]] = None,
+    since: Optional[_dt.datetime] = None,
+    events: Optional[Iterable[dict]] = None,
+) -> list[dict]:
+    """Every prep_brief receipt, oldest first, optionally filtered by meeting
+    id / time. Returns {meeting_id, slug, artifact, dt, fired_via, refreshed,
+    raw}. Same defensive read path as iter_receipts — legacy/malformed lines
+    never break the reader. `events` is a read already made
+    (`ledger_events`), so a caller reads the log once."""
+    wanted = None
+    if meeting_ids is not None:
+        wanted = {str(m).strip() for m in meeting_ids if str(m).strip()}
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=_dt.timezone.utc)
+
+    out: list[dict] = []
+    for ev in (events if events is not None else _iter_events(workspace_root)):
+        if not isinstance(ev, dict) or ev.get("type") != PREP_RECEIPT_TYPE:
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        mid = str(data.get("meeting_id") or "").strip()
+        if not mid:
+            continue
+        if wanted is not None and mid not in wanted:
+            continue
+        dt = event_dt(ev)
+        if since is not None:
+            if dt is None or dt < since:
+                continue
+        out.append({
+            "meeting_id": mid,
+            "slug": data.get("slug"),
+            "artifact": data.get("artifact"),
+            "dt": dt,
+            "fired_via": normalize_fired_via(data.get("fired_via")),
+            "refreshed": bool(data.get("refreshed")),
+            "raw": ev,
+        })
+    out.sort(key=lambda r: (r["dt"] is not None, r["dt"] or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)))
+    return out
+
+
+def prep_exists_for_meeting(workspace_root, meeting_id) -> bool:
+    """F-29's detector rule, as one function: does ANY prep_brief receipt
+    exist for this meeting id? The morning brief may render its "no prep"
+    flag ONLY when this returns False — never from folder globs or slug
+    guesses (the pre-v4.5.2 detector read a different signal than the writer
+    left and claimed "no prep" while the file + receipt were both on disk)."""
+    if not isinstance(meeting_id, str) or not meeting_id.strip():
+        return False
+    return bool(prep_receipts(workspace_root, meeting_ids=[meeting_id]))
+
+
+# ---------------------------------------------------------------------------
+# Reader
+# ---------------------------------------------------------------------------
+
+def _iter_events(workspace_root) -> Iterable[dict]:
+    try:
+        import events_io
+
+        yield from events_io.iter_events(workspace_root)
+        return
+    except Exception:
+        pass
+    # Defensive fallback — active file, then each computer's own file
+    # (cr1#1061 slice 3), bad lines skipped.
+    import json
+
+    data = Path(workspace_root) / "_hq" / "data"
+    paths = [data / "events.jsonl"]
+    try:
+        paths += sorted((data / "computers").glob("*/events.jsonl"))
+    except OSError:
+        pass
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(ev, dict):
+                        yield ev
+        except OSError:
+            continue
+
+
+def iter_receipts(
+    workspace_root,
+    *,
+    task_ids: Optional[Iterable[str]] = None,
+    since: Optional[_dt.datetime] = None,
+    until: Optional[_dt.datetime] = None,
+) -> list[dict]:
+    """Every receipt in the substrate, normalized. One pass, shard-
+    transparent (events_io), all legacy shapes parsed forever.
+
+    Returns dicts, oldest first:
+      {task_id (canonical), type, dt (aware datetime|None),
+       fired_via (canonical|None), late_tier (coalesced|None),
+       status, raw (the original event, untouched)}
+
+    `since`/`until` are half-open [since, until); naive bounds are taken
+    as UTC. Receipts with no parseable timestamp are INCLUDED when no time
+    filter is set and excluded by any time filter (they can't be placed).
+    """
+    wanted = None
+    if task_ids is not None:
+        wanted = {normalize_task_id(t) for t in task_ids}
+    if since is not None and since.tzinfo is None:
+        since = since.replace(tzinfo=_dt.timezone.utc)
+    if until is not None and until.tzinfo is None:
+        until = until.replace(tzinfo=_dt.timezone.utc)
+
+    out: list[dict] = []
+    for ev in _iter_events(workspace_root):
+        tid = receipt_task_id(ev)
+        if tid is None:
+            continue
+        if wanted is not None and tid not in wanted:
+            continue
+        dt = event_dt(ev)
+        if since is not None or until is not None:
+            if dt is None:
+                continue
+            if since is not None and dt < since:
+                continue
+            if until is not None and dt >= until:
+                continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        out.append({
+            "task_id": tid,
+            "type": ev.get("type"),
+            "dt": dt,
+            "fired_via": normalize_fired_via(data.get("fired_via")),
+            "late_tier": get_late_tier(data),
+            "status": data.get("status") or data.get("outcome"),
+            "raw": ev,
+        })
+    out.sort(key=lambda r: (r["dt"] is not None, r["dt"] or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)))
+    return out
+
+
+def last_receipt_times(
+    workspace_root,
+    task_ids: Optional[Iterable[str]] = None,
+) -> dict[str, Optional[_dt.datetime]]:
+    """Newest receipt datetime per task (aware; None = never receipted).
+    The watchdog freshness signal — task_watchdog delegates here."""
+    ids = [normalize_task_id(t) for t in task_ids] if task_ids is not None else list(RECEIPT_TYPES)
+    out: dict[str, Optional[_dt.datetime]] = {tid: None for tid in ids}
+    for r in iter_receipts(workspace_root, task_ids=ids):
+        raw = r.get("raw") if isinstance(r.get("raw"), dict) else {}
+        if isinstance(raw.get("data"), dict) and raw["data"].get("in_flight") is True:
+            continue  # cr1#772: a fire that stood down ran nothing
+        if r["dt"] is not None:
+            cur = out.get(r["task_id"])
+            if cur is None or r["dt"] > cur:
+                out[r["task_id"]] = r["dt"]
+    return out
+
+
+def receipt_surface(receipt) -> Optional[str]:
+    """The SURFACE a receipt served, when it names one and the name is a task
+    this module knows (SPEC SURFCOUNT1). None otherwise.
+
+    Some fires deliberately wear a task id that is not the surface they
+    serve. The day-close is the shipped case: `end_of_day.TASK_ID` is the
+    legacy `past-meetings` BY DESIGN — a rename that re-pointed the
+    registration would have moved every customer's evening chat — and the
+    fire stamps `data.surface: "end-of-day"` as the discriminator. So the
+    receipt names both, and which of the two a reader should use depends on
+    the question: "when did this REGISTERED task last fire" wants the task
+    id; "how many times did this SURFACE run" wants the surface.
+
+    Gated on `RECEIPT_TYPES` membership on purpose. An unrecognised surface
+    string minting a bucket of its own would give the usage report a row with
+    no `count_types` to judge against and no display name to render, and would
+    silently move that fire out of the row it does belong in. Falling back to
+    the task id keeps the run counted somewhere real — the conservative
+    direction, and the same posture `normalize_task_id` takes with an
+    unknown-but-clean id.
+    """
+    raw = receipt.get("raw") if isinstance(receipt, dict) else None
+    data = raw.get("data") if isinstance(raw, dict) else None
+    surface = data.get("surface") if isinstance(data, dict) else None
+    if not isinstance(surface, str) or not surface.strip():
+        return None
+    tid = normalize_task_id(surface)
+    return tid if tid in RECEIPT_TYPES else None
+
+
+def run_bucket(receipt) -> Optional[str]:
+    """WHICH ROW a receipt's run belongs in: its surface when it names a known
+    one, else its task id (SPEC SURFCOUNT1).
+
+    Exactly one bucket per receipt, which is what makes double-counting
+    structurally impossible rather than a property somebody has to remember.
+    Every reader that TALLIES or COMPARES fires across surfaces goes through
+    here; readers asking about a single registered task's freshness
+    (`last_receipt_times`, the dispatcher's due-ness rule) correctly keep
+    using the task id, because their question really is about the task.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    return receipt_surface(receipt) or receipt.get("task_id")
+
+
+def count_runs(
+    workspace_root,
+    *,
+    since: Optional[_dt.datetime] = None,
+    until: Optional[_dt.datetime] = None,
+    task_ids: Optional[Iterable[str]] = None,
+) -> dict[str, int]:
+    """Run count per task — the usage-report number (F-49's acceptance).
+
+    Counting rules (the documented contract):
+      - A receipt is counted under the SURFACE it served when it names one
+        (`run_bucket`), else under its task id. The day-close fires under the
+        legacy `past-meetings` id with `data.surface: "end-of-day"`; before
+        SURFCOUNT1 those fires tallied under Past Meetings and End of Day
+        rendered "ran 0x" the morning after it fired, which teaches a reader
+        to distrust either the schedule or the report. The
+        discriminate-on-surface rule was already written for the audit
+        readers; this is the reporting readers applying it.
+      - Only a task's `count_types` (defaulting to its full `types` set)
+        are run-countable — monthly-report's value_receipt_generated events
+        are freshness signals, not runs (one fire writes 2-3 of them). Judged
+        against the BUCKET's spec, since the bucket is the row the run lands
+        in.
+      - Receipts of DIFFERENT types chained within RUN_DEDUP_WINDOW are ONE
+        run (a fire emitting primary + secondary receipts).
+      - Receipts of the SAME type never merge — two pack_runs minutes apart
+        are two real runs.
+      - Timestamp-less receipts each count as one run (never dropped).
+
+    Returns {canonical task_id: run count} for every requested task,
+    zero-filled — a task with no receipts reports 0, it does not vanish
+    from the table (F-49's missing-rows failure mode).
+    """
+    ids = [normalize_task_id(t) for t in task_ids] if task_ids is not None else list(RECEIPT_TYPES)
+    counts: dict[str, int] = {tid: 0 for tid in ids}
+    wanted = set(ids)
+    # NO task filter on the fetch, and that is load-bearing rather than
+    # sloppy: a receipt destined for the `end-of-day` bucket is written under
+    # `past-meetings`, so filtering by the requested ids up front would drop
+    # it before anything could read its surface — a caller asking only about
+    # the day-close would get the same zero it gets today. The scan is the
+    # same one pass either way (`iter_receipts` walks the events once
+    # regardless); only the in-memory filter moves, to AFTER bucketing.
+    receipts = iter_receipts(workspace_root, since=since, until=until)
+
+    by_task: dict[str, list[dict]] = {}
+    for r in receipts:
+        bucket = run_bucket(r)
+        if bucket not in wanted:
+            continue
+        spec = RECEIPT_TYPES.get(bucket, {})
+        countable = spec.get("count_types") or spec.get("types") or frozenset()
+        if r["type"] not in countable:
+            continue
+        by_task.setdefault(bucket, []).append(r)
+
+    for tid, rs in by_task.items():
+        undated = [r for r in rs if r["dt"] is None]
+        dated = sorted((r for r in rs if r["dt"] is not None), key=lambda r: r["dt"])
+        runs = len(undated)
+        cluster_type_counts: dict[str, int] = {}
+        cluster_last: Optional[_dt.datetime] = None
+        for r in dated:
+            if cluster_last is not None and (r["dt"] - cluster_last) <= RUN_DEDUP_WINDOW:
+                cluster_type_counts[r["type"]] = cluster_type_counts.get(r["type"], 0) + 1
+            else:
+                if cluster_type_counts:
+                    runs += max(cluster_type_counts.values())
+                cluster_type_counts = {r["type"]: 1}
+            cluster_last = r["dt"]
+        if cluster_type_counts:
+            runs += max(cluster_type_counts.values())
+        counts[tid] = runs
+    return counts
+
+
+__all__ = [
+    "CANONICAL_TASK_IDS",
+    "RECEIPT_TYPES",
+    "ALL_RECEIPT_TYPES",
+    "FIRED_VIA",
+    "LATENESS_FIELD",
+    "RUN_DEDUP_WINDOW",
+    "normalize_task_id",
+    "normalize_fired_via",
+    "get_late_tier",
+    "receipt_task_id",
+    "log_receipt",
+    "iter_receipts",
+    "last_receipt_times",
+    "receipt_surface",
+    "run_bucket",
+    "count_runs",
+    "PREP_RECEIPT_TYPE",
+    "log_prep_receipt",
+    "prep_receipts",
+    "prep_exists_for_meeting",
+    "WRITER_IDENTITY_REQUIRED_LINE",
+    "WriterIdentityRequired",
+    "require_writer_identity",
+]

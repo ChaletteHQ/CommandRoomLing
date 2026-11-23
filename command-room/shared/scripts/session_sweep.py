@@ -1,0 +1,1220 @@
+#!/usr/bin/env python3
+"""
+Session-sweep write core (Phase 5 Memory layer, R1 — 2026-07).
+
+THE MEMORY LEAK THIS CLOSES
+---------------------------
+Command Room only remembers what a writing skill happened to capture. Anything
+the CEO does in an ad-hoc chat that never fires a capture skill is lost — a
+commitment made in passing, a decision reasoned out loud, a deliverable produced
+by hand. The Claude app exposes full transcripts of every session (proven readable from
+inside a scheduled-task session, 2026-07-01), so a nightly pass can promote that
+episodic layer (L1) into the canonical event log (L2) after the fact.
+
+This module is the deterministic WRITE half of that pass. The SKILL does the
+semantic extraction (reads transcripts, decides what is a real commitment /
+decision / interaction / deliverable that never became an event); this module
+takes those extracted items and does the parts that must be exact:
+
+  1. Dedup — through the EXISTING `.source_refs.idx` sidecar, never a second
+     path. Each item carries `data.source_ref = "session:{session_id}"` for
+     provenance plus a content hash in `data.dedup_hash`; the CONTENT hash is
+     the dedup discriminator (the session-level source_ref is identical across
+     every item of one session, so it can never be the dedup key — that would
+     collapse a whole session to one event). Re-running a session only appends
+     items whose content the index hasn't seen, so the sweep is idempotent and
+     an over-wide re-scan is always safe.
+  2. Write — through `append_event()` (the F1 gatekeeper), so swept events get
+     the same seq/ts stamping, schema-enum validation, and commitment identity
+     (`cmt_<ulid>` + required `data.kind`) as any other writer. There is exactly
+     one append path.
+  3. Receipt — one `session_sweep_run` audit event per run (sessions scanned,
+     events recovered, per-type counts). The watchdog reads this receipt to
+     confirm the task fired and did its job (Bug #98 doctrine: enforce on the
+     substrate artifact, never on narration). `validate_sweep_ran` reads it
+     back so the skill can self-validate exactly like reconcile-sent.
+
+The recovered items reuse the EXISTING `commitment` / `decision` / `interaction`
+/ `note` families — there are no parallel "swept" event variants (EVENT_TYPES.md).
+Deliverables recovered from a chat land as `note` events tagged
+`data.recovered_kind = "deliverable"`.
+
+  4. Narrative (SESSSTORY1, 2026-08-27) — a fourth, OPTIONAL leg. Facts were
+     already end-session-proof; the human-readable session-notes BLOCK was
+     not — it only wrote inside the "end session" ritual, which most sessions
+     never run. `sweep_and_receipt`'s optional `sessions` argument lets the
+     nightly pass compose that block too, per session, from that session's
+     `session_chapter` markers plus this run's own recovered-item counts —
+     see `session_narrative.py` for the composer and the workspace-manager
+     dedup handshake. The receipt gains `n_narratives_composed`.
+
+stdlib only. Shared by the nightly sweep (R1) and — via the same `_sweep` core —
+the one-time historical backfill (R2), so both dedup and write identically.
+The narrative leg (4) runs ONLY from `sweep_and_receipt` — `backfill_and_receipt`
+never passes `sessions`, so a historical catch-up never rewrites old notes files.
+"""
+from __future__ import annotations
+
+import hashlib
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Iterable, Optional
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from capture_gate import (  # noqa: E402
+    bind_capture_thread,
+    classify_capture,
+    gate_commitment_data,
+    intake_kwargs,
+    observed_from_commitment_event,
+    workspace_capture_context,
+)
+from event_gate import append_event  # noqa: E402
+import session_narrative  # noqa: E402
+import source_ref_index  # noqa: E402
+
+# The event families the sweep may recover. Deliberately a small, closed set of
+# ALREADY-REGISTERED types — the sweep recovers real history, it does not mint a
+# new vocabulary. `deliverable` is an INPUT alias the skill may use; it is stored
+# as a `note` (see _normalize_item).
+SWEEPABLE_TYPES = frozenset({"commitment", "decision", "interaction", "note"})
+
+#: BIND1 - the detector name a `thread_binding` proposal minted off a swept
+#: row is attributed to. ATTRIBUTION ONLY, and the correction matters
+#: (REVIEW_BIND1 F4): it does NOT buy this writer its own slot budget on the
+#: daily confirm card, because a binding question no longer reaches that
+#: card at all - `thread_resolve.propose_binding_row` routes it to the
+#: on-demand "review project bindings" door. Nor did it ever buy a separate
+#: ROW: `thread_resolve._fingerprint` is keyed on the org and its candidate
+#: threads and ignores the detector, so the first writer to hit an ambiguous
+#: org owns that question for all three.
+BIND_DETECTOR = "session-sweep"
+_DELIVERABLE_ALIAS = "note"
+
+# Receipt event types (registered in EVENT_TYPES.md / events.schema.json).
+RECEIPT_SWEEP = "session_sweep_run"
+RECEIPT_BACKFILL = "session_backfill_run"
+
+# cr1#1489: the chats are the desktop app's own sessions, and the one tool
+# that reads them runs only inside the desktop app; a cloud fire never has it.
+# A sweep that read nothing and does not name the tool it read with lands
+# skipped with this reason, the same words the steps ask a tool-less run for.
+NO_TOOL_REASON = "no session-transcript tool in this run"
+#: cr1#1489: an empty read on a cloud fire (cr1#979's fire-place check).
+CLOUD_REASON = "a cloud run cannot reach the chats on the computer"
+#: cr1#1489 (owner ruling 2026-11-22, "Yes, hide it"): the writer's own two
+#: wordings of a run with no chat reader at all. Not a fault the seat can fix
+#: by itself, so never said to the owner; `reader_missing` counts any skip,
+#: since a model passing the reason writes its own words.
+NO_READER_REASONS = frozenset({NO_TOOL_REASON, CLOUD_REASON})
+#: cr1#1489: the one sentence a person hears after asking, by its own phrase,
+#: for the chat sweep or the chat catch-up when this run has no
+#: session-transcript tool:
+#: plain, no fault named, nothing to type anywhere else. The session-sweep
+#: and session-backfill skills carry it word for word.
+NO_READER_LINE = "Reading past chats is not available in this version of the Claude app."
+#: The receipt field naming the session tool a sweep read with.
+TRANSCRIPT_TOOL_FIELD = "transcript_tool"
+#: cr1#1489: how many empty `complete` sweeps in a row, with no tool named
+#: (the shape a cloud fire wrote before this fix), make the span since the
+#: last read that happened a gap rather than quiet nights. The silent-source
+#: count (`maintenance_dispatcher.SOURCE_SILENT_RUNS`) is the same number.
+GAP_EMPTY_RUNS = 5
+#: How far back the typed catch-up (`session-backfill`) reads, in days.
+BACKFILL_DAYS = 60
+
+# Top-level (non-`data`) reference fields the skill may set on an item; lifted
+# onto the event so the dual-layer reader (event_refs) links threads/people.
+_TOPLEVEL_REF_FIELDS = (
+    "person_ids",
+    "primary_thread_id",
+    "related_thread_ids",
+    "classification_confidence",
+)
+
+
+def session_source_ref(session_id: str) -> str:
+    """Provenance ref for a swept item: `session:{session_id}`. Constant across
+    every item of one session (so it is NOT the dedup key — the content hash is).
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise ValueError("session_id is required to compose a source_ref")
+    return f"session:{sid}"
+
+
+def content_hash(source_ref: str, etype: str, summary: str) -> str:
+    """12-hex content hash — the dedup discriminator for a swept item.
+
+    Mirrors the PASSIVE_CAPTURE convention (`sha256(...)[:12]` into
+    `data.dedup_hash`). Basis is source_ref + type + normalized summary so two
+    genuinely-distinct items of one session hash apart, while re-processing the
+    same item twice hashes identically and dedups.
+    """
+    basis = f"{source_ref}|{etype}|{(summary or '').strip().lower()}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:12]
+
+
+def already_captured(workspace_root, dedup_hash: str) -> bool:
+    """True if this content hash is already in `.source_refs.idx`.
+
+    Checks the CONTENT hash only — never the session-level source_ref, which is
+    shared across a whole session and would false-positive after the first item.
+    The index self-heals (rebuilds from events.jsonl on first check).
+    """
+    return source_ref_index.check(workspace_root, dedup_hash=dedup_hash)
+
+
+class SweepItemError(ValueError):
+    """A raw extracted item was malformed — fail loud so a bad extraction is
+    visible, not silently dropped."""
+
+
+def _gate_commitment(data: dict, raw: dict, session_id) -> None:
+    """Stage-D / S2 / Stage-E capture parity for a recovered commitment
+    (v4.5.2 C1, F-31): the sweep runs the SAME capture block as
+    scan-for-commitments Step 3 — since v4.6.1 W4c literally the same code,
+    `capture_gate.gate_commitment_data` (this wrapper only binds the sweep's
+    error class + subject wording). Mutates `data` in place (pending_review
+    stamping); raises SweepItemError on anything the extraction must go back
+    and do."""
+    gate_commitment_data(
+        data,
+        subject=f"recovered commitment (session {session_id})",
+        classification_confidence=raw.get("classification_confidence"),
+        error_cls=SweepItemError,
+    )
+
+
+def _normalize_item(raw: dict, source_skill: str) -> tuple[dict, str]:
+    """Turn one raw extracted item into a gated-ready event dict + its dedup
+    hash. Raises SweepItemError on anything the sweep cannot safely write."""
+    if not isinstance(raw, dict):
+        raise SweepItemError(f"item must be a dict, got {type(raw).__name__}")
+
+    session_id = raw.get("session_id")
+    source_ref = session_source_ref(session_id)  # raises on empty session_id
+
+    etype = (raw.get("type") or "").strip()
+    recovered_kind = None
+    if etype == "deliverable":
+        recovered_kind = "deliverable"
+        etype = _DELIVERABLE_ALIAS
+    if etype not in SWEEPABLE_TYPES:
+        raise SweepItemError(
+            f"unsupported sweep type {raw.get('type')!r} — recover one of "
+            f"{sorted(SWEEPABLE_TYPES)} (or 'deliverable', stored as note)"
+        )
+
+    summary = (raw.get("summary") or "").strip()
+    if not summary:
+        raise SweepItemError(f"item (session {session_id}) has no summary")
+
+    dedup_hash = content_hash(source_ref, etype, summary)
+
+    data = dict(raw.get("data") or {})
+    data["summary"] = summary
+    data["source_ref"] = source_ref
+    data["dedup_hash"] = dedup_hash
+    data["session_id"] = session_id
+    data["recovered_by"] = "session-sweep"
+    if recovered_kind:
+        data.setdefault("recovered_kind", recovered_kind)
+
+    # Commitments must run the full capture block at extraction — kind
+    # classification, S2 due-nudge, Stage-E counterparty receipts, and the
+    # pending_review safety inversion (v4.5.2 C1 / F-31 parity with
+    # scan-for-commitments Step 3). Title defaults from the summary.
+    if etype == "commitment":
+        data.setdefault("title", summary)
+        # MC1: normalize counterparty fields (single byte-identical; multi
+        # writes the list + primary scalar so degrade-readers see the first).
+        from commitment_parties import build_counterparty_fields
+        _cpf = build_counterparty_fields(
+            counterparty_id=data.get("counterparty_id"),
+            counterparty_name=data.get("counterparty_name"),
+            counterparty_ids=data.get("counterparty_ids"),
+            counterparty_names=data.get("counterparty_names"),
+        )
+        for _k in ("counterparty_id", "counterparty_name",
+                   "counterparty_ids", "counterparty_names"):
+            data.pop(_k, None)
+        data.update(_cpf)
+        _gate_commitment(data, raw, session_id)
+
+    event = {"type": etype, "source_skill": source_skill, "data": data}
+    for field in _TOPLEVEL_REF_FIELDS:
+        if raw.get(field) is not None:
+            event[field] = raw[field]
+
+    # Stage-E: a resolved counterparty_id is also a person reference — the
+    # schema requires it in person_ids so the dual-layer reader links it.
+    if etype == "commitment":
+        from commitment_parties import counterparty_ids as _cp_ids
+        pids = list(event.get("person_ids") or [])
+        changed = False
+        for _cid in _cp_ids(data):  # MC1: every resolved counterparty
+            if _cid not in pids:
+                pids.append(_cid)
+                changed = True
+        if changed:
+            event["person_ids"] = pids
+    return event, dedup_hash
+
+
+# Canonical task identity per receipt type (v4.5.2 R1 receipt contract).
+_RECEIPT_TASK_IDS = {
+    "session_sweep_run": "session-sweep",
+    "session_backfill_run": "session-sweep",
+}
+
+
+def _compose_narratives(
+    workspace_root,
+    recovered: list[dict],
+    sessions: Optional[Iterable[dict]],
+    *,
+    source_skill: str,
+) -> int:
+    """SESSSTORY1 narrative leg. For each session descriptor in `sessions`,
+    compose + append that session's notes block from ITS chapter markers
+    (already supplied, never re-read here) plus a per-type count of what
+    THIS run recovered for that session_id — grouped from `recovered`, the
+    same list `_sweep` just appended. Returns the number of blocks actually
+    WRITTEN (n_narratives_composed); every fence (already composed, nothing
+    to say, no notes file) is a silent 0 for that session, never a raised
+    error — a narrative miss must never fail the sweep run that recovers the
+    session's real events."""
+    if not sessions:
+        return 0
+    by_session: dict[str, Counter] = {}
+    for ev in recovered:
+        sid = (ev.get("data") or {}).get("session_id")
+        if sid:
+            by_session.setdefault(sid, Counter())[ev["type"]] += 1
+    composed = 0
+    for s in sessions:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("session_id")
+        if not sid:
+            continue
+        result = session_narrative.compose_and_append(
+            workspace_root,
+            session_id=sid,
+            thread_id=s.get("thread_id"),
+            for_date=s.get("for_date"),
+            chapter_lines=s.get("chapter_lines"),
+            recovered_counts=dict(by_session.get(sid, {})),
+            source_skill=source_skill,
+            origin=session_narrative.ORIGIN_SWEPT,
+        )
+        if result.get("composed"):
+            composed += 1
+    return composed
+
+
+def _effective_fired_via(explicit) -> str:
+    """`receipts.effective_fired_via`, behind an import that cannot break.
+
+    SPEC_NIGHTM3_LANES §5 P-2 — the F3-6 family remainder (ruling R-RW-5).
+    This composer defaulted `fired_via="scheduled"`, so a merged seat that
+    ran it with nothing forwarded recorded a scheduled fire nobody claimed.
+    The resolver's floor off a merged seat is today's `scheduled`, so the
+    un-merged fleet is byte-identical; an explicit value always wins.
+    """
+    try:
+        from receipts import effective_fired_via
+    except Exception:  # noqa: BLE001 — a receipt never fails on a stamp
+        return explicit or "scheduled"
+    try:
+        return effective_fired_via(explicit)
+    except Exception:  # noqa: BLE001
+        return explicit or "scheduled"
+
+
+def _asked_by(explicit=None) -> Optional[str]:
+    """The surface that asked for this run — the argument, else
+    `CR_TRIGGERED_BY` — or None. Never raises, never guesses."""
+    import os
+
+    raw = explicit if explicit else os.environ.get("CR_TRIGGERED_BY")
+    raw = str(raw or "").strip()
+    return raw or None
+
+
+def _sweep(
+    workspace_root,
+    items: Iterable[dict],
+    *,
+    receipt_type: str,
+    source_skill: str,
+    sessions_scanned: int,
+    window_desc: str,
+    extra_receipt: Optional[dict] = None,
+    fired_via: Optional[str] = None,
+    sessions: Optional[Iterable[dict]] = None,
+    triggered_by: Optional[str] = None,
+) -> dict:
+    """Dedup + write + receipt. The one write path shared by the nightly sweep
+    and the historical backfill. Returns a receipt dict the skill renders.
+
+    `sessions` (SESSSTORY1, nightly sweep only — `backfill_and_receipt` never
+    passes it): an optional list of session descriptors
+    `{session_id, thread_id, for_date, chapter_lines}` the narrative leg
+    composes a notes-file block for, one per session, counts-only from
+    material already in hand — see session_narrative.py."""
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+
+    # W4c relevance gate: resolve the capture context once per run (who the
+    # user is, the team, the customize-layer mode). Fail-open — an
+    # unresolvable user forces track-everything inside the helper.
+    ctx = workspace_capture_context(workspace_root)
+
+    recovered: list[dict] = []
+    by_type: Counter = Counter()
+    seen: set[str] = set()
+    skipped = 0
+
+    for raw in items:
+        event, h = _normalize_item(raw, source_skill)
+        # Two dedup layers, both on the CONTENT hash: the durable index (across
+        # every prior run) and a within-batch set (two identical items in one
+        # extraction). Neither uses the session-level source_ref.
+        if h in seen or already_captured(workspace_root, h):
+            skipped += 1
+            continue
+        seen.add(h)
+        # W4c: a recovered commitment opens ONLY when the workspace owner is
+        # a party (or the mode/caution rail says otherwise); third-party and
+        # can't-attribute items land as observed tier — the full record,
+        # silent, promotable. Sessions carry no org context, so no override.
+        if event["type"] == "commitment":
+            verdict = classify_capture(
+                event["data"],
+                mode=ctx["mode"],
+                user_id=ctx["user_id"],
+                user_names=ctx["user_names"],
+                team_ids=ctx["team_ids"],
+                known_ids=ctx["known_ids"],
+                # INTAKE1 — a session capture's home is the session's own
+                # project when it has one; the sweep carries it on the event
+                # it just built. And the OTHER SIDE is on the envelope here,
+                # not in the payload: `_normalize_item` lifts a recovered
+                # row's people to top-level `person_ids`, so the home rule is
+                # handed them explicitly or it reads a row that names somebody
+                # as naming nobody (fix round 1, review F-2).
+                # INTAKE1 rule 2 — a session is the user's OWN words, so a
+                # row that names nobody and is self-owed by kind takes the
+                # user as its owner instead of arriving ownerless. Since fix
+                # round 1 the door does that binding itself, BEFORE the
+                # caution rail (review F-6), so the order is the door's
+                # property and not this caller's to remember.
+                **intake_kwargs(
+                    ctx, primary_thread_id=event.get("primary_thread_id"),
+                    person_ids=event.get("person_ids"), own_words=True),
+            )
+            if verdict["tier"] == "observed":
+                event = observed_from_commitment_event(
+                    event, reason=verdict["reason"]
+                )
+            # BIND1 - bind AT THE WRITE, and AFTER the relevance verdict so
+            # the open/observed split is byte-identical to the shipped one:
+            # a binding is a fact about the row, not a reason to open it.
+            # Measured unbound before this line, on the 2026-09-17 scratch
+            # copy: 10 of the 11 open session-sweep rows on the plate.
+            # `preview_items` below deliberately does NOT call this - a
+            # preview writes nothing, and a binding proposal is a write.
+            event = bind_capture_thread(
+                workspace_root, event, detector=BIND_DETECTOR,
+                user_person_id=ctx.get("user_id"))
+        recovered.append(event)
+        by_type[event["type"]] += 1
+
+    if recovered:
+        # One gated, locked append for the whole batch — seq/ts stamping and
+        # `.source_refs.idx` maintenance happen inside atomic_append_jsonl.
+        append_event(events_path, recovered, holder=source_skill)
+
+    # SESSSTORY1 narrative leg — runs AFTER the recovered items land, so a
+    # session's "already-promoted events" (per §0 Ruling 2) genuinely
+    # includes this run's own recoveries when grouping counts below.
+    narratives_composed = _compose_narratives(
+        workspace_root, recovered, sessions, source_skill=source_skill
+    )
+
+    receipt_data = {
+        # v4.5.2 R1 receipt-contract fields (shared/RECEIPT_CONTRACT.md):
+        # canonical task identity + fired_via + machine on every receipt.
+        "task_id": _RECEIPT_TASK_IDS.get(receipt_type, source_skill),
+        "kind": _RECEIPT_TASK_IDS.get(receipt_type, source_skill),
+        "status": "complete",
+        "fired_via": _effective_fired_via(fired_via),
+        "sessions_scanned": int(sessions_scanned),
+        "events_recovered": len(recovered),
+        "skipped_dedup": skipped,
+        "by_type": dict(by_type),
+        "window": window_desc,
+        # SESSSTORY1 §0 Ruling 2 — zero-written, always present, never just
+        # "present when sessions was passed": a receipt reader must be able
+        # to trust the field exists on every session_sweep_run row.
+        "n_narratives_composed": narratives_composed,
+    }
+    # SPEC_NIGHTM3_LANES §5 P-2 (ruling R-RW-5) — WHICH surface asked for this
+    # run, when one did: the argument, else `CR_TRIGGERED_BY`. Written only
+    # when present, so a run nobody named keeps the receipt it always had.
+    asked_by = _asked_by(triggered_by)
+    if asked_by:
+        receipt_data["triggered_by"] = asked_by
+    try:
+        # SCHED1 — the shared stamp helper, so the machine token and its
+        # not-persisted flag land the same way here as on every other receipt.
+        from receipts import machine_fields
+
+        receipt_data.update(machine_fields())
+    except Exception:
+        pass
+    if extra_receipt:
+        receipt_data.update(extra_receipt)
+    append_event(
+        events_path,
+        {"type": receipt_type, "source_skill": source_skill, "data": receipt_data},
+        holder=source_skill,
+    )
+
+    return {
+        "events_recovered": len(recovered),
+        "skipped_dedup": skipped,
+        "sessions_scanned": int(sessions_scanned),
+        "by_type": dict(by_type),
+        "recovered_summaries": [e["data"]["summary"] for e in recovered],
+        "n_narratives_composed": narratives_composed,
+    }
+
+
+def _unread_sweep(workspace_root, *, status: str, reason: str, receipt_type: str,
+                  source_skill: str, window: Optional[dict],
+                  window_desc: str, extra_receipt: dict, fired_via,
+                  triggered_by) -> dict:
+    """The receipt of a sweep that read no session (cr1#740): `skipped` when
+    this run has no session tool at all (owed, not failing: nothing went
+    wrong), `blocked` when the read errored. Either way the reason, the
+    window and its start as the carry-over marker, through the one append
+    path. Writes no item and composes no narrative: nothing was read."""
+    from catchup import WINDOW_INCOMPLETE_FIELD, receipt_window_marker
+    from event_gate import append_event
+
+    events_path = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    win = window if isinstance(window, dict) else {}
+    marker = receipt_window_marker(
+        {"start": win.get("since"), "end": win.get("until")}, incomplete=True)
+    receipt_data = {
+        "task_id": _RECEIPT_TASK_IDS.get(receipt_type, source_skill),
+        "kind": _RECEIPT_TASK_IDS.get(receipt_type, source_skill),
+        "status": status,
+        ("blocked_reason" if status == "blocked" else "skip_reason"): reason,
+        "fired_via": _effective_fired_via(fired_via),
+        "sessions_scanned": 0,
+        "events_recovered": 0,
+        "skipped_dedup": 0,
+        "by_type": {},
+        "window": window_desc,
+        "n_narratives_composed": 0,
+        # A skip says nothing to the owner, like every other skip receipt.
+        "summary": ("Sessions were not read this time: " + reason
+                    + ". The same window is read next time."
+                    if status == "blocked" else ""),
+    }
+    if marker:
+        receipt_data[WINDOW_INCOMPLETE_FIELD] = marker
+    asked_by = _asked_by(triggered_by)
+    if asked_by:
+        receipt_data["triggered_by"] = asked_by
+    try:
+        from receipts import machine_fields
+
+        receipt_data.update(machine_fields())
+    except Exception:  # noqa: BLE001
+        pass
+    receipt_data.update(extra_receipt or {})
+    append_event(
+        events_path,
+        {"type": receipt_type, "source_skill": source_skill, "data": receipt_data},
+        holder=source_skill,
+    )
+    return {
+        "events_recovered": 0,
+        "skipped_dedup": 0,
+        "sessions_scanned": 0,
+        "by_type": {},
+        "recovered_summaries": [],
+        "n_narratives_composed": 0,
+        "status": status,
+        ("blocked_reason" if status == "blocked" else "skip_reason"): reason,
+        "summary": receipt_data["summary"],
+    }
+
+
+#: The fields one extracted item carries into the writer (Step 3).
+SWEEP_ITEM_FIELDS = ("session_id", "type", "summary", "data", "person_ids")
+
+
+def plan_sweep(workspace_root, now=None) -> dict:
+    """The session-sweep job PLANNED beside the data - READ ONLY (MAINTJOBS1
+    MUST 2; on `workspace_access.RUN_HELPER_ALLOWLIST`).
+
+    Step 1 of the skill, answered where the ledger is: the cursor
+    (`validate_sweep_ran`'s `last_ts`, the newest `session_sweep_run`), the
+    floor the fire reads sessions after, the window label the receipt
+    records, the primary user an item's owner is, and the item fields.
+
+    The floor is the one maintenance window (cr1#663,
+    `catchup.maintenance_window`): since the newest sweep receipt with no
+    day cap, 30 days on a first run or after a gap longer than 30 days.
+    The 24-hour floor this plan used to apply on top of the cursor was a
+    horizon: a cursor older than a day was narrowed to a day, and the
+    sessions between went unread. A fire with no session-transcript tool
+    still runs the writer with no items: the receipt lands, which is the
+    skill's own skip-not-fail posture. Writes nothing."""
+    import datetime as _dtm
+
+    from catchup import MAINTENANCE_WINDOW_FIELD, maintenance_window
+
+    now = now or _dtm.datetime.now(_dtm.timezone.utc)
+    if isinstance(now, str):
+        now = _dtm.datetime.fromisoformat(now.replace("Z", "+00:00"))
+    if now.tzinfo is None:
+        now = now.astimezone()
+    try:
+        cursor = validate_sweep_ran(workspace_root).get("last_ts")
+    except Exception:  # noqa: BLE001
+        cursor = None
+    window = maintenance_window(
+        workspace_root, "session-sweep",
+        now=now.astimezone().replace(tzinfo=None))
+    after = (_dtm.datetime.fromisoformat(window["since_aware"])
+             .astimezone(_dtm.timezone.utc).isoformat())
+    try:
+        from primary_user import resolve_primary_user
+        user = resolve_primary_user(workspace_root)
+    except Exception:  # noqa: BLE001
+        user = None
+    return {
+        "job_id": "session-sweep",
+        "cursor_before": cursor,
+        "after": after,
+        "window_desc": f"since-{after}",
+        MAINTENANCE_WINDOW_FIELD: window,
+        "user_person_id": user,
+        "item_fields": list(SWEEP_ITEM_FIELDS),
+        "ready": True,
+    }
+
+
+def _cloud_fire(fired_via=None, triggered_by=None) -> bool:
+    """cr1#1489: this run is a scheduled fire on a merged seat, the cloud
+    run, through cr1#979's own two answers (`maintenance_dispatcher.
+    merged_seat`, `eod_incremental.typed_run`). A person's typed run is in
+    the desktop app, and says so either in the door's environment or in the
+    writer's own arguments (`fired_via="manual"`, a `triggered_by` surface,
+    as the skill and the brief pass them). An unreadable answer is not a
+    cloud fire."""
+    if str(fired_via or "").strip().lower() == "manual" or str(triggered_by or "").strip():
+        return False
+    try:
+        from eod_incremental import typed_run
+        from maintenance_dispatcher import merged_seat
+        return bool(merged_seat()) and not typed_run()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def sweep_and_receipt(
+    workspace_root,
+    items: Iterable[dict],
+    *,
+    sessions_scanned: int,
+    source_skill: str = "session-sweep",
+    window_hours: int = 24,
+    window_desc: Optional[str] = None,
+    fired_via: Optional[str] = None,
+    sessions: Optional[Iterable[dict]] = None,
+    triggered_by: Optional[str] = None,
+    maintenance_window: Optional[dict] = None,
+    fetch_blocked: Optional[str] = None,
+    skip_reason: Optional[str] = None,
+    craft_candidates: Optional[Iterable[dict]] = None,
+    craft_sessions: Optional[Iterable[str]] = None,
+    transcript_tool: Optional[str] = None,
+) -> dict:
+    """Nightly sweep (R1): dedup + write the extracted items, append one
+    `session_sweep_run` receipt.
+
+    cr1#1489: `transcript_tool` names the session tool this run listed and
+    read the sessions with, stamped on the receipt. A run that read nothing
+    (no item, no session scanned, no session handed in) and names no tool
+    has shown no read at all, so it lands SKIPPED with `NO_TOOL_REASON` and
+    the window holds, as if it had said so: a cloud fire, which never has the
+    tool, wrote `complete` here and moved the window past chats it never
+    opened. A quiet night read with the tool names it and stays complete,
+    except on a cloud fire (cr1#979's fire-place check, `_cloud_fire`), where
+    an empty read is a skip whatever tool it names (`CLOUD_REASON`).
+
+    cr1#400: `craft_candidates` are the method signal the model found in the
+    window (`craft_sweep.propose_craft_rules` names the shape). Each becomes
+    an always-ask `craft_rule` proposal, or an amend proposal when it
+    contradicts a confirmed rule, for the Hub's Review tab; no craft file is
+    written here. A candidate with `new_kind` is a kind of work that recurs
+    (cr1#1391 part B): an always-ask `craft_kind` proposal, nothing added
+    until the owner's yes. Every run also offers the least used kind for
+    retirement when a subject is over the cap (`craft_sweep.
+    offer_retirements`), asked first; the receipt counts an offer under
+    `craft_cap`. A chat counts as evidence only when this run read it: a
+    session of `items`, of `sessions`, or of `craft_sessions` (the ids of
+    every session read, passed when a session yielded nothing else). The
+    receipt counts them under `craft`. `items` is the skill's extraction; every write
+    is idempotent, so a re-run over the same window is a clean no-op.
+
+    cr1#740: `fetch_blocked` is why the session read errored, and lands a
+    BLOCKED receipt; `skip_reason` is why this run has no session-transcript
+    tool at all, and lands a SKIPPED one (owed, not failing, the posture of
+    a mail-less workspace). Both write nothing else and carry the window's
+    start as `window_incomplete_before`, so the next run reads the same
+    window; a run that read nothing used to land `complete` with
+    `sessions_scanned` 0 and the window moved past every session in the
+    gap. An empty `items` with neither is still a quiet window, read whole.
+
+    cr1#663: the receipt names the job's maintenance window under
+    `catchup.MAINTENANCE_WINDOW_FIELD`: the plan's dict when handed in, else
+    the helper's own answer computed here, before this receipt lands (so the
+    basis is the previous sweep). `window` (the label) keeps its shape.
+
+    Pass `window_desc` when the real window is a since-cursor span — the
+    default `last-Nh` label on a cursor-scoped run is the F-08 P2c / F-33
+    receipt-metadata inaccuracy (record the real window, not a default).
+    `fired_via`: "scheduled" on the nightly cron; "manual" on a chat-phrase
+    or Run Now fire (v4.5.2 receipt contract). Omitted, the SEAT answers
+    (`receipts.effective_fired_via`, SPEC_NIGHTM3_LANES §5 P-2): `scheduled`
+    on every un-merged seat, byte for byte; on a merged VM seat the forwarded
+    `CR_FIRED_VIA`, else `manual`. `triggered_by` names the surface that asked
+    (else `CR_TRIGGERED_BY`), written only when present.
+
+    `sessions` (SESSSTORY1): optional list of
+    `{session_id, thread_id, for_date, chapter_lines}` descriptors — one per
+    session active this window that did NOT already run "end session". The
+    narrative leg composes a session-notes block for each (dedup'd against
+    both this writer and the "end session" ritual writer — see
+    session_narrative.already_composed) and the receipt's
+    `n_narratives_composed` counts how many were actually written. Omit (or
+    pass an empty list) on a run with no session-transcript access — the
+    receipt still lands with `n_narratives_composed: 0`, same skip-not-fail
+    posture as an empty `items`.
+
+    MAINTJOBS1 MUST 2: the writer is named FIRST. The items and the session
+    narratives are written before the receipt, so on a merged seat with no
+    forwarded identity the refusal comes here, before any of them."""
+    from receipts import require_writer_identity
+
+    require_writer_identity(workspace_root=workspace_root)
+    extra_receipt: dict = {"window_hours": int(window_hours)}
+    window = None
+    try:
+        from catchup import MAINTENANCE_WINDOW_FIELD
+        from catchup import maintenance_window as _maintenance_window
+
+        window = (maintenance_window if isinstance(maintenance_window, dict)
+                  else _maintenance_window(workspace_root, "session-sweep"))
+        extra_receipt[MAINTENANCE_WINDOW_FIELD] = window
+    except Exception:  # noqa: BLE001 - the window never costs the receipt
+        pass
+    blocked = str(fetch_blocked or "").strip()
+    skipped = str(skip_reason or "").strip()
+    tool = str(transcript_tool or "").strip()
+    items = list(items or [])
+    if sessions is not None:
+        sessions = list(sessions)
+    if craft_sessions is not None:
+        craft_sessions = list(craft_sessions)
+    empty = (not items and not int(sessions_scanned or 0) and not sessions
+             and not craft_sessions)
+    if not blocked and not skipped and empty and (not tool or _cloud_fire(fired_via, triggered_by)):
+        # cr1#979's fire-place check: a scheduled fire on a merged seat runs
+        # in the cloud, where the chats on the computer cannot be reached; an
+        # empty read there is a skip even if a tool was named.
+        skipped = CLOUD_REASON if tool else NO_TOOL_REASON
+    if tool:
+        extra_receipt[TRANSCRIPT_TOOL_FIELD] = tool
+    if blocked or skipped:
+        return _unread_sweep(
+            workspace_root, status="blocked" if blocked else "skipped",
+            reason=blocked or skipped, receipt_type=RECEIPT_SWEEP,
+            source_skill=source_skill, window=window,
+            window_desc=window_desc or f"last-{int(window_hours)}h",
+            extra_receipt=extra_receipt, fired_via=fired_via,
+            triggered_by=triggered_by)
+    if craft_candidates:
+        try:
+            import craft_sweep
+
+            items = list(items or [])
+            sessions = list(sessions or []) if sessions is not None else None
+            read = {str(i.get("session_id")) for i in items if isinstance(i, dict) and i.get("session_id")}
+            read |= {str(x.get("session_id")) for x in sessions or [] if isinstance(x, dict) and x.get("session_id")}
+            read |= {str(x) for x in (craft_sessions or []) if x}
+            got = craft_sweep.propose_craft_rules(workspace_root,
+                                                  list(craft_candidates),
+                                                  known_sessions=read)
+            extra_receipt["craft"] = {"proposed": got.get("proposed", 0),
+                                      "amends": got.get("amends", 0),
+                                      "kinds": got.get("kinds", 0),
+                                      "skipped": len(got.get("skipped") or [])}
+        except Exception as exc:  # noqa: BLE001 - the facts still land
+            extra_receipt["craft"] = {"error": type(exc).__name__}
+    # cr1#1391 part B: over the cap of active kinds, the least used one is
+    # offered for retirement on the Review tab, asked first; nothing retires
+    # here. The receipt names an offer only when one was made.
+    try:
+        import craft_sweep
+
+        cap = craft_sweep.offer_retirements(workspace_root)
+        if cap.get("offered"):
+            extra_receipt["craft_cap"] = {"offered": cap["offered"]}
+    except Exception:  # noqa: BLE001 - the facts still land
+        pass
+    return _sweep(
+        workspace_root,
+        items,
+        receipt_type=RECEIPT_SWEEP,
+        source_skill=source_skill,
+        sessions_scanned=sessions_scanned,
+        window_desc=window_desc or f"last-{int(window_hours)}h",
+        extra_receipt=extra_receipt,
+        fired_via=fired_via,
+        sessions=sessions,
+        triggered_by=triggered_by,
+    )
+
+
+def _load_events(workspace_root) -> list[dict]:
+    try:
+        from event_refs import load_events
+
+        return load_events(Path(workspace_root) / "_hq" / "data" / "events.jsonl")
+    except Exception:
+        return []
+
+
+def _receipt_ts(ev: dict) -> str:
+    try:
+        from event_time import event_time
+
+        return event_time(ev) or ""
+    except Exception:
+        d = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        return ev.get("ts") or d.get("ts") or ""
+
+
+def _sweep_receipts(workspace_root, receipt_type: str) -> list:
+    """`[(local date, data)]` of one receipt type, oldest first."""
+    from event_time import parse_ts
+
+    out = []
+    for ev in _load_events(workspace_root):
+        if not isinstance(ev, dict) or ev.get("type") != receipt_type:
+            continue
+        when = parse_ts(_receipt_ts(ev))
+        if when is None:
+            continue
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        out.append((when, data))
+    out.sort(key=lambda t: t[0])
+    return [(when.astimezone(), data) for when, data in out]
+
+
+def _read_happened(data: dict) -> bool:
+    """A sweep receipt that shows a read: complete, and it read a session,
+    recovered an item or names the tool it read with."""
+    return (data.get("status", "complete") == "complete"
+            and bool(int(data.get("sessions_scanned") or 0)
+                     or int(data.get("events_recovered") or 0)
+                     or str(data.get(TRANSCRIPT_TOOL_FIELD) or "").strip()))
+
+
+def _old_empty(data: dict) -> bool:
+    """The receipt a cloud fire wrote before cr1#1489: complete, nothing read,
+    no tool named and no skip."""
+    return data.get("status", "complete") == "complete" and not _read_happened(data)
+
+
+def _short_day(iso: Optional[str]) -> str:
+    """cr1#1590: an ISO day as the Hub's short words say it ("Oct 3"), in
+    fixed English month names; the day itself when it does not parse."""
+    try:
+        import datetime as _dtm
+
+        d = _dtm.date.fromisoformat(str(iso)[:10])
+    except (TypeError, ValueError):
+        return str(iso or "")
+    return f"{_MONTHS[d.month - 1]} {d.day}"
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def chats_unread(workspace_root) -> dict:
+    """cr1#1489, READ ONLY, OPERATOR-ONLY: `{}` when the chat capture is
+    reading, else `{line, unread_since, gap, notes}`.
+
+    NEVER SHOWN TO A CLIENT (owner ruling 2026-11-22, "Yes, hide it"). It
+    was the Hub's maintenance note (#1500); the session-transcript tool it
+    tells the owner to use is not in the current Claude app, typed or
+    scheduled, so no seat can act on it. It stays as Chalette's own read of
+    the book, beside the skip receipts it reads; no surface a client sees
+    calls it (`tests/run_cr1489_hide_chats_note_test.py` fences that).
+    cr1#1590: `notes` holds one `{kind, short, act, line}` per sentence of
+    `line`: a few words, the phrase it names and that sentence, word for word.
+
+      * the newest sweep is skipped or blocked: chats are not being read, and
+        the line says what to type on the computer (`unread_since` is the day
+        of the last read that happened, or None);
+      * a gap: `GAP_EMPTY_RUNS` or more empty `complete` sweeps in a row with
+        no tool named (the cloud shape before this fix), by machines that never
+        read a session on this book, moved the window past chats nobody
+        opened. `gap` is `{from, to, last_day}`, ISO dates: the read before
+        them, the newest of them, and the day the typed catch-up's
+        `BACKFILL_DAYS` stop reaching its start. A catch-up that read and
+        whose reach covers the start answers it; past that day, any that read
+        after it does; a span wholly past the reach is dropped. Never raises.
+
+    The gap rule is a heuristic for old receipts: a desktop seat whose
+    every run carried a new machine name and had five quiet nights reads as
+    a gap. The cost is one typed catch-up, which previews before it writes."""
+    try:
+        rows = _sweep_receipts(workspace_root, RECEIPT_SWEEP)
+        backfills = _sweep_receipts(workspace_root, RECEIPT_BACKFILL)
+    except Exception:  # noqa: BLE001
+        return {}
+    if not rows:
+        return {}
+    import datetime as _dtm
+
+    now = _dtm.datetime.now().astimezone()
+    last_read = None
+    read_machines = set()
+    for i, (when, data) in enumerate(rows):
+        if _read_happened(data):
+            last_read = i
+            if data.get("machine"):
+                read_machines.add(str(data["machine"]))
+    newest = rows[-1][1]
+    status = newest.get("status")
+    unread = status in ("skipped", "blocked")
+    # The newest long run of empty receipts, wherever it sits: a typed sweep
+    # that reads afterwards does not read the span they moved past. A skip or
+    # a blocked read in the middle moved nothing (cr1#740) and does not split
+    # the run. A run written by a machine that has read sessions on this book
+    # is that machine's quiet nights, not a run that could not read.
+    reach = _dtm.timedelta(days=BACKFILL_DAYS)
+    gap = None
+    prev_read, streak, runs = None, [], []
+    for when, data in rows + [(None, {"status": "end"})]:
+        if when is not None and _old_empty(data):
+            streak.append((when, str(data.get("machine") or "")))
+            continue
+        if when is not None and data.get("status") in ("skipped", "blocked"):
+            continue
+        if (len(streak) >= GAP_EMPTY_RUNS
+                and not any(m and m in read_machines for _w, m in streak)):
+            runs.append((prev_read or streak[0][0], streak[-1][0]))
+        streak = []
+        if when is not None and _read_happened(data):
+            prev_read = when
+    # A catch-up counts only when it read; one run after the span's start left
+    # its reach answers what is still within reach of it.
+    caught = [w for w, d in backfills if _read_happened(d)]
+    for start, end in reversed(runs):
+        if now > end + reach:
+            continue  # wholly past the catch-up's reach: nothing left to do
+        if any(b >= end and (b - reach <= start or now > start + reach) for b in caught):
+            continue
+        gap = {"from": start.date().isoformat(), "to": end.date().isoformat(),
+               "last_day": (start + reach).date().isoformat()}
+        break
+    if not unread and not gap:
+        return {}
+    bits = []
+    notes = []
+    since = rows[last_read][0].date().isoformat() if last_read is not None else None
+    if status == "blocked":
+        bits.append(("Chats are not being read" + (f" since {since}" if since else "")
+                     + ": the last run could not open them ("
+                     + str(newest.get("blocked_reason") or "the read failed")
+                     + "). Type `sweep my chats` in the desktop app on your computer."))
+    elif unread:
+        bits.append(("Chats are not being read" + (f" since {since}" if since else "")
+                     + ": the last run could not open them, and a cloud run cannot "
+                     "reach the chats on your computer. Type `sweep my chats` in the "
+                     "desktop app on your computer."))
+    if bits:
+        notes.append({"kind": "look", "short": ("Chats not read since " + _short_day(since)) if since
+                      else "Chats not being read",
+                      "act": {"label": "Sweep my chats", "chat": "sweep my chats"}, "line": bits[-1]})
+    if gap:
+        if gap["last_day"] >= now.date().isoformat():
+            bits.append((f"Chats from {gap['from']} to {gap['to']} were never read. Type "
+                         "`catch up my chat history` in the desktop app on your computer "
+                         f"by {gap['last_day']} to recover them."))
+        else:
+            bits.append((f"Chats from {gap['from']} to {gap['to']} were never read. Type "
+                         "`catch up my chat history` in the desktop app on your computer "
+                         f"to recover the ones from the last {BACKFILL_DAYS} days; older "
+                         "ones are past its reach."))
+        notes.append({"kind": "look", "short": f"Chats {_short_day(gap['from'])} to {_short_day(gap['to'])} never read",
+                      "act": {"label": "Catch up my chat history", "chat": "catch up my chat history"}, "line": bits[-1]})
+    return {"line": " ".join(bits), "unread_since": since if unread else None, "gap": gap, "notes": notes}
+
+
+def reader_missing(workspace_root) -> bool:
+    """cr1#1489, READ ONLY: is the newest `session_sweep_run` a skip for want
+    of a chat reader? Any `skipped` sweep is one, whatever words its
+    `skip_reason` uses: by the writer's contract (cr1#740) a skip means this
+    run had no session-transcript tool (`NO_READER_REASONS` are the writer's
+    own two wordings; a model passing the reason writes its own). A read that
+    errored is `blocked`, never a skip. The health check reads this so the
+    chat capture's pass is never a line to the owner while it cannot read
+    (owner ruling 2026-11-22); the receipt itself still says so for
+    Chalette. Read through the shared receipt reader, every log of the book.
+    A catch-up's receipt is not a sweep's. Never raises: unreadable is False."""
+    try:
+        from receipts import iter_receipts
+
+        rows = [r for r in iter_receipts(workspace_root, task_ids=["session-sweep"])
+                if isinstance(r.get("raw"), dict) and r["raw"].get("type") == RECEIPT_SWEEP]
+    except Exception:  # noqa: BLE001
+        return False
+    if not rows:
+        return False
+    dated = [r for r in rows if r.get("dt") is not None]
+    newest = max(dated, key=lambda r: r["dt"]) if dated else rows[-1]
+    data = newest["raw"].get("data") if isinstance(newest["raw"].get("data"), dict) else {}
+    return str(data.get("status") or "").strip().lower() == "skipped"
+
+
+def last_sweep(workspace_root, *, receipt_type: str = RECEIPT_SWEEP) -> Optional[dict]:
+    """The newest sweep receipt event (or None). Its timestamp is the cursor the
+    skill uses to scope 'sessions active since the last sweep'."""
+    newest = None
+    newest_ts = ""
+    for ev in _load_events(workspace_root):
+        if ev.get("type") != receipt_type:
+            continue
+        ts = _receipt_ts(ev)
+        if newest is None or ts >= newest_ts:
+            newest, newest_ts = ev, ts
+    return newest
+
+
+def validate_sweep_ran(
+    workspace_root,
+    *,
+    receipt_type: str = RECEIPT_SWEEP,
+    since_ts: Optional[str] = None,
+) -> dict:
+    """Read the receipt back and confirm the sweep genuinely ran (Bug #98
+    doctrine — the audit event is the proof, not the narration).
+
+    Returns {ran, ok, last_ts, events_recovered, sessions_scanned}. `ok` is True
+    only when a receipt exists AND (no since_ts, or the receipt is at/after it),
+    so the skill can prove THIS run landed rather than an old one.
+
+    cr1#740: as the mail and chat validators answer. A BLOCKED receipt (the
+    read errored) is not `ok`: a read that could not happen is not a read
+    that found nothing. A SKIPPED one (no session tool) is `ok` and not
+    `ran`: the leg correctly did nothing. Each carries `status` and `reason`.
+    """
+    ev = last_sweep(workspace_root, receipt_type=receipt_type)
+    if ev is None:
+        return {"ran": False, "ok": False, "last_ts": None,
+                "events_recovered": 0, "sessions_scanned": 0}
+    ts = _receipt_ts(ev)
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    ok = bool(ts) and (since_ts is None or ts >= since_ts)
+    out = {
+        "ran": True,
+        "ok": ok,
+        "last_ts": ts or None,
+        "events_recovered": int(data.get("events_recovered") or 0),
+        "sessions_scanned": int(data.get("sessions_scanned") or 0),
+    }
+    if data.get("status") == "blocked":
+        out["ok"] = False
+        out["status"] = "blocked"
+        out["reason"] = ("the session read did not happen: "
+                         + str(data.get("blocked_reason") or "recorded as blocked"))
+    elif data.get("status") == "skipped":
+        out["ran"] = False
+        out["status"] = "skipped"
+        out["reason"] = data.get("skip_reason")
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Historical backfill (R2) — one-time, supervised, preview-and-confirm.
+# -----------------------------------------------------------------------------
+# The backfill reuses the exact `_sweep` write path (so dedup + append are
+# identical to the nightly pass); it adds a PREVIEW that dedup-checks without
+# writing, and a snapshot-before-touch archive step. History stays additive-only
+# (§3.1) — the snapshot is an archived safety copy, never a rewrite/undo path.
+
+
+def preview_items(workspace_root, items: Iterable[dict], *, source_skill: str = "session-backfill") -> dict:
+    """Dedup-check the extracted items WITHOUT writing anything — the plan the
+    backfill skill shows the CEO before it commits. Same dedup logic as the
+    write path (`_normalize_item` + content-hash membership), so the preview
+    count equals what a confirm would actually append."""
+    by_type: Counter = Counter()
+    seen: set[str] = set()
+    would: list[str] = []
+    skipped = 0
+    ctx = workspace_capture_context(workspace_root)
+    for raw in items:
+        event, h = _normalize_item(raw, source_skill)
+        if h in seen or already_captured(workspace_root, h):
+            skipped += 1
+            continue
+        seen.add(h)
+        # Same W4c relevance routing as the write path — the preview's
+        # by_type must equal what a confirm would actually append.
+        if event["type"] == "commitment":
+            verdict = classify_capture(
+                event["data"],
+                mode=ctx["mode"],
+                user_id=ctx["user_id"],
+                user_names=ctx["user_names"],
+                team_ids=ctx["team_ids"],
+                known_ids=ctx["known_ids"],
+                # INTAKE1 — a session capture's home is the session's own
+                # project when it has one; the sweep carries it on the event
+                # it just built. And the OTHER SIDE is on the envelope here,
+                # not in the payload: `_normalize_item` lifts a recovered
+                # row's people to top-level `person_ids`, so the home rule is
+                # handed them explicitly or it reads a row that names somebody
+                # as naming nobody (fix round 1, review F-2).
+                # INTAKE1 rule 2 — a session is the user's OWN words, so a
+                # row that names nobody and is self-owed by kind takes the
+                # user as its owner instead of arriving ownerless. Since fix
+                # round 1 the door does that binding itself, BEFORE the
+                # caution rail (review F-6), so the order is the door's
+                # property and not this caller's to remember.
+                **intake_kwargs(
+                    ctx, primary_thread_id=event.get("primary_thread_id"),
+                    person_ids=event.get("person_ids"), own_words=True),
+            )
+            if verdict["tier"] == "observed":
+                event = observed_from_commitment_event(
+                    event, reason=verdict["reason"]
+                )
+        by_type[event["type"]] += 1
+        would.append(event["data"]["summary"])
+    return {
+        "would_recover": len(would),
+        "skipped_dedup": skipped,
+        "by_type": dict(by_type),
+        "sample_summaries": would[:10],
+    }
+
+
+def _snapshot_events(workspace_root, archive_dir=None):
+    """Archive a copy of events.jsonl BEFORE the backfill appends (archive-
+    never-delete / snapshot-before-touch, §3.1). Returns the snapshot path, or
+    None when there is nothing to snapshot. Never overwrites an existing
+    snapshot in the same dir (a second confirm in one day keeps the first)."""
+    ep = Path(workspace_root) / "_hq" / "data" / "events.jsonl"
+    if not ep.exists():
+        return None
+    if archive_dir is None:
+        import datetime as _d
+
+        archive_dir = Path(workspace_root) / "_archive" / f"session-backfill_{_d.date.today().isoformat()}"
+    archive_dir = Path(archive_dir)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dest = archive_dir / "events.jsonl"
+    if not dest.exists():
+        import shutil
+
+        shutil.copy2(ep, dest)
+    return dest
+
+
+def backfill_and_receipt(
+    workspace_root,
+    items: Iterable[dict],
+    *,
+    days: int = 60,
+    sessions_scanned: int,
+    source_skill: str = "session-backfill",
+    archive_dir=None,
+) -> dict:
+    """One-time historical backfill (R2): snapshot events.jsonl, then dedup +
+    write the extracted items and land one `session_backfill_run` receipt.
+
+    Call ONLY after the CEO confirmed the `preview_items` plan (this skill is
+    ship-don't-run / supervised). Idempotent via the same content-hash dedup —
+    a re-run after a prior backfill recovers only genuinely-new items.
+    """
+    snap = _snapshot_events(workspace_root, archive_dir)
+    result = _sweep(
+        workspace_root,
+        items,
+        receipt_type=RECEIPT_BACKFILL,
+        source_skill=source_skill,
+        sessions_scanned=sessions_scanned,
+        window_desc=f"last-{int(days)}d",
+        extra_receipt={"days": int(days), "snapshot": str(snap) if snap else None},
+        fired_via="manual",  # backfill is always CEO-confirmed / supervised
+    )
+    result["snapshot"] = str(snap) if snap else None
+    return result
+
+
+def validate_backfill_ran(workspace_root, *, since_ts: Optional[str] = None) -> dict:
+    """Read the `session_backfill_run` receipt back (the supervised run's proof).
+    Same contract as `validate_sweep_ran`, on the backfill receipt type."""
+    return validate_sweep_ran(workspace_root, receipt_type=RECEIPT_BACKFILL, since_ts=since_ts)
+
+
+def last_backfill(workspace_root) -> Optional[dict]:
+    """The newest `session_backfill_run` receipt (or None) — lets the skill warn
+    'you already backfilled on <date>' before a second supervised run."""
+    return last_sweep(workspace_root, receipt_type=RECEIPT_BACKFILL)
+
+
+__all__ = [
+    "SWEEPABLE_TYPES",
+    "RECEIPT_SWEEP",
+    "RECEIPT_BACKFILL",
+    "NO_TOOL_REASON",
+    "CLOUD_REASON",
+    "NO_READER_REASONS",
+    "NO_READER_LINE",
+    "TRANSCRIPT_TOOL_FIELD",
+    "GAP_EMPTY_RUNS",
+    "BACKFILL_DAYS",
+    "chats_unread",
+    "reader_missing",
+    "SweepItemError",
+    "session_source_ref",
+    "content_hash",
+    "already_captured",
+    "sweep_and_receipt",
+    "last_sweep",
+    "validate_sweep_ran",
+    "preview_items",
+    "backfill_and_receipt",
+    "validate_backfill_ran",
+    "last_backfill",
+]
